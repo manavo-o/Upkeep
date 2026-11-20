@@ -73,7 +73,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <key>NSAccessibilityUsageDescription</key>
     <string>Upkeep uses Device Control / Accessibility to temporarily lock keyboard and pointer input during Cleaning Mode.</string>
     <key>UpkeepUpdateRepo</key>
-    <string></string>
+    <string>manavo-o/Upkeep</string>
 </dict>
 </plist>
 PLIST
