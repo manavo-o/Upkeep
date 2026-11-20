@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="prismGrad" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="1.0"/>
+      <stop offset="100%" stop-color="#E4F0FF" stop-opacity="0.88"/>
+    </linearGradient>
+  </defs>
+  <!-- Sculpted upward chevron / clean-sweep prism -->
+  <path d="M 512 292 C 528 292 542 300 551 314 L 716 576 C 731 600 714 632 685 632 L 586 632 L 586 704 C 586 728 566 748 542 748 L 482 748 C 458 748 438 728 438 704 L 438 632 L 339 632 C 310 632 293 600 308 576 L 473 314 C 482 300 496 292 512 292 Z" fill="url(#prismGrad)"/>
+</svg>

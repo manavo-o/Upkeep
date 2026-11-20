@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+._*
+
+# SwiftPM & Xcode
+.build/
+.swiftpm/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Rust build outputs
+rust/spotlight_core/target/
+
+# Generated binaries & app bundle
+Frameworks/lib/
+dist/

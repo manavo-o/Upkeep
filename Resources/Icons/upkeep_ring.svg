@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#D6E6FF" stop-opacity="0.72"/>
+    </linearGradient>
+  </defs>
+  <!-- Precision outer orbital ring (270-degree open sweep for modern Apple utility feel) -->
+  <path d="M 512 184 A 328 328 0 1 1 236 336" fill="none" stroke="url(#ringGrad)" stroke-width="56" stroke-linecap="round"/>
+  <!-- Subtle cardinal accent dot at top-left gap -->
+  <circle cx="312" cy="248" r="32" fill="#FFFFFF" fill-opacity="0.92"/>
+</svg>
