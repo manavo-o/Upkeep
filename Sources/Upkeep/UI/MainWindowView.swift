@@ -621,11 +621,17 @@ private struct PowerAndInputSettingsPane: View {
     }
 }
 
-// MARK: - 2. Homebrew (Native macOS 27 Grouped Form)
+// MARK: - 2. Homebrew (Native macOS 27 Grouped Form + Persistent Operation Log)
 
 private struct HomebrewSettingsPane: View {
     @Bindable var vm: TrayViewModel
     let coordinator: HUDCoordinator
+    @Bindable var logStore = BrewLogStore.shared
+
+    @State private var copiedInstallCommand = false
+    @State private var copiedLog = false
+
+    private static let brewInstallCommand = #"/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)""#
 
     var body: some View {
         UpkeepSettingsFormView {
@@ -635,8 +641,29 @@ private struct HomebrewSettingsPane: View {
                         tone: .warning,
                         icon: "terminal.fill",
                         title: "Homebrew CLI Not Found",
-                        message: "Install Homebrew in /opt/homebrew/bin or /usr/local/bin to search, install, and upgrade packages."
-                    )
+                        message: "Install Homebrew in /opt/homebrew/bin or /usr/local/bin to search, install, and upgrade packages.",
+                        actionTitle: copiedInstallCommand ? "Copied" : "Copy Install Command"
+                    ) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(Self.brewInstallCommand, forType: .string)
+                        copiedInstallCommand = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            copiedInstallCommand = false
+                        }
+                    }
+                }
+            } else if let error = vm.brewErrorText {
+                Section {
+                    UpkeepSettingsCallout(
+                        tone: .warning,
+                        icon: "exclamationmark.triangle.fill",
+                        title: "Homebrew Operation Failed",
+                        message: error,
+                        actionTitle: "Retry"
+                    ) {
+                        vm.brewErrorText = nil
+                        vm.refreshOverview(force: true)
+                    }
                 }
             }
 
@@ -664,6 +691,7 @@ private struct HomebrewSettingsPane: View {
                             coordinator.showHomebrewHUD()
                         }
                         .buttonStyle(.upkeepPrimary)
+                        .disabled(!BrewService.isInstalled())
                     }
                 } label: {
                     HStack(spacing: 10) {
@@ -680,9 +708,13 @@ private struct HomebrewSettingsPane: View {
                 .upkeepSearchTarget("brew.hud")
 
                 LabeledContent {
-                    Text("\(vm.brewInstalledCount)")
-                        .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    if vm.isRefreshingBrew && vm.brewInstalledCount == 0 {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("\(vm.brewInstalledCount)")
+                            .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 } label: {
                     HStack(spacing: 10) {
                         UpkeepSettingsIcon(systemName: "shippingbox.fill", color: .blue)
@@ -713,6 +745,108 @@ private struct HomebrewSettingsPane: View {
                     icon: "terminal",
                     isGranted: BrewService.isInstalled()
                 )
+            }
+
+            UpkeepSettingsSection(
+                "Last Operation Log",
+                footer: "Persists across relaunches so you can inspect the full output of your latest brew install, upgrade, uninstall, or doctor run."
+            ) {
+                if let log = logStore.lastLog {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Image(systemName: log.succeeded ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(log.succeeded ? Color.green : Color.red)
+                                .font(.system(size: 13))
+
+                            Text(log.command)
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .lineLimit(1)
+
+                            Text(log.succeeded ? "Succeeded" : "Exit \(log.exitCode)")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(log.succeeded ? Color.green : Color.red)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(
+                                    (log.succeeded ? Color.green : Color.red).opacity(0.14),
+                                    in: Capsule()
+                                )
+
+                            Spacer()
+
+                            Text(log.timestamp, style: .relative)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+
+                            Button(copiedLog ? "Copied" : "Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(log.output, forType: .string)
+                                copiedLog = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    copiedLog = false
+                                }
+                            }
+                            .buttonStyle(.upkeepSecondary)
+                            .controlSize(.small)
+
+                            Button("Clear") {
+                                withAnimation(.snappy(duration: 0.18)) {
+                                    logStore.clear()
+                                }
+                            }
+                            .buttonStyle(.upkeepSecondary)
+                            .controlSize(.small)
+                        }
+
+                        ScrollView([.vertical, .horizontal]) {
+                            Text(log.output)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(10)
+                        }
+                        .frame(maxHeight: 180)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .upkeepSearchTarget("brew.log")
+                } else {
+                    HStack(spacing: 12) {
+                        UpkeepSettingsIcon(systemName: "doc.text", color: .secondary, size: 24)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("No Homebrew operations recorded yet")
+                                .font(.system(size: 13, weight: .medium))
+                            Text("Run an upgrade, install, or brew doctor to capture persistent output here.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        if BrewService.isInstalled() {
+                            Button {
+                                vm.runBrewDoctor()
+                            } label: {
+                                if vm.isRunningBrewDoctor {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Text("Run Doctor")
+                                }
+                            }
+                            .buttonStyle(.upkeepSecondary)
+                            .controlSize(.small)
+                            .disabled(vm.isRunningBrewDoctor)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                    .upkeepSearchTarget("brew.log")
+                }
             }
 
             UpkeepSettingsSection("HUD Shortcuts") {
@@ -757,6 +891,8 @@ private struct CleanerWorkspacePane: View {
     @Bindable var vm: TrayViewModel
     @State private var hoveredIndex: Int?
     @State private var filter: CleanerFilter = .all
+    @State private var copiedMoleInstall = false
+    @State private var copiedCleanError = false
 
     private var filteredLines: [String] {
         guard let lines = vm.cleanPreview?.lines else { return [] }
@@ -770,9 +906,12 @@ private struct CleanerWorkspacePane: View {
         }
     }
 
+    private var hasNonHeaderFilteredItems: Bool {
+        filteredLines.contains { !$0.hasPrefix("➤") }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Unified Summary Header Strip
             VStack(spacing: 12) {
                 HStack(spacing: 14) {
                     UpkeepSectionIcon(section: .cleaner, size: 34)
@@ -803,7 +942,7 @@ private struct CleanerWorkspacePane: View {
 
                     Spacer()
 
-                    if let summary = vm.cleanPreview, summary.isDryRun, !vm.confirmClean {
+                    if let summary = vm.cleanPreview, summary.isDryRun, !summary.lines.isEmpty, !vm.confirmClean {
                         Button(role: .destructive) {
                             withAnimation(.snappy) { vm.confirmClean = true }
                         } label: {
@@ -857,7 +996,29 @@ private struct CleanerWorkspacePane: View {
 
             Divider().opacity(0.22)
 
-            if vm.isScanningClean || vm.isCleaning {
+            if !MoleService.isInstalled() {
+                ContentUnavailableView {
+                    Label("Mole CLI Not Installed", systemImage: "terminal")
+                } description: {
+                    Text("Upkeep uses Mole (`mo clean`) for safe dry-run cache inspection. Install it via Homebrew to enable Cleaner.")
+                } actions: {
+                    HStack(spacing: 8) {
+                        Button(copiedMoleInstall ? "Copied Command" : "Copy `brew install` Command") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString("brew install tw93/tap/mole", forType: .string)
+                            copiedMoleInstall = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                copiedMoleInstall = false
+                            }
+                        }
+                        .buttonStyle(.upkeepPrimary)
+
+                        Button("Retry") { vm.runMoleDryRun() }
+                            .buttonStyle(.upkeepSecondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if vm.isScanningClean || vm.isCleaning {
                 VStack(spacing: 10) {
                     ProgressView()
                     Text(vm.isCleaning ? "Cleaning caches…" : "Scanning caches safely…")
@@ -869,12 +1030,24 @@ private struct CleanerWorkspacePane: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let err = vm.cleanError {
                 ContentUnavailableView {
-                    Label("Scan Failed", systemImage: "exclamationmark.triangle")
+                    Label("Cache Scan Failed", systemImage: "exclamationmark.triangle")
                 } description: {
                     Text(err)
                 } actions: {
-                    Button("Retry Scan") { vm.runMoleDryRun() }
-                        .buttonStyle(.upkeepPrimary)
+                    HStack(spacing: 8) {
+                        Button("Retry Scan") { vm.runMoleDryRun() }
+                            .buttonStyle(.upkeepPrimary)
+
+                        Button(copiedCleanError ? "Copied" : "Copy Error") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(err, forType: .string)
+                            copiedCleanError = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                copiedCleanError = false
+                            }
+                        }
+                        .buttonStyle(.upkeepSecondary)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let summary = vm.cleanPreview {
@@ -882,7 +1055,22 @@ private struct CleanerWorkspacePane: View {
                     ContentUnavailableView {
                         Label("System is Clean", systemImage: "checkmark.circle")
                     } description: {
-                        Text("No reclaimable caches reported by Mole.")
+                        Text("No reclaimable caches were reported by Mole.")
+                    } actions: {
+                        Button("Rescan") { vm.runMoleDryRun() }
+                            .buttonStyle(.upkeepSecondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if !hasNonHeaderFilteredItems {
+                    ContentUnavailableView {
+                        Label("No \(filter.rawValue) Items", systemImage: "line.3.horizontal.decrease.circle")
+                    } description: {
+                        Text(filter == .cleaned
+                             ? "No files have been deleted yet — this is a dry-run preview."
+                             : "No candidate cache entries match this filter.")
+                    } actions: {
+                        Button("Show All Items") { filter = .all }
+                            .buttonStyle(.upkeepSecondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -902,7 +1090,7 @@ private struct CleanerWorkspacePane: View {
                 ContentUnavailableView {
                     Label("Ready to Scan", systemImage: "doc.text.magnifyingglass")
                 } description: {
-                    Text("Inspect caches safely without deleting any files.")
+                    Text("Inspect system and app caches safely without deleting any files.")
                 } actions: {
                     Button("Start Dry-Run") { vm.runMoleDryRun() }
                         .buttonStyle(.upkeepPrimary)
@@ -960,7 +1148,7 @@ private struct CleanerWorkspacePane: View {
     }
 }
 
-// MARK: - 4. Uninstaller (Unified macOS 27 Workspace)
+// MARK: - 4. Uninstaller (Unified macOS 27 Workspace + Leftover & Homebrew Cask Review)
 
 private enum UninstallerSort: String, CaseIterable, Identifiable {
     case name = "Name"
@@ -972,6 +1160,7 @@ private enum UninstallerSort: String, CaseIterable, Identifiable {
 private struct UninstallerWorkspacePane: View {
     @Bindable var vm: TrayViewModel
     @State private var sortOrder: UninstallerSort = .name
+    @State private var copiedError = false
 
     private var sortedApps: [MoleInstalledApp] {
         switch sortOrder {
@@ -991,7 +1180,7 @@ private struct UninstallerWorkspacePane: View {
                         placeholder: "Filter installed applications…",
                         onEscape: {
                             if vm.pendingUninstallApp != nil {
-                                withAnimation(.snappy) { vm.pendingUninstallApp = nil }
+                                vm.cancelUninstallReview()
                             }
                         }
                     )
@@ -1007,11 +1196,10 @@ private struct UninstallerWorkspacePane: View {
                 }
 
                 HStack(spacing: 12) {
-                    Toggle("Include personal data & support files", isOn: $vm.includePersonalData)
-                        .toggleStyle(.checkbox)
+                    Text("Click Remove on any app to preview exact ~/Library leftovers and Homebrew cask status before trashing.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                        .help("Also removes application support files, preferences, and caches (--with-data)")
+                        .lineLimit(1)
 
                     Spacer()
 
@@ -1020,21 +1208,6 @@ private struct UninstallerWorkspacePane: View {
                             .font(.footnote.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
-                }
-
-                if let pending = vm.pendingUninstallApp {
-                    MenuBarDestructiveConfirmBar(
-                        title: "Move \(pending.name) to Trash?",
-                        confirmLabel: "Move to Trash",
-                        confirmIcon: "trash.fill",
-                        onCancel: {
-                            withAnimation(.snappy) { vm.pendingUninstallApp = nil }
-                        },
-                        onConfirm: {
-                            vm.confirmUninstall(pending)
-                        }
-                    )
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 }
 
                 if let status = vm.uninstallStatus {
@@ -1046,11 +1219,17 @@ private struct UninstallerWorkspacePane: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                         Spacer()
+                        Button("Dismiss") {
+                            vm.uninstallStatus = nil
+                        }
+                        .buttonStyle(.plain)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.tertiary)
                     }
                 }
 
                 if let err = vm.uninstallError, !vm.installedApps.isEmpty {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 11))
                             .foregroundStyle(MenuBarTheme.Colors.destructive)
@@ -1059,6 +1238,18 @@ private struct UninstallerWorkspacePane: View {
                             .foregroundStyle(MenuBarTheme.Colors.destructive)
                             .lineLimit(2)
                         Spacer()
+                        Button(copiedError ? "Copied" : "Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(err, forType: .string)
+                            copiedError = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                copiedError = false
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.secondary)
+
                         Button("Dismiss") {
                             vm.uninstallError = nil
                         }
@@ -1077,7 +1268,7 @@ private struct UninstallerWorkspacePane: View {
             if vm.isLoadingApps {
                 VStack(spacing: 10) {
                     ProgressView()
-                    Text("Loading installed applications…")
+                    Text("Scanning installed applications…")
                         .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                 }
@@ -1088,13 +1279,37 @@ private struct UninstallerWorkspacePane: View {
                 } description: {
                     Text(err)
                 } actions: {
-                    Button("Retry") { vm.loadApps(force: true) }
+                    HStack(spacing: 8) {
+                        Button("Retry") { vm.loadApps(force: true) }
+                            .buttonStyle(.upkeepPrimary)
+                        Button("Copy Error") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(err, forType: .string)
+                        }
+                        .buttonStyle(.upkeepSecondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if vm.installedApps.isEmpty {
+                ContentUnavailableView {
+                    Label("No Applications Found", systemImage: "app.dashed")
+                } description: {
+                    Text("No apps were discovered in /Applications or ~/Applications.")
+                } actions: {
+                    Button("Reload Applications") { vm.loadApps(force: true) }
                         .buttonStyle(.upkeepPrimary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if vm.filteredApps.isEmpty {
-                ContentUnavailableView.search(text: vm.appQuery)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ContentUnavailableView {
+                    Label("No Matching Applications", systemImage: "magnifyingglass")
+                } description: {
+                    Text("No installed apps match “\(vm.appQuery)”.")
+                } actions: {
+                    Button("Clear Filter") { vm.appQuery = "" }
+                        .buttonStyle(.upkeepSecondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 4) {
@@ -1103,7 +1318,7 @@ private struct UninstallerWorkspacePane: View {
                                 app: app,
                                 isPending: vm.pendingUninstallApp?.id == app.id,
                                 onRemove: {
-                                    withAnimation(.snappy) { vm.pendingUninstallApp = app }
+                                    vm.inspectForUninstall(app)
                                 }
                             )
                         }
@@ -1116,6 +1331,224 @@ private struct UninstallerWorkspacePane: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(item: $vm.pendingUninstallApp) { app in
+            UninstallReviewSheet(app: app, vm: vm)
+        }
+    }
+}
+
+// MARK: - Interactive Uninstaller Leftover & Homebrew Cask Review Sheet
+
+private struct UninstallReviewSheet: View {
+    let app: MoleInstalledApp
+    @Bindable var vm: TrayViewModel
+
+    @State private var selectedLeftovers: Set<String> = []
+    @State private var useHomebrewCask: Bool = true
+    @State private var didSeedSelection: Bool = false
+
+    private var selectedLeftoversBytes: Int64 {
+        guard let inspection = vm.uninstallInspection else { return 0 }
+        return inspection.leftovers
+            .filter { selectedLeftovers.contains($0.path) }
+            .reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    private var totalSelectedSizeFormatted: String {
+        let total = (app.size ?? 0) + selectedLeftoversBytes
+        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                AppIconView(path: app.path, size: 42)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Uninstall \(app.name)")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text(app.path)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(totalSelectedSizeFormatted)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
+                    Text("Total selected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(20)
+
+            Divider().opacity(0.25)
+
+            if vm.isInspectingUninstall || vm.uninstallInspection == nil {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Inspecting ~/Library leftovers & Homebrew Caskroom…")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let inspection = vm.uninstallInspection {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let token = inspection.homebrewCaskToken {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 10) {
+                                UpkeepSettingsIcon(systemName: "shippingbox.fill", color: MenuBarTheme.Colors.homebrew, size: 24)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("Managed by Homebrew Cask")
+                                        .font(.system(size: 12.5, weight: .semibold))
+                                    Text("Found matching cask token `\(token)` in Caskroom.")
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+
+                            Toggle("Uninstall via `brew uninstall --cask \(token)` (recommended)", isOn: $useHomebrewCask)
+                                .toggleStyle(.checkbox)
+                                .font(.footnote)
+                        }
+                        .padding(12)
+                        .background(MenuBarTheme.Colors.homebrew.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(MenuBarTheme.Colors.homebrew.opacity(0.25), lineWidth: 0.75)
+                        }
+                    }
+
+                    HStack {
+                        Text("Related Files in ~/Library (\(inspection.leftovers.count))")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+
+                        Spacer()
+
+                        if !inspection.leftovers.isEmpty {
+                            Button("Select All") {
+                                selectedLeftovers = Set(inspection.leftovers.map(\.path))
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(Color.accentColor)
+
+                            Text("·").foregroundStyle(.tertiary)
+
+                            Button("None") {
+                                selectedLeftovers.removeAll()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if inspection.leftovers.isEmpty {
+                        HStack(spacing: 10) {
+                            Image(systemName: "checkmark.circle")
+                                .foregroundStyle(.secondary)
+                            Text("No leftover files found in ~/Library — only the app bundle will be removed.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                        .padding()
+                        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    } else {
+                        ScrollView {
+                            LazyVStack(spacing: 4) {
+                                ForEach(inspection.leftovers) { item in
+                                    let isChecked = selectedLeftovers.contains(item.path)
+                                    Button {
+                                        if isChecked {
+                                            selectedLeftovers.remove(item.path)
+                                        } else {
+                                            selectedLeftovers.insert(item.path)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 10) {
+                                            Image(systemName: isChecked ? "checkmark.square.fill" : "square")
+                                                .foregroundStyle(isChecked ? Color.accentColor : Color.secondary)
+                                                .font(.system(size: 14))
+
+                                            VStack(alignment: .leading, spacing: 1) {
+                                                Text(item.displayPath)
+                                                    .font(.system(size: 11.5, design: .monospaced))
+                                                    .foregroundStyle(.primary)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                                Text(item.category)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+
+                                            Spacer(minLength: 8)
+
+                                            Text(item.formattedSize)
+                                                .font(.system(size: 11, design: .rounded).monospacedDigit())
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(20)
+                .onAppear {
+                    if !didSeedSelection {
+                        selectedLeftovers = Set(inspection.leftovers.map(\.path))
+                        didSeedSelection = true
+                    }
+                }
+            }
+
+            Divider().opacity(0.25)
+
+            HStack {
+                Button("Cancel") {
+                    vm.cancelUninstallReview()
+                }
+                .buttonStyle(.upkeepSecondary)
+                .keyboardShortcut(.cancelAction)
+                .disabled(vm.isUninstallingApp)
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    vm.executeReviewedUninstall(
+                        selectedLeftoverPaths: selectedLeftovers,
+                        useHomebrewCask: useHomebrewCask
+                    )
+                } label: {
+                    if vm.isUninstallingApp {
+                        ProgressView().controlSize(.small)
+                    } else if let token = vm.uninstallInspection?.homebrewCaskToken, useHomebrewCask {
+                        Label("Uninstall Cask (\(token))", systemImage: "trash.fill")
+                    } else {
+                        Label("Move to Trash", systemImage: "trash.fill")
+                    }
+                }
+                .buttonStyle(.upkeepPrimary)
+                .tint(.red)
+                .disabled(vm.isInspectingUninstall || vm.uninstallInspection == nil || vm.isUninstallingApp)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+        }
+        .frame(width: 540, height: 460)
     }
 }
 
@@ -1132,6 +1565,20 @@ private struct UpdatesSettingsPane: View {
 
     var body: some View {
         UpkeepSettingsFormView {
+            if let error = updater.errorMessage {
+                Section {
+                    UpkeepSettingsCallout(
+                        tone: .warning,
+                        icon: "exclamationmark.triangle.fill",
+                        title: "Update Check Failed",
+                        message: error,
+                        actionTitle: "Retry"
+                    ) {
+                        Task { await updater.checkForUpdates() }
+                    }
+                }
+            }
+
             UpkeepSettingsSection(
                 "Upkeep Releases",
                 footer: "Automatic update checks run quietly every 6 hours when a GitHub repository is configured."
@@ -1196,6 +1643,14 @@ private struct UpdatesSettingsPane: View {
                     }
                 }
 
+                if updater.githubRepo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    UpkeepSettingsCallout(
+                        tone: .info,
+                        icon: "info.circle.fill",
+                        message: "Enter a public GitHub repository (for example, `manavo-o/Upkeep`) to enable automatic app release checks."
+                    )
+                }
+
                 if let release = updater.availableRelease {
                     UpkeepSettingsCallout(
                         tone: .success,
@@ -1213,12 +1668,6 @@ private struct UpdatesSettingsPane: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-
-                if let error = updater.errorMessage {
-                    Text(error)
-                        .font(.footnote)
-                        .foregroundStyle(MenuBarTheme.Colors.destructive)
-                }
             }
 
             UpkeepSettingsSection("CLI Utilities") {
@@ -1226,7 +1675,7 @@ private struct UpdatesSettingsPane: View {
                     Button("Update CLI Tools") {
                         Task {
                             await updater.updateCLIUtilities()
-                            vm.refreshOverview()
+                            vm.refreshOverview(force: true)
                         }
                     }
                     .buttonStyle(.upkeepSecondary)

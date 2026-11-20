@@ -54,8 +54,11 @@ public final class TrayViewModel {
 
     public var brewInstalledCount: Int = 0
     public var brewOutdatedCount: Int = 0
+    public var isRefreshingBrew: Bool = false
     public var isUpgradingBrew: Bool = false
+    public var isRunningBrewDoctor: Bool = false
     public var brewStatusText: String?
+    public var brewErrorText: String?
 
     // Mole Cleaner state
     public var cleanPreview: MoleCleanSummary?
@@ -75,6 +78,9 @@ public final class TrayViewModel {
     public var includePersonalData: Bool = false
     public var isLoadingApps: Bool = false
     public var pendingUninstallApp: MoleInstalledApp?
+    public var uninstallInspection: UninstallInspection?
+    public var isInspectingUninstall: Bool = false
+    public var isUninstallingApp: Bool = false
     public var uninstallStatus: String?
     public var uninstallError: String?
 
@@ -103,28 +109,55 @@ public final class TrayViewModel {
             .map(\.0)
     }
 
-    public func refreshOverview() {
+    public func refreshOverview(force: Bool = false) {
+        guard BrewService.isInstalled() else {
+            brewInstalledCount = 0
+            brewOutdatedCount = 0
+            return
+        }
+        isRefreshingBrew = true
         Task {
-            if let items = try? await BrewService.shared.loadInstalledAndOutdated() {
+            do {
+                let items = try await BrewService.shared.loadInstalledAndOutdated(forceRefresh: force)
                 self.brewInstalledCount = items.count
                 self.brewOutdatedCount = items.filter(\.isOutdated).count
+                self.brewErrorText = nil
+            } catch {
+                self.brewErrorText = error.localizedDescription
             }
+            self.isRefreshingBrew = false
         }
     }
 
     public func upgradeAllBrew() {
         guard !isUpgradingBrew else { return }
         isUpgradingBrew = true
+        brewErrorText = nil
         brewStatusText = "Upgrading packages…"
         Task {
             do {
                 _ = try await BrewService.shared.upgrade(name: nil)
                 self.brewStatusText = "All packages up to date"
-                self.refreshOverview()
+                self.refreshOverview(force: true)
             } catch {
-                self.brewStatusText = error.localizedDescription
+                self.brewStatusText = nil
+                self.brewErrorText = error.localizedDescription
             }
             self.isUpgradingBrew = false
+        }
+    }
+
+    public func runBrewDoctor() {
+        guard !isRunningBrewDoctor else { return }
+        isRunningBrewDoctor = true
+        brewErrorText = nil
+        Task {
+            do {
+                _ = try await BrewService.shared.runDoctor()
+            } catch {
+                self.brewErrorText = error.localizedDescription
+            }
+            self.isRunningBrewDoctor = false
         }
     }
 
@@ -169,6 +202,60 @@ public final class TrayViewModel {
                 self.uninstallError = error.localizedDescription
             }
             self.isLoadingApps = false
+        }
+    }
+
+    public func inspectForUninstall(_ app: MoleInstalledApp) {
+        guard !isInspectingUninstall else { return }
+        pendingUninstallApp = app
+        uninstallInspection = nil
+        isInspectingUninstall = true
+        uninstallError = nil
+        Task {
+            let result = await MoleService.shared.inspectAppForUninstall(app)
+            if self.pendingUninstallApp?.id == app.id {
+                self.uninstallInspection = result
+            }
+            self.isInspectingUninstall = false
+        }
+    }
+
+    public func cancelUninstallReview() {
+        pendingUninstallApp = nil
+        uninstallInspection = nil
+        isInspectingUninstall = false
+    }
+
+    public func executeReviewedUninstall(selectedLeftoverPaths: Set<String>, useHomebrewCask: Bool) {
+        guard let inspection = uninstallInspection, !isUninstallingApp else { return }
+        let app = inspection.app
+        let caskToken = useHomebrewCask ? inspection.homebrewCaskToken : nil
+
+        isUninstallingApp = true
+        uninstallError = nil
+        uninstallStatus = caskToken != nil
+            ? "Uninstalling \(app.name) via Homebrew…"
+            : "Removing \(app.name)…"
+
+        Task {
+            do {
+                let message = try await MoleService.shared.uninstallReviewedApp(
+                    app,
+                    selectedLeftoverPaths: selectedLeftoverPaths,
+                    homebrewCaskToken: caskToken
+                )
+                self.uninstallStatus = message
+                self.installedApps.removeAll { $0.id == app.id }
+                self.pendingUninstallApp = nil
+                self.uninstallInspection = nil
+                if caskToken != nil {
+                    self.refreshOverview(force: true)
+                }
+            } catch {
+                self.uninstallError = error.localizedDescription
+                self.uninstallStatus = nil
+            }
+            self.isUninstallingApp = false
         }
     }
 

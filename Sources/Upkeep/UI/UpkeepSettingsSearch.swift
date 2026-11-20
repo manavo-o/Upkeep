@@ -105,6 +105,14 @@ public enum UpkeepSearchCatalog {
             keywords: ["upgrade", "outdated", "updates", "brew", "packages"]
         ),
         UpkeepSearchItem(
+            id: "brew.log",
+            title: "Last Operation Log",
+            section: "Last Operation Log",
+            tab: .homebrew,
+            icon: "doc.text",
+            keywords: ["log", "output", "stdout", "stderr", "upgrade", "install", "doctor", "brew"]
+        ),
+        UpkeepSearchItem(
             id: "brew.shortcuts",
             title: "HUD Keyboard Shortcuts",
             section: "HUD Shortcuts",

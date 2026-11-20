@@ -1,4 +1,78 @@
 import Foundation
+import Observation
+
+public struct BrewOperationLog: Codable, Sendable, Equatable {
+    public let command: String
+    public let output: String
+    public let succeeded: Bool
+    public let exitCode: Int32
+    public let timestamp: Date
+
+    public init(command: String, output: String, succeeded: Bool, exitCode: Int32, timestamp: Date = Date()) {
+        self.command = command
+        self.output = output
+        self.succeeded = succeeded
+        self.exitCode = exitCode
+        self.timestamp = timestamp
+    }
+}
+
+@MainActor
+@Observable
+public final class BrewLogStore {
+    public static let shared = BrewLogStore()
+    public private(set) var lastLog: BrewOperationLog?
+
+    private static let fileURL: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("com.local.Upkeep/last_brew_log.json")
+    }()
+
+    private init() {
+        if let data = try? Data(contentsOf: Self.fileURL),
+           let decoded = try? JSONDecoder().decode(BrewOperationLog.self, from: data) {
+            self.lastLog = decoded
+        }
+    }
+
+    public func record(command: String, stdout: String, stderr: String, exitCode: Int32) {
+        let cleanOut = CLIExecutor.stripANSI(stdout).trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanErr = CLIExecutor.stripANSI(stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+        let combined: String
+        if cleanOut.isEmpty && cleanErr.isEmpty {
+            combined = exitCode == 0 ? "Command completed with no output." : "Command failed with exit code \(exitCode)."
+        } else if cleanErr.isEmpty {
+            combined = cleanOut
+        } else if cleanOut.isEmpty {
+            combined = cleanErr
+        } else {
+            combined = cleanOut + "\n\n" + cleanErr
+        }
+        let entry = BrewOperationLog(
+            command: command,
+            output: combined,
+            succeeded: exitCode == 0,
+            exitCode: exitCode,
+            timestamp: Date()
+        )
+        self.lastLog = entry
+        persist(entry)
+    }
+
+    public func clear() {
+        self.lastLog = nil
+        try? FileManager.default.removeItem(at: Self.fileURL)
+    }
+
+    private func persist(_ entry: BrewOperationLog) {
+        let dir = Self.fileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(entry) {
+            try? data.write(to: Self.fileURL, options: .atomic)
+        }
+    }
+}
 
 public struct BrewPackageItem: Identifiable, Sendable, Hashable {
     public let id: String
@@ -108,6 +182,49 @@ public actor BrewService {
             }
         }
         return items.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Matches an installed `.app` bundle against Homebrew's local Caskroom without spawning Ruby.
+    public static func findInstalledCask(forAppName appName: String, appPath: String) -> String? {
+        let fm = FileManager.default
+        let prefix = fm.fileExists(atPath: "/opt/homebrew/Caskroom") ? "/opt/homebrew" : "/usr/local"
+        let caskroom = (prefix as NSString).appendingPathComponent("Caskroom")
+        guard let tokens = try? fm.contentsOfDirectory(atPath: caskroom) else { return nil }
+
+        let appBundleName = (appPath as NSString).lastPathComponent
+        let normalizedApp = normalizeToken(appName)
+        var fallbackMatch: String? = nil
+
+        for token in tokens where !token.hasPrefix(".") {
+            let tokenDir = (caskroom as NSString).appendingPathComponent(token)
+            if let entries = try? fm.contentsOfDirectory(atPath: tokenDir) {
+                for entry in entries where !entry.hasPrefix(".") {
+                    let versionDir = (tokenDir as NSString).appendingPathComponent(entry)
+                    let directApp = (versionDir as NSString).appendingPathComponent(appBundleName)
+                    if fm.fileExists(atPath: directApp) {
+                        return token
+                    }
+                }
+            }
+            let metaDir = (tokenDir as NSString).appendingPathComponent(".metadata")
+            if let enumerator = fm.enumerator(atPath: metaDir) {
+                for case let rel as String in enumerator where rel.hasSuffix(".rb") || rel.hasSuffix(".json") {
+                    let filePath = (metaDir as NSString).appendingPathComponent(rel)
+                    if let content = try? String(contentsOfFile: filePath, encoding: .utf8),
+                       content.localizedCaseInsensitiveContains(appBundleName) {
+                        return token
+                    }
+                }
+            }
+            if fallbackMatch == nil && normalizeToken(token) == normalizedApp {
+                fallbackMatch = token
+            }
+        }
+        return fallbackMatch
+    }
+
+    private static func normalizeToken(_ value: String) -> String {
+        value.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
     private func updateLocalCatalog(_ items: [BrewPackageItem]) {
@@ -471,9 +588,11 @@ public actor BrewService {
         var args = ["install"]
         if isCask { args.append("--cask") }
         args.append(name)
+        let cmd = "brew " + args.joined(separator: " ")
         let res = try await CLIExecutor.run(binary: "brew", arguments: args, environment: Self.brewEnv)
+        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
         guard res.succeeded else {
-            throw CLIError.executionFailed(command: "brew " + args.joined(separator: " "), exitCode: res.exitCode, stderr: res.stderr)
+            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
         _ = try? await loadInstalledAndOutdated(forceRefresh: true)
         return CLIExecutor.stripANSI(res.stdout)
@@ -483,9 +602,11 @@ public actor BrewService {
         var args = ["uninstall"]
         if isCask { args.append("--cask") }
         args.append(name)
+        let cmd = "brew " + args.joined(separator: " ")
         let res = try await CLIExecutor.run(binary: "brew", arguments: args, environment: Self.brewEnv)
+        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
         guard res.succeeded else {
-            throw CLIError.executionFailed(command: "brew " + args.joined(separator: " "), exitCode: res.exitCode, stderr: res.stderr)
+            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
         let updated = catalog.filter { !($0.name == name && $0.isCask == isCask) }
         updateLocalCatalog(updated)
@@ -495,42 +616,52 @@ public actor BrewService {
     public func upgrade(name: String? = nil) async throws -> String {
         var args = ["upgrade"]
         if let name { args.append(name) }
+        let cmd = "brew " + args.joined(separator: " ")
         let res = try await CLIExecutor.run(binary: "brew", arguments: args, environment: Self.brewEnv)
+        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
         guard res.succeeded else {
-            throw CLIError.executionFailed(command: "brew " + args.joined(separator: " "), exitCode: res.exitCode, stderr: res.stderr)
+            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
         _ = try? await loadInstalledAndOutdated(forceRefresh: true)
         return CLIExecutor.stripANSI(res.stdout)
     }
 
     public func pin(name: String) async throws -> String {
+        let cmd = "brew pin \(name)"
         let res = try await CLIExecutor.run(binary: "brew", arguments: ["pin", name], environment: Self.brewEnv)
+        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
         guard res.succeeded else {
-            throw CLIError.executionFailed(command: "brew pin \(name)", exitCode: res.exitCode, stderr: res.stderr)
+            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
         _ = try? await loadInstalledAndOutdated(forceRefresh: true)
         return CLIExecutor.stripANSI(res.stdout)
     }
 
     public func unpin(name: String) async throws -> String {
+        let cmd = "brew unpin \(name)"
         let res = try await CLIExecutor.run(binary: "brew", arguments: ["unpin", name], environment: Self.brewEnv)
+        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
         guard res.succeeded else {
-            throw CLIError.executionFailed(command: "brew unpin \(name)", exitCode: res.exitCode, stderr: res.stderr)
+            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
         _ = try? await loadInstalledAndOutdated(forceRefresh: true)
         return CLIExecutor.stripANSI(res.stdout)
     }
 
     public func updateBrew() async throws -> String {
+        let cmd = "brew update"
         let res = try await CLIExecutor.run(binary: "brew", arguments: ["update"], environment: Self.brewEnv)
+        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
         guard res.succeeded else {
-            throw CLIError.executionFailed(command: "brew update", exitCode: res.exitCode, stderr: res.stderr)
+            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
         return CLIExecutor.stripANSI(res.stdout)
     }
 
     public func runDoctor() async throws -> String {
+        let cmd = "brew doctor"
         let res = try await CLIExecutor.run(binary: "brew", arguments: ["doctor"], environment: Self.brewEnv)
+        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
         return CLIExecutor.stripANSI(res.stdout + "\n" + res.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
