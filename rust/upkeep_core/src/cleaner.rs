@@ -1,15 +1,23 @@
-use crate::{calculate_path_size_accurate, cstr_to_str, is_protected_path, string_to_cstr};
+use crate::{
+    calculate_path_size_accurate, cstr_to_str, is_protected_path, read_bundle_id, string_to_cstr,
+};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 extern "C" {
     fn getuid() -> u32;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn proc_listallpids(buffer: *mut c_void, buffersize: c_int) -> c_int;
+    fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
 }
 
 // MARK: - Data Structures
@@ -67,26 +75,39 @@ struct ScanTarget {
     holdback_reason: Option<&'static str>,
 }
 
+struct RunningApps {
+    bundle_ids: HashSet<String>,
+    app_names: HashSet<String>,
+}
+
 const CATEGORY_ORDER: &[(&str, &str)] = &[
     ("developer_tools", "Developer Tools"),
     ("browser_caches", "Browser Caches"),
+    ("app_internal_caches", "App Internal Caches"),
     ("user_app_caches", "User App Caches"),
+    ("orphaned_leftovers", "Orphaned App Leftovers"),
     ("logs_diagnostics", "Logs & Diagnostics"),
     ("saved_state_temp", "Saved State & Temp"),
+    ("old_installers", "Old Installers"),
     ("user_trash", "Trash"),
 ];
 
 /// Relative paths under `$HOME` whose children should be emptied while preserving the folder itself.
 const PRESERVE_PARENT_REL_PATHS: &[&str] = &[
     "/library/developer/xcode/deriveddata",
+    "/library/developer/xcode/archives",
+    "/library/developer/xcode/products",
     "/library/developer/xcode/ios devicesupport",
     "/library/developer/xcode/watchos devicesupport",
     "/library/developer/xcode/tvos devicesupport",
+    "/library/developer/xcode/userdata/previews/simulator devices",
     "/library/developer/coresimulator/caches",
     "/library/caches/com.apple.dt.xcode",
     "/library/caches/homebrew",
     "/library/caches/org.swift.swiftpm",
     "/library/caches/cocoapods",
+    "/library/caches/jetbrains",
+    "/.docker/buildx/cache",
     "/.npm/_cacache",
     "/library/caches/pnpm",
     "/library/caches/yarn",
@@ -94,10 +115,34 @@ const PRESERVE_PARENT_REL_PATHS: &[&str] = &[
     "/library/caches/pip",
     "/.cache/pip",
     "/.cache/uv",
+    "/library/caches/pypoetry",
+    "/library/caches/pipenv",
     "/.cargo/registry/cache",
+    "/.cargo/registry/src",
+    "/.rustup/downloads",
     "/.gradle/caches",
     "/.m2/repository",
     "/library/caches/go-build",
+    "/.android/cache",
+    "/.android/build-cache",
+    "/library/caches/ms-playwright",
+    "/.cache/ms-playwright",
+    "/.cache/puppeteer",
+    "/.cache/huggingface/hub",
+    "/library/caches/node-gyp",
+    "/.cache/node-gyp",
+    "/library/caches/electron",
+    "/.cache/deno",
+    "/.cache/typescript",
+    "/.cache/pre-commit",
+    "/.cache/ruff",
+    "/.cache/mypy",
+    "/.composer/cache",
+    "/.gem/cache",
+    "/.pyenv/cache",
+    "/.nvm/.cache",
+    "/.nuget/packages",
+    "/.pub-cache",
     "/library/caches/google/chrome",
     "/library/caches/bravesoftware",
     "/library/caches/microsoft edge",
@@ -109,6 +154,97 @@ const PRESERVE_PARENT_REL_PATHS: &[&str] = &[
     "/.trash",
 ];
 
+/// Exact disposable Electron/Chromium cache leaves under `~/Library/Application Support/<App>/`.
+const ELECTRON_CACHE_LEAVES: &[(&str, &str)] = &[
+    ("Cache", "Cache"),
+    ("Code Cache", "Code Cache"),
+    ("GPUCache", "GPU Cache"),
+    ("DawnCache", "Dawn Cache"),
+    ("DawnGraphiteCache", "Dawn Graphite Cache"),
+    ("DawnWebGPUCache", "Dawn WebGPU Cache"),
+    ("CachedData", "Cached Data"),
+    ("Service Worker/CacheStorage", "Service Worker Cache"),
+    ("Crashpad/completed", "Crash Reports"),
+];
+
+/// Maps `~/Library/Application Support/<folder>` names (lowercased) to their app bundle IDs for live-app detection.
+const APP_SUPPORT_BUNDLE_ALIASES: &[(&str, &str)] = &[
+    ("code", "com.microsoft.vscode"),
+    ("code - insiders", "com.microsoft.vscodeinsiders"),
+    ("cursor", "com.todesktop.230313mzl4w4u92"),
+    ("slack", "com.tinyspeck.slackmacgap"),
+    ("discord", "com.hnc.discord"),
+    ("spotify", "com.spotify.client"),
+    ("notion", "notion.id"),
+    ("figma", "com.figma.desktop"),
+    ("obsidian", "md.obsidian"),
+    ("claude", "com.anthropic.claudefordesktop"),
+    ("linear", "com.linear"),
+    ("tradingview", "com.tradingview.tradingviewapp.desktop"),
+    ("postman", "com.postmanlabs.mac"),
+    ("whatsapp", "net.whatsapp.whatsapp"),
+    ("microsoft teams", "com.microsoft.teams2"),
+    ("zed", "dev.zed.zed"),
+    ("windsurf", "com.exafunction.windsurf"),
+];
+
+const PROTECTED_APP_SUPPORT_NAMES: &[&str] = &[
+    "addressbook",
+    "anki2",
+    "bitwarden",
+    "callhistorydb",
+    "callhistorytransactions",
+    "clash",
+    "clashx",
+    "clouddocs",
+    "com.apple.idleassetsd",
+    "com.apple.sharedfilelist",
+    "com.apple.tcc",
+    "com.apple.wallpaper",
+    "crashreporter",
+    "crossover",
+    "dock",
+    "docker",
+    "epic",
+    "fileprovider",
+    "icdd",
+    "keepassxc",
+    "knowledge",
+    "lm studio",
+    "minecraft",
+    "mobilesync",
+    "ollama",
+    "orbstack",
+    "parallels",
+    "shadowsocksx-ng",
+    "steam",
+    "syncservices",
+    "tailscale",
+    "utm",
+    "v2rayu",
+    "whisky",
+    "wireguard",
+    "1password",
+];
+
+const PROTECTED_CONTAINER_PREFIXES: &[&str] = &[
+    "com.apple.",
+    "com.local.upkeep",
+    "com.docker.",
+    "dev.orbstack.",
+    "dev.kdrag0n.macvirt",
+    "com.utmapp.utm",
+    "com.isaacmarovitz.whisky",
+    "com.parallels.",
+    "io.tailscale.",
+    "com.wireguard.",
+    "com.agilebits.",
+    "com.1password.",
+    "com.bitwarden.",
+];
+
+const INSTALLER_EXTENSIONS: &[&str] = &["dmg", "pkg", "mpkg", "iso", "xip"];
+
 fn format_display_path(path_str: &str, home: &str) -> String {
     if !home.is_empty() && path_str.starts_with(home) {
         let rest = &path_str[home.len()..];
@@ -118,6 +254,216 @@ fn format_display_path(path_str: &str, home: &str) -> String {
     }
     path_str.to_string()
 }
+
+// MARK: - Live Running-App & Installed-App Detection
+
+#[cfg(target_os = "macos")]
+fn collect_running_apps() -> RunningApps {
+    let mut bundle_ids = HashSet::new();
+    let mut app_names = HashSet::new();
+
+    let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return RunningApps {
+            bundle_ids,
+            app_names,
+        };
+    }
+
+    let mut pids = vec![0 as c_int; (count as usize) + 64];
+    let filled = unsafe {
+        proc_listallpids(
+            pids.as_mut_ptr() as *mut c_void,
+            (pids.len() * std::mem::size_of::<c_int>()) as c_int,
+        )
+    };
+    if filled <= 0 {
+        return RunningApps {
+            bundle_ids,
+            app_names,
+        };
+    }
+
+    let mut seen_bundles: HashSet<PathBuf> = HashSet::new();
+    let mut path_buf = vec![0u8; 4096];
+
+    for &pid in &pids[..(filled as usize).min(pids.len())] {
+        if pid <= 0 {
+            continue;
+        }
+        let len = unsafe {
+            proc_pidpath(
+                pid,
+                path_buf.as_mut_ptr() as *mut c_void,
+                path_buf.len() as u32,
+            )
+        };
+        if len <= 0 {
+            continue;
+        }
+        let Ok(exec_path) = std::str::from_utf8(&path_buf[..(len as usize).min(path_buf.len())])
+        else {
+            continue;
+        };
+        if let Some(app_idx) = exec_path.find(".app/") {
+            let bundle_path = PathBuf::from(&exec_path[..app_idx + 4]);
+            seen_bundles.insert(bundle_path);
+        }
+    }
+
+    for bundle_path in seen_bundles {
+        if let Some(stem) = bundle_path.file_stem().and_then(|s| s.to_str()) {
+            let lower = stem.to_ascii_lowercase();
+            if !lower.is_empty() {
+                app_names.insert(lower);
+            }
+        }
+        let bid = read_bundle_id(&bundle_path);
+        if !bid.is_empty() {
+            bundle_ids.insert(bid.to_ascii_lowercase());
+        }
+    }
+
+    RunningApps {
+        bundle_ids,
+        app_names,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn collect_running_apps() -> RunningApps {
+    RunningApps {
+        bundle_ids: HashSet::new(),
+        app_names: HashSet::new(),
+    }
+}
+
+impl RunningApps {
+    fn is_bundle_running(&self, candidate_lower: &str) -> bool {
+        bundle_id_matches_set(candidate_lower, &self.bundle_ids)
+    }
+
+    fn is_app_name_running(&self, name_lower: &str) -> bool {
+        if self.app_names.contains(name_lower) {
+            return true;
+        }
+        for &(folder_key, bid) in APP_SUPPORT_BUNDLE_ALIASES {
+            if folder_key == name_lower && self.is_bundle_running(bid) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn collect_installed_bundle_ids(home_path: &Path) -> HashSet<String> {
+    let mut app_paths: Vec<PathBuf> = Vec::new();
+    let app_roots = [
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+        home_path.join("Applications"),
+        PathBuf::from("/Applications/Setapp"),
+    ];
+
+    for root in app_roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("app") {
+                app_paths.push(p);
+            } else if p.is_dir() {
+                // Scan 1 level deep (e.g. /Applications/Utilities/*.app)
+                if let Ok(sub_entries) = fs::read_dir(&p) {
+                    for sub in sub_entries.flatten() {
+                        let sp = sub.path();
+                        if sp.extension().and_then(|e| e.to_str()) == Some("app") {
+                            app_paths.push(sp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also include Homebrew Caskroom app bundles so cask-installed apps are never misclassified as orphaned
+    for caskroom in ["/opt/homebrew/Caskroom", "/usr/local/Caskroom"] {
+        let Ok(tokens) = fs::read_dir(caskroom) else {
+            continue;
+        };
+        for token_entry in tokens.flatten() {
+            let Ok(versions) = fs::read_dir(token_entry.path()) else {
+                continue;
+            };
+            for ver_entry in versions.flatten() {
+                let Ok(items) = fs::read_dir(ver_entry.path()) else {
+                    continue;
+                };
+                for item in items.flatten() {
+                    let ip = item.path();
+                    if ip.extension().and_then(|e| e.to_str()) == Some("app") {
+                        app_paths.push(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    app_paths
+        .par_iter()
+        .filter_map(|p| {
+            let bid = read_bundle_id(p);
+            if bid.is_empty() {
+                None
+            } else {
+                Some(bid.to_ascii_lowercase())
+            }
+        })
+        .collect()
+}
+
+fn is_reverse_dns_bundle_id(name: &str) -> bool {
+    let segments: Vec<&str> = name.split('.').collect();
+    if segments.len() < 3 {
+        return false;
+    }
+    let first = segments[0];
+    if first.is_empty() || !first.as_bytes()[0].is_ascii_alphabetic() {
+        return false;
+    }
+    segments.iter().all(|seg| {
+        !seg.is_empty()
+            && seg
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
+fn bundle_id_matches_set(candidate_lower: &str, set: &HashSet<String>) -> bool {
+    if set.contains(candidate_lower) {
+        return true;
+    }
+    let cand_bytes = candidate_lower.as_bytes();
+    for id in set {
+        let id_bytes = id.as_bytes();
+        if cand_bytes.len() > id_bytes.len()
+            && cand_bytes[id_bytes.len()] == b'.'
+            && &cand_bytes[..id_bytes.len()] == id_bytes
+        {
+            return true;
+        }
+        if id_bytes.len() > cand_bytes.len()
+            && id_bytes[cand_bytes.len()] == b'.'
+            && &id_bytes[..cand_bytes.len()] == cand_bytes
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// MARK: - Path Protection & Validation
 
 fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
     const PROTECTED_PREFIXES: &[&str] = &[
@@ -129,11 +475,25 @@ fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
         "/.codex",
         "/.gemini",
         "/.opencode",
+        "/.orbstack",
+        "/.cargo/bin",
+        "/.rustup/toolchains",
+        "/.yarn/berry",
+        "/library/caches/yarn/berry",
+        "/library/jupyter/runtime",
         "/library/keychains",
+        "/library/messages/attachments",
         "/library/caches/com.local.upkeep",
         "/library/caches/cloudkit",
         "/library/application support/steam",
         "/library/application support/epic",
+        "/library/application support/com.apple.wallpaper",
+        "/library/application support/com.apple.idleassetsd",
+        "/library/application support/dock",
+        "/library/application support/mobilesync",
+        "/library/application support/clouddocs",
+        "/library/application support/addressbook",
+        "/library/group containers/group.com.apple.notes",
         "/library/unity",
     ];
     for prefix in PROTECTED_PREFIXES {
@@ -148,6 +508,35 @@ fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
         {
             return true;
         }
+    }
+    if let Some(group_entry) = rel_lower.strip_prefix("/library/group containers/") {
+        if group_entry.contains("dev.orbstack") || group_entry.starts_with("group.com.apple.") {
+            return true;
+        }
+    }
+    if let Some(container_entry) = rel_lower.strip_prefix("/library/containers/") {
+        for pref in PROTECTED_CONTAINER_PREFIXES {
+            if container_entry.starts_with(pref) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Checks that no directory component strictly between `base` and `target` is a symlink.
+fn has_symlinked_ancestor(path: &Path, base: &Path) -> bool {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if dir == base || dir.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(meta) = fs::symlink_metadata(dir) {
+            if meta.file_type().is_symlink() {
+                return true;
+            }
+        }
+        current = dir.parent();
     }
     false
 }
@@ -165,6 +554,10 @@ pub(crate) fn validate_clean_target(
     if !path.is_absolute() {
         return Err("Path must be absolute".to_string());
     }
+    let raw_str = path.to_string_lossy();
+    if raw_str.chars().any(|c| c.is_control()) {
+        return Err("Path contains control characters".to_string());
+    }
     for comp in path.components() {
         if matches!(comp, Component::ParentDir) {
             return Err("Path traversal ('..') is not allowed".to_string());
@@ -178,6 +571,16 @@ pub(crate) fn validate_clean_target(
 
     let home_trimmed = home.trim_end_matches('/');
     let tmp_trimmed = tmpdir.trim_end_matches('/');
+
+    if !home_trimmed.is_empty() && raw_str.starts_with(home_trimmed) {
+        if has_symlinked_ancestor(path, Path::new(home_trimmed)) {
+            return Err("Refused to traverse symlinked ancestor directory".to_string());
+        }
+    } else if !tmp_trimmed.is_empty() && raw_str.starts_with(tmp_trimmed) {
+        if has_symlinked_ancestor(path, Path::new(tmp_trimmed)) {
+            return Err("Refused to traverse symlinked ancestor directory".to_string());
+        }
+    }
 
     let canonical_target = if let (Some(parent), Some(fname)) = (path.parent(), path.file_name()) {
         if let Ok(canon_parent) = fs::canonicalize(parent) {
@@ -255,7 +658,9 @@ pub(crate) fn validate_clean_target(
             return Err("Path is protected".to_string());
         }
 
-        let preserve_parent = PRESERVE_PARENT_REL_PATHS.contains(&rel_lower.as_str());
+        let preserve_parent = PRESERVE_PARENT_REL_PATHS.contains(&rel_lower.as_str())
+            || (rel_lower.starts_with("/library/containers/")
+                && rel_lower.ends_with("/data/library/caches"));
         return Ok(preserve_parent);
     }
 
@@ -320,8 +725,16 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
     }
 
     let home_path = PathBuf::from(&home);
+
+    // Collect running apps and installed app bundle IDs in parallel (~5-15ms total)
+    let (running_apps, installed_bundle_ids) = rayon::join(
+        collect_running_apps,
+        || collect_installed_bundle_ids(&home_path),
+    );
+
     let mut targets: Vec<ScanTarget> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
 
     let mut push_target = |cat_id: &'static str,
                            cat_title: &'static str,
@@ -329,30 +742,46 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                            path: PathBuf,
                            default_selected: bool,
                            holdback_reason: Option<&'static str>| {
-        if let Ok(meta) = fs::symlink_metadata(&path) {
-            if meta.file_type().is_symlink() {
-                return;
-            }
-            if is_protected_path(&path, &home) {
-                return;
-            }
-            if seen_paths.insert(path.clone()) {
-                targets.push(ScanTarget {
-                    category_id: cat_id,
-                    category_title: cat_title,
-                    name,
-                    path,
-                    default_selected,
-                    holdback_reason,
-                });
-            }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
         }
+        if is_protected_path(&path, &home) {
+            return;
+        }
+        let dev_ino = (meta.dev(), meta.ino());
+        if !seen_paths.insert(path.clone()) || !seen_inodes.insert(dev_ino) {
+            return;
+        }
+        targets.push(ScanTarget {
+            category_id: cat_id,
+            category_title: cat_title,
+            name,
+            path,
+            default_selected,
+            holdback_reason,
+        });
     };
 
-    // 1. Developer Tools & Package Managers
+    // 1. Developer Tools, Package Managers & AI/ML Caches
     let dev_specs: &[(&str, &str, bool, Option<&str>)] = &[
         ("Xcode DerivedData", "Library/Developer/Xcode/DerivedData", true, None),
         ("Xcode Caches", "Library/Caches/com.apple.dt.Xcode", true, None),
+        ("Xcode Products", "Library/Developer/Xcode/Products", true, None),
+        (
+            "SwiftUI Previews",
+            "Library/Developer/Xcode/UserData/Previews/Simulator Devices",
+            true,
+            None,
+        ),
+        (
+            "Xcode Archives",
+            "Library/Developer/Xcode/Archives",
+            false,
+            Some("Removes archived app builds"),
+        ),
         (
             "iOS DeviceSupport",
             "Library/Developer/Xcode/iOS DeviceSupport",
@@ -375,15 +804,31 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
         ("Homebrew Download Cache", "Library/Caches/Homebrew", true, None),
         ("SwiftPM Cache", "Library/Caches/org.swift.swiftpm", true, None),
         ("CocoaPods Cache", "Library/Caches/CocoaPods", true, None),
+        ("JetBrains Caches", "Library/Caches/JetBrains", true, None),
+        ("Docker Buildx Cache", ".docker/buildx/cache", true, None),
         ("npm Cache", ".npm/_cacache", true, None),
         ("pnpm Store Cache", "Library/Caches/pnpm", true, None),
-        ("Yarn Cache", "Library/Caches/Yarn", true, None),
+        ("Yarn Classic Cache", "Library/Caches/Yarn", true, None),
         ("Bun Install Cache", ".bun/install/cache", true, None),
+        ("node-gyp Cache (Library)", "Library/Caches/node-gyp", true, None),
+        ("node-gyp Cache (~/.cache)", ".cache/node-gyp", true, None),
+        ("Electron Download Cache", "Library/Caches/electron", true, None),
+        ("Deno Cache", ".cache/deno", true, None),
+        ("TypeScript Cache", ".cache/typescript", true, None),
         ("pip Cache (Library)", "Library/Caches/pip", true, None),
         ("pip Cache (~/.cache)", ".cache/pip", true, None),
         ("uv Cache", ".cache/uv", true, None),
+        ("Poetry Cache", "Library/Caches/pypoetry", true, None),
+        ("Pipenv Cache", "Library/Caches/pipenv", true, None),
+        ("Ruff Cache", ".cache/ruff", true, None),
+        ("Mypy Cache", ".cache/mypy", true, None),
+        ("pre-commit Cache", ".cache/pre-commit", true, None),
         ("Cargo Registry Cache", ".cargo/registry/cache", true, None),
+        ("Cargo Extracted Sources", ".cargo/registry/src", true, None),
+        ("Rustup Downloads", ".rustup/downloads", true, None),
         ("Gradle Caches", ".gradle/caches", true, None),
+        ("Android Cache", ".android/cache", true, None),
+        ("Android Build Cache", ".android/build-cache", true, None),
         (
             "Maven Repository",
             ".m2/repository",
@@ -391,6 +836,31 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
             Some("Re-downloads Maven dependencies"),
         ),
         ("Go Build Cache", "Library/Caches/go-build", true, None),
+        ("Playwright Browsers (Library)", "Library/Caches/ms-playwright", true, None),
+        ("Playwright Browsers (~/.cache)", ".cache/ms-playwright", true, None),
+        ("Puppeteer Cache", ".cache/puppeteer", true, None),
+        ("Composer Cache", ".composer/cache", true, None),
+        ("RubyGems Cache", ".gem/cache", true, None),
+        ("pyenv Cache", ".pyenv/cache", true, None),
+        ("nvm Cache", ".nvm/.cache", true, None),
+        (
+            "Hugging Face Hub Cache",
+            ".cache/huggingface/hub",
+            false,
+            Some("Re-downloads Hugging Face models"),
+        ),
+        (
+            "NuGet Packages",
+            ".nuget/packages",
+            false,
+            Some("Re-downloads NuGet packages"),
+        ),
+        (
+            "Dart / Flutter Pub Cache",
+            ".pub-cache",
+            false,
+            Some("Re-downloads Dart/Flutter packages"),
+        ),
     ];
     for &(name, rel, default_sel, holdback) in dev_specs {
         push_target(
@@ -404,28 +874,78 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
     }
 
     // 2. Browser Caches (Caches ONLY — never profiles, cookies, bookmarks, or sessions)
-    let browser_specs: &[(&str, &str)] = &[
-        ("Google Chrome Cache", "Library/Caches/Google/Chrome"),
-        ("Brave Cache", "Library/Caches/BraveSoftware"),
-        ("Microsoft Edge Cache", "Library/Caches/Microsoft Edge"),
-        ("Arc Cache", "Library/Caches/company.thebrowser.Browser"),
-        ("Firefox Cache", "Library/Caches/Firefox"),
-        ("Zen Cache", "Library/Caches/zen"),
-        ("Vivaldi Cache", "Library/Caches/Vivaldi"),
-        ("Opera Cache", "Library/Caches/com.operasoftware.Opera"),
+    let browser_specs: &[(&str, &str, &str)] = &[
+        ("Google Chrome Cache", "Library/Caches/Google/Chrome", "com.google.chrome"),
+        ("Brave Cache", "Library/Caches/BraveSoftware", "com.brave.browser"),
+        ("Microsoft Edge Cache", "Library/Caches/Microsoft Edge", "com.microsoft.edgemac"),
+        ("Arc Cache", "Library/Caches/company.thebrowser.Browser", "company.thebrowser.browser"),
+        ("Firefox Cache", "Library/Caches/Firefox", "org.mozilla.firefox"),
+        ("Zen Cache", "Library/Caches/zen", "app.zen-browser.zen"),
+        ("Vivaldi Cache", "Library/Caches/Vivaldi", "com.vivaldi.vivaldi"),
+        ("Opera Cache", "Library/Caches/com.operasoftware.Opera", "com.operasoftware.opera"),
     ];
-    for &(name, rel) in browser_specs {
+    for &(name, rel, bid) in browser_specs {
+        let is_running = running_apps.is_bundle_running(bid);
         push_target(
             "browser_caches",
             "Browser Caches",
             name.to_string(),
             home_path.join(rel),
-            true,
-            None,
+            !is_running,
+            if is_running {
+                Some("Browser is currently running")
+            } else {
+                None
+            },
         );
     }
 
-    // 3. User App Caches (~/Library/Caches/*)
+    // 3. Electron & Chromium App Internal Caches (~/Library/Application Support/<App>/<exact cache leaf>)
+    let app_support_dir = home_path.join("Library/Application Support");
+    if let Ok(entries) = fs::read_dir(&app_support_dir) {
+        for entry in entries.flatten() {
+            let app_dir = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&app_dir) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                continue;
+            }
+            let app_name = entry.file_name().to_string_lossy().into_owned();
+            let app_lower = app_name.to_ascii_lowercase();
+            if app_name.starts_with('.')
+                || app_lower.starts_with("com.apple.")
+                || PROTECTED_APP_SUPPORT_NAMES.contains(&app_lower.as_str())
+            {
+                continue;
+            }
+            let is_running = running_apps.is_app_name_running(&app_lower)
+                || running_apps.is_bundle_running(&app_lower);
+            for &(leaf_rel, leaf_label) in ELECTRON_CACHE_LEAVES {
+                let leaf_path = app_dir.join(leaf_rel);
+                if leaf_path.exists() {
+                    push_target(
+                        "app_internal_caches",
+                        "App Internal Caches",
+                        format!("{} — {}", app_name, leaf_label),
+                        leaf_path,
+                        !is_running,
+                        if is_running {
+                            Some("App is currently running")
+                        } else {
+                            None
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let orphan_cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(30 * 24 * 3600))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    // 4. User App Caches (~/Library/Caches/*) + Orphaned Cache Detection
     let caches_dir = home_path.join("Library/Caches");
     if let Ok(entries) = fs::read_dir(&caches_dir) {
         for entry in entries.flatten() {
@@ -438,9 +958,15 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                 || lower == "com.local.upkeep"
                 || lower == "org.swift.swiftpm"
                 || lower == "cocoapods"
+                || lower == "jetbrains"
                 || lower == "pnpm"
                 || lower == "yarn"
                 || lower == "pip"
+                || lower == "pypoetry"
+                || lower == "pipenv"
+                || lower == "node-gyp"
+                || lower == "electron"
+                || lower == "ms-playwright"
                 || lower == "go-build"
                 || lower == "bravesoftware"
                 || lower == "microsoft edge"
@@ -459,9 +985,10 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                         if gname.starts_with('.') || gname.eq_ignore_ascii_case("chrome") {
                             continue;
                         }
+                        let is_android_studio = gname.to_ascii_lowercase().starts_with("androidstudio");
                         push_target(
-                            "user_app_caches",
-                            "User App Caches",
+                            if is_android_studio { "developer_tools" } else { "user_app_caches" },
+                            if is_android_studio { "Developer Tools" } else { "User App Caches" },
                             format!("Google {}", gname),
                             ge.path(),
                             true,
@@ -471,11 +998,82 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                 }
                 continue;
             }
-            push_target("user_app_caches", "User App Caches", name, entry.path(), true, None);
+
+            let entry_path = entry.path();
+            let is_running = running_apps.is_bundle_running(&lower)
+                || running_apps.is_app_name_running(&lower);
+
+            if !is_running
+                && is_reverse_dns_bundle_id(&lower)
+                && !installed_bundle_ids.is_empty()
+                && !bundle_id_matches_set(&lower, &installed_bundle_ids)
+            {
+                let is_stale_30d = fs::symlink_metadata(&entry_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map_or(false, |mtime| mtime <= orphan_cutoff);
+                if is_stale_30d {
+                    push_target(
+                        "orphaned_leftovers",
+                        "Orphaned App Leftovers",
+                        format!("{} (Cache)", name),
+                        entry_path,
+                        false,
+                        Some("App not installed (30d+ inactive)"),
+                    );
+                    continue;
+                }
+            }
+
+            push_target(
+                "user_app_caches",
+                "User App Caches",
+                name,
+                entry_path,
+                !is_running,
+                if is_running {
+                    Some("App is currently running")
+                } else {
+                    None
+                },
+            );
         }
     }
 
-    // 4. Logs & Diagnostics
+    // 4b. Sandboxed App Container Caches (~/Library/Containers/<bundle_id>/Data/Library/Caches)
+    let containers_dir = home_path.join("Library/Containers");
+    if let Ok(entries) = fs::read_dir(&containers_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let lower = name.to_ascii_lowercase();
+            if name.starts_with('.')
+                || PROTECTED_CONTAINER_PREFIXES
+                    .iter()
+                    .any(|pref| lower.starts_with(pref))
+            {
+                continue;
+            }
+            let container_cache = entry.path().join("Data/Library/Caches");
+            if !container_cache.is_dir() {
+                continue;
+            }
+            let is_running = running_apps.is_bundle_running(&lower);
+            push_target(
+                "user_app_caches",
+                "User App Caches",
+                format!("{} (Container)", name),
+                container_cache,
+                !is_running,
+                if is_running {
+                    Some("App is currently running")
+                } else {
+                    None
+                },
+            );
+        }
+    }
+
+    // 5. Logs & Diagnostics
     let logs_dir = home_path.join("Library/Logs");
     if let Ok(entries) = fs::read_dir(&logs_dir) {
         for entry in entries.flatten() {
@@ -504,7 +1102,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
         }
     }
 
-    // 5. Saved Application State & Stale Temp Files (>24h)
+    // 6. Saved Application State (+ Orphaned Saved State) & Stale Temp Files (>24h)
     let saved_state_dir = home_path.join("Library/Saved Application State");
     if let Ok(entries) = fs::read_dir(&saved_state_dir) {
         for entry in entries.flatten() {
@@ -513,23 +1111,50 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                 continue;
             }
             let clean_name = name.trim_end_matches(".savedState").to_string();
+            let clean_lower = clean_name.to_ascii_lowercase();
+            let entry_path = entry.path();
+
+            if !clean_lower.starts_with("com.apple.")
+                && !running_apps.is_bundle_running(&clean_lower)
+                && is_reverse_dns_bundle_id(&clean_lower)
+                && !installed_bundle_ids.is_empty()
+                && !bundle_id_matches_set(&clean_lower, &installed_bundle_ids)
+            {
+                let is_stale_30d = fs::symlink_metadata(&entry_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map_or(false, |mtime| mtime <= orphan_cutoff);
+                if is_stale_30d {
+                    push_target(
+                        "orphaned_leftovers",
+                        "Orphaned App Leftovers",
+                        format!("{} (Saved State)", clean_name),
+                        entry_path,
+                        false,
+                        Some("App not installed (30d+ inactive)"),
+                    );
+                    continue;
+                }
+            }
+
             push_target(
                 "saved_state_temp",
                 "Saved State & Temp",
                 clean_name,
-                entry.path(),
+                entry_path,
                 false,
                 Some("Resets open window positions"),
             );
         }
     }
 
+    let temp_cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(24 * 3600))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
         let tmp_path = PathBuf::from(&tmpdir);
         let my_uid = unsafe { getuid() };
-        let cutoff = SystemTime::now()
-            .checked_sub(Duration::from_secs(24 * 3600))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         if let Ok(entries) = fs::read_dir(&tmp_path) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -553,7 +1178,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                     continue;
                 }
                 let modified = meta.modified().unwrap_or(SystemTime::now());
-                if modified > cutoff {
+                if modified > temp_cutoff {
                     continue;
                 }
                 push_target(
@@ -568,7 +1193,41 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
         }
     }
 
-    // 6. User Trash (optional, unchecked by default)
+    // 7. Old Installers in ~/Downloads (.dmg, .pkg, .mpkg, .iso, .xip > 24h old, unchecked by default)
+    let downloads_dir = home_path.join("Downloads");
+    if let Ok(entries) = fs::read_dir(&downloads_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            let ext_lower = ext.to_ascii_lowercase();
+            if !INSTALLER_EXTENSIONS.contains(&ext_lower.as_str()) {
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            let modified = meta.modified().unwrap_or(SystemTime::now());
+            if modified > temp_cutoff {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            push_target(
+                "old_installers",
+                "Old Installers",
+                name,
+                p,
+                false,
+                Some("Installer archive in Downloads"),
+            );
+        }
+    }
+
+    // 8. User Trash (optional, unchecked by default)
     push_target(
         "user_trash",
         "Trash",
@@ -767,10 +1426,29 @@ mod tests {
         assert!(validate_clean_target(Path::new("/Users/tester/Library/Caches/com.local.Upkeep"), home, tmp).is_err());
         assert!(validate_clean_target(Path::new("/Users/tester/.ssh"), home, tmp).is_err());
         assert!(validate_clean_target(Path::new("/Users/tester/Library/Caches/../Documents"), home, tmp).is_err());
+        assert!(validate_clean_target(Path::new("/Users/tester/Library/Caches/bad\nname"), home, tmp).is_err());
+        assert!(is_cleaner_protected_rel("/.yarn/berry/cache"));
+        assert!(is_cleaner_protected_rel("/library/jupyter/runtime"));
+        assert!(is_cleaner_protected_rel("/library/application support/com.apple.wallpaper/aerials"));
+        assert!(is_cleaner_protected_rel("/library/containers/com.docker.docker/data/library/caches"));
+        assert!(is_cleaner_protected_rel("/.orbstack/data"));
     }
 
     #[test]
-    fn cleans_temp_target_and_rejects_symlink() {
+    fn reverse_dns_and_boundary_matching() {
+        assert!(is_reverse_dns_bundle_id("com.spotify.client"));
+        assert!(!is_reverse_dns_bundle_id("v1.2.3"));
+        assert!(!is_reverse_dns_bundle_id("Homebrew"));
+
+        let mut installed = HashSet::new();
+        installed.insert("com.example.app".to_string());
+        assert!(bundle_id_matches_set("com.example.app", &installed));
+        assert!(bundle_id_matches_set("com.example.app.shipit", &installed));
+        assert!(!bundle_id_matches_set("com.example.app2", &installed));
+    }
+
+    #[test]
+    fn cleans_temp_target_and_rejects_symlink_and_symlinked_ancestor() {
         let base = std::env::temp_dir().join(format!("upkeep_cleaner_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
@@ -781,10 +1459,19 @@ mod tests {
         let link_b = base.join("sneaky_link");
         symlink(&file_a, &link_b).unwrap();
 
+        let real_dir = base.join("real_dir");
+        fs::create_dir_all(&real_dir).unwrap();
+        let nested_file = real_dir.join("inner.bin");
+        fs::write(&nested_file, vec![7u8; 4096]).unwrap();
+        let linked_dir = base.join("linked_dir");
+        symlink(&real_dir, &linked_dir).unwrap();
+        let via_linked_ancestor = linked_dir.join("inner.bin");
+
         let tmp_str = base.to_string_lossy().into_owned();
         let home_str = "/Users/nonexistent_test_home";
 
         assert!(validate_clean_target(&link_b, home_str, &tmp_str).is_err());
+        assert!(validate_clean_target(&via_linked_ancestor, home_str, &tmp_str).is_err());
 
         let dry = clean_paths_internal(vec![file_a.to_string_lossy().into_owned()], true, home_str, &tmp_str);
         assert_eq!(dry.removed_count, 1);

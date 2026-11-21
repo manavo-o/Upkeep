@@ -1838,7 +1838,7 @@ fn extract_xml_plist_string(bytes: &[u8], key_tag: &[u8]) -> Option<String> {
     Some(raw.to_string())
 }
 
-fn read_bundle_id(app_path: &Path) -> String {
+pub(crate) fn read_bundle_id(app_path: &Path) -> String {
     let plist_path = app_path.join("Contents").join("Info.plist");
     let Ok(bytes) = fs::read(&plist_path) else {
         return String::new();
