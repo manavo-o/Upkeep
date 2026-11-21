@@ -687,6 +687,7 @@ public enum UpkeepEngine {
                 let size_bytes: UInt64
                 let default_selected: Bool
                 let holdback_reason: String?
+                let requires_admin: Bool?
             }
             struct WireCleanerCategory: Decodable {
                 let id: String
@@ -722,7 +723,8 @@ public enum UpkeepEngine {
                             displayPath: item.display_path,
                             sizeBytes: Int64(item.size_bytes),
                             defaultSelected: item.default_selected,
-                            holdbackReason: item.holdback_reason
+                            holdbackReason: item.holdback_reason,
+                            requiresAdmin: item.requires_admin ?? false
                         )
                     }
                 )

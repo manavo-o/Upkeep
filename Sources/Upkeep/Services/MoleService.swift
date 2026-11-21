@@ -12,6 +12,7 @@ public struct CleanerItem: Identifiable, Sendable, Hashable {
     public let sizeBytes: Int64
     public let defaultSelected: Bool
     public let holdbackReason: String?
+    public let requiresAdmin: Bool
     public let formattedSize: String
 
     public init(
@@ -22,7 +23,8 @@ public struct CleanerItem: Identifiable, Sendable, Hashable {
         displayPath: String,
         sizeBytes: Int64,
         defaultSelected: Bool,
-        holdbackReason: String?
+        holdbackReason: String?,
+        requiresAdmin: Bool = false
     ) {
         self.id = id
         self.category = category
@@ -32,6 +34,7 @@ public struct CleanerItem: Identifiable, Sendable, Hashable {
         self.sizeBytes = sizeBytes
         self.defaultSelected = defaultSelected
         self.holdbackReason = holdbackReason
+        self.requiresAdmin = requiresAdmin
         self.formattedSize = sizeBytes > 0
             ? ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
             : "< 1 KB"
@@ -310,9 +313,158 @@ public actor MoleService {
         await UpkeepEngine.scanCleanerNative()
     }
 
-    /// Executes safe parallel cleanup of the selected paths via the native Rust cleaner engine.
-    public func executeNativeClean(paths: [String], dryRun: Bool = false) async -> CleanExecutionResult {
-        await UpkeepEngine.cleanPathsNative(paths, dryRun: dryRun)
+    /// Executes safe parallel cleanup of the selected user paths via Rust and optional allowlisted
+    /// system paths via a single native macOS administrator authorization prompt.
+    public func executeNativeClean(
+        paths: [String],
+        adminPaths: [String] = [],
+        dryRun: Bool = false
+    ) async -> CleanExecutionResult {
+        let userResult: CleanExecutionResult = paths.isEmpty
+            ? .empty(dryRun: dryRun)
+            : await UpkeepEngine.cleanPathsNative(paths, dryRun: dryRun)
+
+        guard !adminPaths.isEmpty else {
+            return userResult
+        }
+
+        let adminResult = await executeAdminClean(paths: adminPaths, dryRun: dryRun)
+        return CleanExecutionResult(
+            reclaimedBytes: userResult.reclaimedBytes + adminResult.reclaimedBytes,
+            removedCount: userResult.removedCount + adminResult.removedCount,
+            failedItems: userResult.failedItems + adminResult.failedItems,
+            durationMs: userResult.durationMs + adminResult.durationMs,
+            dryRun: dryRun
+        )
+    }
+
+    private static let allowedAdminDirRoots: Set<String> = [
+        "/Library/Developer/CoreSimulator/Caches/dyld",
+        "/Library/Logs/DiagnosticReports",
+        "/private/var/db/diagnostics/Special",
+        "/private/var/db/diagnostics/Persist",
+        "/private/var/db/DiagnosticPipeline",
+        "/private/var/db/reportmemoryexception"
+    ]
+
+    private static let allowedAdminFilePrefixes: [String] = [
+        "/private/var/log/",
+        "/private/var/db/powerlog/",
+        "/Library/Caches/",
+        "/private/tmp/",
+        "/private/var/tmp/",
+        "/Library/LaunchDaemons/",
+        "/Library/LaunchAgents/"
+    ]
+
+    private static func isAllowedAdminTarget(_ rawPath: String) -> (allowed: Bool, preserveParent: Bool) {
+        guard rawPath.hasPrefix("/"),
+              !rawPath.contains("/../"),
+              !rawPath.hasSuffix("/.."),
+              !rawPath.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            return (false, false)
+        }
+        let trimmed = rawPath.hasSuffix("/") ? String(rawPath.dropLast()) : rawPath
+        if allowedAdminDirRoots.contains(trimmed) {
+            return (true, true)
+        }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("/private/var/db/powerlog/") {
+            let base = (lower as NSString).lastPathComponent
+            if base.hasPrefix("current") || base.hasSuffix("-wal") || base.hasSuffix("-shm") {
+                return (false, false)
+            }
+        }
+        if lower.hasPrefix("/library/launchdaemons/") || lower.hasPrefix("/library/launchagents/") {
+            let base = (lower as NSString).lastPathComponent
+            if base.hasPrefix("com.apple.") || !base.hasSuffix(".plist") {
+                return (false, false)
+            }
+        }
+        for prefix in allowedAdminFilePrefixes where trimmed.hasPrefix(prefix) && trimmed.count > prefix.count {
+            return (true, false)
+        }
+        return (false, false)
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func executeAdminClean(paths: [String], dryRun: Bool) async -> CleanExecutionResult {
+        let started = Date()
+        var validTargets: [(path: String, preserveParent: Bool, size: Int64)] = []
+        var failed: [CleanFailedItem] = []
+
+        for path in Set(paths) {
+            let check = Self.isAllowedAdminTarget(path)
+            guard check.allowed else {
+                failed.append(CleanFailedItem(path: path, error: "System path is outside allowed admin targets"))
+                continue
+            }
+            let size = UpkeepEngine.calculatePathSize(atPath: path)
+            validTargets.append((path, check.preserveParent, size))
+        }
+
+        guard !validTargets.isEmpty else {
+            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            return CleanExecutionResult(reclaimedBytes: 0, removedCount: 0, failedItems: failed, durationMs: elapsed, dryRun: dryRun)
+        }
+
+        if dryRun {
+            let total = validTargets.reduce(Int64(0)) { $0 + $1.size }
+            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            return CleanExecutionResult(reclaimedBytes: total, removedCount: validTargets.count, failedItems: failed, durationMs: elapsed, dryRun: true)
+        }
+
+        var commands: [String] = []
+        for target in validTargets {
+            let q = Self.shellQuote(target.path)
+            if target.preserveParent {
+                commands.append("if [ -d \(q) ] && [ ! -L \(q) ]; then find \(q) -mindepth 1 -maxdepth 1 ! -type l -exec rm -rf {} + 2>/dev/null || true; fi")
+            } else {
+                commands.append("if [ ! -L \(q) ]; then rm -rf \(q) 2>/dev/null || true; fi")
+            }
+        }
+        let shellScript = commands.joined(separator: "; ")
+        let escapedForAppleScript = shellScript
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let appleScript = "do shell script \"\(escapedForAppleScript)\" with administrator privileges"
+
+        do {
+            let res = try await CLIExecutor.run(binary: "/usr/bin/osascript", arguments: ["-e", appleScript])
+            if res.exitCode != 0 {
+                let errText = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let msg = errText.isEmpty ? "Administrator authorization was cancelled" : errText
+                for target in validTargets {
+                    failed.append(CleanFailedItem(path: target.path, error: msg))
+                }
+                let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+                return CleanExecutionResult(reclaimedBytes: 0, removedCount: 0, failedItems: failed, durationMs: elapsed, dryRun: false)
+            }
+        } catch {
+            for target in validTargets {
+                failed.append(CleanFailedItem(path: target.path, error: error.localizedDescription))
+            }
+            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            return CleanExecutionResult(reclaimedBytes: 0, removedCount: 0, failedItems: failed, durationMs: elapsed, dryRun: false)
+        }
+
+        var reclaimed: Int64 = 0
+        var removed = 0
+        for target in validTargets {
+            let afterSize = UpkeepEngine.calculatePathSize(atPath: target.path)
+            let delta = max(0, target.size - afterSize)
+            if delta > 0 || !FileManager.default.fileExists(atPath: target.path) {
+                reclaimed += delta > 0 ? delta : target.size
+                removed += 1
+            } else {
+                failed.append(CleanFailedItem(path: target.path, error: "Could not remove protected system item"))
+            }
+        }
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        return CleanExecutionResult(reclaimedBytes: reclaimed, removedCount: removed, failedItems: failed, durationMs: elapsed, dryRun: false)
     }
 
     public func listInstalledApps(forceRefresh: Bool = false) async throws -> [MoleInstalledApp] {

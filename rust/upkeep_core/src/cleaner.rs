@@ -2,7 +2,7 @@ use crate::{
     calculate_path_size_accurate, cstr_to_str, is_protected_path, read_bundle_id, string_to_cstr,
 };
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
@@ -32,6 +32,7 @@ pub struct CleanerItem {
     pub size_bytes: u64,
     pub default_selected: bool,
     pub holdback_reason: Option<String>,
+    pub requires_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +67,14 @@ pub struct CleanExecutionPayload {
     pub dry_run: bool,
 }
 
+#[derive(Deserialize)]
+struct SystemLaunchPlist {
+    #[serde(rename = "Program")]
+    program: Option<String>,
+    #[serde(rename = "ProgramArguments")]
+    program_arguments: Option<Vec<String>>,
+}
+
 struct ScanTarget {
     category_id: &'static str,
     category_title: &'static str,
@@ -73,6 +82,7 @@ struct ScanTarget {
     path: PathBuf,
     default_selected: bool,
     holdback_reason: Option<&'static str>,
+    requires_admin: bool,
 }
 
 struct RunningApps {
@@ -85,10 +95,13 @@ const CATEGORY_ORDER: &[(&str, &str)] = &[
     ("browser_caches", "Browser Caches"),
     ("app_internal_caches", "App Internal Caches"),
     ("user_app_caches", "User App Caches"),
+    ("macos_user_caches", "macOS & Apple Caches"),
+    ("project_artifacts", "Project Build Artifacts"),
     ("orphaned_leftovers", "Orphaned App Leftovers"),
     ("logs_diagnostics", "Logs & Diagnostics"),
     ("saved_state_temp", "Saved State & Temp"),
     ("old_installers", "Old Installers"),
+    ("system_caches", "System Caches & Logs (Admin)"),
     ("user_trash", "Trash"),
 ];
 
@@ -103,6 +116,22 @@ const PRESERVE_PARENT_REL_PATHS: &[&str] = &[
     "/library/developer/xcode/userdata/previews/simulator devices",
     "/library/developer/coresimulator/caches",
     "/library/caches/com.apple.dt.xcode",
+    "/library/caches/com.apple.quicklook.thumbnailcache",
+    "/library/caches/qlmanage",
+    "/library/caches/com.apple.iconservices.store",
+    "/library/caches/com.apple.safari/webpage previews",
+    "/library/caches/com.apple.webkit.networking",
+    "/library/caches/com.apple.appstore",
+    "/library/caches/com.apple.appstoreagent",
+    "/library/caches/com.apple.mediaanalysisd",
+    "/library/caches/com.apple.photoanalysisd",
+    "/library/caches/com.apple.parsecd",
+    "/library/caches/com.apple.siri",
+    "/library/caches/com.apple.ical",
+    "/library/caches/com.apple.addressbooksourcesync",
+    "/library/messages/caches",
+    "/library/messages/stickercache",
+    "/library/autosave information",
     "/library/caches/homebrew",
     "/library/caches/org.swift.swiftpm",
     "/library/caches/cocoapods",
@@ -152,6 +181,24 @@ const PRESERVE_PARENT_REL_PATHS: &[&str] = &[
     "/library/caches/vivaldi",
     "/library/caches/com.operasoftware.opera",
     "/.trash",
+];
+
+/// Explicit Apple user caches that are safe to empty (children only; parent preserved).
+const SAFE_APPLE_CACHE_REL_PATHS: &[&str] = &[
+    "/library/caches/com.apple.dt.xcode",
+    "/library/caches/com.apple.quicklook.thumbnailcache",
+    "/library/caches/qlmanage",
+    "/library/caches/com.apple.iconservices.store",
+    "/library/caches/com.apple.safari/webpage previews",
+    "/library/caches/com.apple.webkit.networking",
+    "/library/caches/com.apple.appstore",
+    "/library/caches/com.apple.appstoreagent",
+    "/library/caches/com.apple.mediaanalysisd",
+    "/library/caches/com.apple.photoanalysisd",
+    "/library/caches/com.apple.parsecd",
+    "/library/caches/com.apple.siri",
+    "/library/caches/com.apple.ical",
+    "/library/caches/com.apple.addressbooksourcesync",
 ];
 
 /// Exact disposable Electron/Chromium cache leaves under `~/Library/Application Support/<App>/`.
@@ -244,6 +291,44 @@ const PROTECTED_CONTAINER_PREFIXES: &[&str] = &[
 ];
 
 const INSTALLER_EXTENSIONS: &[&str] = &["dmg", "pkg", "mpkg", "iso", "xip"];
+const INCOMPLETE_DOWNLOAD_EXTENSIONS: &[&str] = &["crdownload", "download", "part"];
+
+/// Default project roots scanned for rebuildable build artifacts (`mo purge` parity).
+const DEFAULT_PROJECT_ROOTS: &[&str] = &[
+    "Projects",
+    "projects",
+    "Developer",
+    "Code",
+    "GitHub",
+    "dev",
+    "Workspace",
+    "workspace",
+    "src",
+    "Repos",
+];
+
+/// Rebuildable project artifact directories and their required sibling project marker files.
+const PROJECT_ARTIFACT_RULES: &[(&str, &[&str])] = &[
+    ("node_modules", &["package.json"]),
+    (".next", &["package.json", "next.config.js", "next.config.mjs", "next.config.ts"]),
+    (".nuxt", &["package.json", "nuxt.config.ts", "nuxt.config.js"]),
+    (".svelte-kit", &["package.json", "svelte.config.js"]),
+    (".turbo", &["package.json", "turbo.json"]),
+    (".parcel-cache", &["package.json"]),
+    ("target", &["Cargo.toml", "pom.xml"]),
+    (".build", &["Package.swift"]),
+    ("Pods", &["Podfile"]),
+    (".venv", &["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"]),
+    ("venv", &["pyproject.toml", "requirements.txt", "setup.py"]),
+    ("__pycache__", &["pyproject.toml", "requirements.txt", "setup.py"]),
+    (".pytest_cache", &["pyproject.toml", "pytest.ini", "setup.py"]),
+    (".mypy_cache", &["pyproject.toml", "mypy.ini", "setup.py"]),
+    (".ruff_cache", &["pyproject.toml", "ruff.toml"]),
+    (".gradle", &["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]),
+    (".dart_tool", &["pubspec.yaml"]),
+    ("dist", &["package.json", "tsconfig.json", "vite.config.ts", "vite.config.js", "pyproject.toml"]),
+    ("build", &["package.json", "build.gradle", "build.gradle.kts", "CMakeLists.txt", "pubspec.yaml"]),
+];
 
 fn format_display_path(path_str: &str, home: &str) -> String {
     if !home.is_empty() && path_str.starts_with(home) {
@@ -374,7 +459,6 @@ fn collect_installed_bundle_ids(home_path: &Path) -> HashSet<String> {
             if p.extension().and_then(|e| e.to_str()) == Some("app") {
                 app_paths.push(p);
             } else if p.is_dir() {
-                // Scan 1 level deep (e.g. /Applications/Utilities/*.app)
                 if let Ok(sub_entries) = fs::read_dir(&p) {
                     for sub in sub_entries.flatten() {
                         let sp = sub.path();
@@ -387,7 +471,6 @@ fn collect_installed_bundle_ids(home_path: &Path) -> HashSet<String> {
         }
     }
 
-    // Also include Homebrew Caskroom app bundles so cask-installed apps are never misclassified as orphaned
     for caskroom in ["/opt/homebrew/Caskroom", "/usr/local/Caskroom"] {
         let Ok(tokens) = fs::read_dir(caskroom) else {
             continue;
@@ -429,7 +512,13 @@ fn is_reverse_dns_bundle_id(name: &str) -> bool {
         return false;
     }
     let first = segments[0];
-    if first.is_empty() || !first.as_bytes()[0].is_ascii_alphabetic() {
+    if first.len() < 2 || !first.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let has_alpha_tail = segments[1..]
+        .iter()
+        .any(|seg| seg.bytes().any(|b| b.is_ascii_alphabetic()));
+    if !has_alpha_tail {
         return false;
     }
     segments.iter().all(|seg| {
@@ -463,6 +552,104 @@ fn bundle_id_matches_set(candidate_lower: &str, set: &HashSet<String>) -> bool {
     false
 }
 
+// MARK: - Project Artifact Discovery (`mo purge` parity, bounded & safe)
+
+fn scan_project_artifacts(
+    home_path: &Path,
+    started: Instant,
+    out: &mut Vec<(String, PathBuf, bool)>,
+) {
+    let recent_cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(7 * 24 * 3600))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let budget = Duration::from_millis(250);
+    let mut visited_roots: HashSet<(u64, u64)> = HashSet::new();
+
+    for root_name in DEFAULT_PROJECT_ROOTS {
+        if started.elapsed() > budget {
+            break;
+        }
+        let root_path = home_path.join(root_name);
+        let Ok(meta) = fs::symlink_metadata(&root_path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        // Deduplicate case-insensitive macOS APFS roots (e.g. ~/Projects vs ~/projects)
+        if !visited_roots.insert((meta.dev(), meta.ino())) {
+            continue;
+        }
+        walk_project_dir(&root_path, 0, recent_cutoff, started, budget, out);
+    }
+}
+
+fn walk_project_dir(
+    dir: &Path,
+    depth: u8,
+    recent_cutoff: SystemTime,
+    started: Instant,
+    budget: Duration,
+    out: &mut Vec<(String, PathBuf, bool)>,
+) {
+    if depth > 4 || started.elapsed() > budget || out.len() >= 120 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
+    let mut sibling_names: HashSet<String> = HashSet::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let p = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_file() {
+            sibling_names.insert(name);
+        } else if meta.is_dir() {
+            subdirs.push((name, p));
+        }
+    }
+
+    for (name, sub_path) in subdirs {
+        if started.elapsed() > budget || out.len() >= 120 {
+            return;
+        }
+        if name == ".git" || name == ".tmp" || name == "vendor" || name == ".Trash" {
+            continue;
+        }
+        if let Some((_, markers)) = PROJECT_ARTIFACT_RULES.iter().find(|(art, _)| *art == name) {
+            let has_marker = markers.iter().any(|m| sibling_names.contains(*m));
+            // Never delete a directory that contains a nested .git repository
+            if has_marker && !sub_path.join(".git").exists() {
+                let is_recent = fs::symlink_metadata(&sub_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map_or(true, |mtime| mtime > recent_cutoff);
+                let project_label = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project");
+                out.push((format!("{}/{}", project_label, name), sub_path, is_recent));
+                // Do not recurse inside matched artifact (avoids nested node_modules over-deletion)
+                continue;
+            }
+        }
+
+        if name.starts_with('.') {
+            continue;
+        }
+        walk_project_dir(&sub_path, depth + 1, recent_cutoff, started, budget, out);
+    }
+}
+
 // MARK: - Path Protection & Validation
 
 fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
@@ -483,6 +670,7 @@ fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
         "/library/jupyter/runtime",
         "/library/keychains",
         "/library/messages/attachments",
+        "/library/mail",
         "/library/caches/com.local.upkeep",
         "/library/caches/cloudkit",
         "/library/application support/steam",
@@ -490,7 +678,6 @@ fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
         "/library/application support/com.apple.wallpaper",
         "/library/application support/com.apple.idleassetsd",
         "/library/application support/dock",
-        "/library/application support/mobilesync",
         "/library/application support/clouddocs",
         "/library/application support/addressbook",
         "/library/group containers/group.com.apple.notes",
@@ -502,11 +689,13 @@ fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
         }
     }
     if let Some(cache_entry) = rel_lower.strip_prefix("/library/caches/") {
-        if cache_entry.starts_with("com.apple.")
-            && cache_entry != "com.apple.dt.xcode"
-            && !cache_entry.starts_with("com.apple.dt.xcode/")
-        {
-            return true;
+        if cache_entry.starts_with("com.apple.") {
+            let is_safe_apple = SAFE_APPLE_CACHE_REL_PATHS.iter().any(|safe| {
+                rel_lower == *safe || rel_lower.starts_with(&format!("{}/", safe))
+            });
+            if !is_safe_apple {
+                return true;
+            }
         }
     }
     if let Some(group_entry) = rel_lower.strip_prefix("/library/group containers/") {
@@ -515,6 +704,11 @@ fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
         }
     }
     if let Some(container_entry) = rel_lower.strip_prefix("/library/containers/") {
+        // Allow Mail Downloads cached attachment copies only
+        if rel_lower.starts_with("/library/containers/com.apple.mail/data/library/mail downloads/")
+        {
+            return false;
+        }
         for pref in PROTECTED_CONTAINER_PREFIXES {
             if container_entry.starts_with(pref) {
                 return true;
@@ -572,11 +766,19 @@ pub(crate) fn validate_clean_target(
     let home_trimmed = home.trim_end_matches('/');
     let tmp_trimmed = tmpdir.trim_end_matches('/');
 
-    if !home_trimmed.is_empty() && raw_str.starts_with(home_trimmed) {
+    if !home_trimmed.is_empty()
+        && raw_str.len() > home_trimmed.len()
+        && raw_str.starts_with(home_trimmed)
+        && raw_str.as_bytes()[home_trimmed.len()] == b'/'
+    {
         if has_symlinked_ancestor(path, Path::new(home_trimmed)) {
             return Err("Refused to traverse symlinked ancestor directory".to_string());
         }
-    } else if !tmp_trimmed.is_empty() && raw_str.starts_with(tmp_trimmed) {
+    } else if !tmp_trimmed.is_empty()
+        && raw_str.len() > tmp_trimmed.len()
+        && raw_str.starts_with(tmp_trimmed)
+        && raw_str.as_bytes()[tmp_trimmed.len()] == b'/'
+    {
         if has_symlinked_ancestor(path, Path::new(tmp_trimmed)) {
             return Err("Refused to traverse symlinked ancestor directory".to_string());
         }
@@ -633,6 +835,7 @@ pub(crate) fn validate_clean_target(
             "/library",
             "/library/caches",
             "/library/application support",
+            "/library/application support/mobilesync",
             "/library/logs",
             "/library/saved application state",
             "/library/developer",
@@ -640,6 +843,7 @@ pub(crate) fn validate_clean_target(
             "/library/preferences",
             "/library/containers",
             "/library/group containers",
+            "/library/messages",
             "/desktop",
             "/documents",
             "/downloads",
@@ -709,7 +913,7 @@ fn clean_single_target(path: &Path, preserve_parent: bool, dry_run: bool) -> Res
     }
 }
 
-// MARK: - Comprehensive Safe Dry-Run Scanner
+// MARK: - Comprehensive Safe Dry-Run Scanner (Full Mole Parity)
 
 pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
     let started = Instant::now();
@@ -726,10 +930,18 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
 
     let home_path = PathBuf::from(&home);
 
-    // Collect running apps and installed app bundle IDs in parallel (~5-15ms total)
-    let (running_apps, installed_bundle_ids) = rayon::join(
-        collect_running_apps,
-        || collect_installed_bundle_ids(&home_path),
+    // Collect running apps, installed bundle IDs, and project artifacts in parallel
+    let ((running_apps, installed_bundle_ids), project_artifacts) = rayon::join(
+        || {
+            rayon::join(collect_running_apps, || {
+                collect_installed_bundle_ids(&home_path)
+            })
+        },
+        || {
+            let mut found = Vec::new();
+            scan_project_artifacts(&home_path, started, &mut found);
+            found
+        },
     );
 
     let mut targets: Vec<ScanTarget> = Vec::new();
@@ -741,14 +953,15 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                            name: String,
                            path: PathBuf,
                            default_selected: bool,
-                           holdback_reason: Option<&'static str>| {
+                           holdback_reason: Option<&'static str>,
+                           requires_admin: bool| {
         let Ok(meta) = fs::symlink_metadata(&path) else {
             return;
         };
         if meta.file_type().is_symlink() {
             return;
         }
-        if is_protected_path(&path, &home) {
+        if !requires_admin && is_protected_path(&path, &home) {
             return;
         }
         let dev_ino = (meta.dev(), meta.ino());
@@ -762,6 +975,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
             path,
             default_selected,
             holdback_reason,
+            requires_admin,
         });
     };
 
@@ -870,6 +1084,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
             home_path.join(rel),
             default_sel,
             holdback,
+            false,
         );
     }
 
@@ -897,10 +1112,11 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
             } else {
                 None
             },
+            false,
         );
     }
 
-    // 3. Electron & Chromium App Internal Caches (~/Library/Application Support/<App>/<exact cache leaf>)
+    // 3. Electron & Chromium App Internal Caches
     let app_support_dir = home_path.join("Library/Application Support");
     if let Ok(entries) = fs::read_dir(&app_support_dir) {
         for entry in entries.flatten() {
@@ -935,6 +1151,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                         } else {
                             None
                         },
+                        false,
                     );
                 }
             }
@@ -943,6 +1160,12 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
 
     let orphan_cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(30 * 24 * 3600))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let temp_cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(24 * 3600))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let sys_age_cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(7 * 24 * 3600))
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     // 4. User App Caches (~/Library/Caches/*) + Orphaned Cache Detection
@@ -954,6 +1177,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
             if name.starts_with('.')
                 || lower.starts_with("com.apple.")
                 || lower == "cloudkit"
+                || lower == "qlmanage"
                 || lower == "homebrew"
                 || lower == "com.local.upkeep"
                 || lower == "org.swift.swiftpm"
@@ -993,6 +1217,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                             ge.path(),
                             true,
                             None,
+                            false,
                         );
                     }
                 }
@@ -1020,6 +1245,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                         entry_path,
                         false,
                         Some("App not installed (30d+ inactive)"),
+                        false,
                     );
                     continue;
                 }
@@ -1036,6 +1262,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                 } else {
                     None
                 },
+                false,
             );
         }
     }
@@ -1069,11 +1296,102 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                 } else {
                     None
                 },
+                false,
             );
         }
     }
 
-    // 5. Logs & Diagnostics
+    // 5. macOS & Apple User Caches (Mole `user.sh` parity — safe caches only, never Mail data or Messages attachments)
+    let macos_cache_specs: &[(&str, &str, bool, Option<&str>)] = &[
+        ("QuickLook Thumbnails", "Library/Caches/com.apple.QuickLook.thumbnailcache", true, None),
+        ("QuickLook Cache", "Library/Caches/qlmanage", true, None),
+        ("Icon Services Cache", "Library/Caches/com.apple.iconservices.store", true, None),
+        ("Safari Webpage Previews", "Library/Caches/com.apple.Safari/Webpage Previews", true, None),
+        ("WebKit Network Cache", "Library/Caches/com.apple.WebKit.Networking", true, None),
+        ("App Store Cache", "Library/Caches/com.apple.appstore", true, None),
+        ("App Store Agent Cache", "Library/Caches/com.apple.appstoreagent", true, None),
+        ("Media Analysis Cache", "Library/Caches/com.apple.mediaanalysisd", true, None),
+        ("Photo Analysis Cache", "Library/Caches/com.apple.photoanalysisd", true, None),
+        ("Siri Suggestions Cache", "Library/Caches/com.apple.parsecd", true, None),
+        ("Siri Cache", "Library/Caches/com.apple.Siri", true, None),
+        ("Calendar Cache", "Library/Caches/com.apple.iCal", true, None),
+        ("Address Book Photo Cache", "Library/Caches/com.apple.AddressBookSourceSync", true, None),
+        ("Messages Caches", "Library/Messages/Caches", true, None),
+        ("Messages Sticker Cache", "Library/Messages/StickerCache", true, None),
+        (
+            "Autosave Information",
+            "Library/Autosave Information",
+            false,
+            Some("Removes unsaved document autosaves"),
+        ),
+        (
+            "iOS Device Backups",
+            "Library/Application Support/MobileSync/Backup",
+            false,
+            Some("Deletes local iPhone/iPad backups"),
+        ),
+    ];
+    for &(name, rel, default_sel, holdback) in macos_cache_specs {
+        push_target(
+            "macos_user_caches",
+            "macOS & Apple Caches",
+            name.to_string(),
+            home_path.join(rel),
+            default_sel,
+            holdback,
+            false,
+        );
+    }
+
+    // Mail Downloads cached attachment copies (>30d old — never touches ~/Library/Mail messages)
+    for mail_dl in [
+        home_path.join("Library/Containers/com.apple.mail/Data/Library/Mail Downloads"),
+        home_path.join("Library/Mail Downloads"),
+    ] {
+        if let Ok(entries) = fs::read_dir(&mail_dl) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                let modified = meta.modified().unwrap_or(SystemTime::now());
+                if modified <= orphan_cutoff {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    push_target(
+                        "macos_user_caches",
+                        "macOS & Apple Caches",
+                        format!("Mail Download: {}", fname),
+                        p,
+                        false,
+                        Some("Cached Mail attachment copy (30d+)"),
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    // 6. Project Build Artifacts (`mo purge` parity — held back by default)
+    for (label, art_path, is_recent) in project_artifacts {
+        push_target(
+            "project_artifacts",
+            "Project Build Artifacts",
+            label,
+            art_path,
+            false,
+            if is_recent {
+                Some("Active project (<7d)")
+            } else {
+                Some("Rebuildable project artifact (7d+ idle)")
+            },
+            false,
+        );
+    }
+
+    // 7. Logs & Diagnostics
     let logs_dir = home_path.join("Library/Logs");
     if let Ok(entries) = fs::read_dir(&logs_dir) {
         for entry in entries.flatten() {
@@ -1081,7 +1399,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
             if name.starts_with('.') || name.eq_ignore_ascii_case("DiagnosticReports") {
                 continue;
             }
-            push_target("logs_diagnostics", "Logs & Diagnostics", name, entry.path(), true, None);
+            push_target("logs_diagnostics", "Logs & Diagnostics", name, entry.path(), true, None, false);
         }
     }
     let diag_dir = logs_dir.join("DiagnosticReports");
@@ -1098,11 +1416,36 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                 entry.path(),
                 true,
                 None,
+                false,
             );
         }
     }
+    let crash_dir = home_path.join("Library/Application Support/CrashReporter");
+    if let Ok(entries) = fs::read_dir(&crash_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            if meta.modified().unwrap_or(SystemTime::now()) <= orphan_cutoff {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                push_target(
+                    "logs_diagnostics",
+                    "Logs & Diagnostics",
+                    format!("CrashReporter: {}", name),
+                    p,
+                    true,
+                    None,
+                    false,
+                );
+            }
+        }
+    }
 
-    // 6. Saved Application State (+ Orphaned Saved State) & Stale Temp Files (>24h)
+    // 8. Saved Application State (+ Orphaned Saved State), Incomplete Downloads & Stale Temp Files (>24h)
     let saved_state_dir = home_path.join("Library/Saved Application State");
     if let Ok(entries) = fs::read_dir(&saved_state_dir) {
         for entry in entries.flatten() {
@@ -1132,6 +1475,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                         entry_path,
                         false,
                         Some("App not installed (30d+ inactive)"),
+                        false,
                     );
                     continue;
                 }
@@ -1144,13 +1488,10 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                 entry_path,
                 false,
                 Some("Resets open window positions"),
+                false,
             );
         }
     }
-
-    let temp_cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(24 * 3600))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
 
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
         let tmp_path = PathBuf::from(&tmpdir);
@@ -1188,21 +1529,141 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                     p,
                     true,
                     None,
+                    false,
                 );
             }
         }
     }
 
-    // 7. Old Installers in ~/Downloads (.dmg, .pkg, .mpkg, .iso, .xip > 24h old, unchecked by default)
-    let downloads_dir = home_path.join("Downloads");
-    if let Ok(entries) = fs::read_dir(&downloads_dir) {
+    // 9. Incomplete Downloads (>24h) & Old Installers (.dmg/.pkg/.mpkg/.iso/.xip >24h) in Downloads & Desktop
+    for (dir_label, scan_dir) in [
+        ("Downloads", home_path.join("Downloads")),
+        ("Desktop", home_path.join("Desktop")),
+    ] {
+        if let Ok(entries) = fs::read_dir(&scan_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                let ext_lower = ext.to_ascii_lowercase();
+                let Ok(meta) = fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                let modified = meta.modified().unwrap_or(SystemTime::now());
+                if modified > temp_cutoff {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if INCOMPLETE_DOWNLOAD_EXTENSIONS.contains(&ext_lower.as_str()) {
+                    push_target(
+                        "saved_state_temp",
+                        "Saved State & Temp",
+                        format!("Incomplete Download: {}", name),
+                        p,
+                        false,
+                        Some("Stale incomplete browser download"),
+                        false,
+                    );
+                } else if meta.is_file() && INSTALLER_EXTENSIONS.contains(&ext_lower.as_str()) {
+                    push_target(
+                        "old_installers",
+                        "Old Installers",
+                        if dir_label == "Desktop" {
+                            format!("{} (Desktop)", name)
+                        } else {
+                            name
+                        },
+                        p,
+                        false,
+                        Some("Installer archive"),
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    // 10. System Caches, Logs & Orphaned System Services (Mole `system.sh` + `apps.sh` parity, requires Admin)
+    let system_dir_targets: &[(&str, &str)] = &[
+        ("CoreSimulator dyld Caches", "/Library/Developer/CoreSimulator/Caches/dyld"),
+        ("System Diagnostic Reports", "/Library/Logs/DiagnosticReports"),
+        ("macOS Unified Logs (Special)", "/private/var/db/diagnostics/Special"),
+        ("macOS Unified Logs (Persist)", "/private/var/db/diagnostics/Persist"),
+        ("DiagnosticPipeline Logs", "/private/var/db/DiagnosticPipeline"),
+        ("Memory Exception Reports", "/private/var/db/reportmemoryexception"),
+    ];
+    for &(name, sys_path) in system_dir_targets {
+        let p = PathBuf::from(sys_path);
+        if p.is_dir() {
+            push_target(
+                "system_caches",
+                "System Caches & Logs (Admin)",
+                name.to_string(),
+                p,
+                false,
+                Some("Requires administrator password"),
+                true,
+            );
+        }
+    }
+
+    // Stale files (>7d) in /private/var/log (*.log, *.gz, *.asl), /private/tmp, /private/var/tmp, /Library/Caches (*.cache, *.tmp, *.log)
+    for (label, dir_str, allowed_exts) in [
+        ("System Log", "/private/var/log", &["log", "gz", "asl"][..]),
+        ("System Cache File", "/Library/Caches", &["cache", "tmp", "log"][..]),
+        ("System Temp", "/private/tmp", &[][..]),
+        ("System Var Temp", "/private/var/tmp", &[][..]),
+    ] {
+        if let Ok(entries) = fs::read_dir(dir_str) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    continue;
+                }
+                if !allowed_exts.is_empty() {
+                    let ext = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if !allowed_exts.contains(&ext.as_str()) {
+                        continue;
+                    }
+                }
+                if meta.modified().unwrap_or(SystemTime::now()) <= sys_age_cutoff {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    push_target(
+                        "system_caches",
+                        "System Caches & Logs (Admin)",
+                        format!("{}: {}", label, fname),
+                        p,
+                        false,
+                        Some("Requires administrator password"),
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    // Power logs (/private/var/db/powerlog) — strictly skipping live Current* databases & -wal/-shm companions
+    if let Ok(entries) = fs::read_dir("/private/var/db/powerlog") {
         for entry in entries.flatten() {
             let p = entry.path();
-            let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
-                continue;
-            };
-            let ext_lower = ext.to_ascii_lowercase();
-            if !INSTALLER_EXTENSIONS.contains(&ext_lower.as_str()) {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            let lower = fname.to_ascii_lowercase();
+            if fname.starts_with('.')
+                || lower.starts_with("current")
+                || lower.ends_with("-wal")
+                || lower.ends_with("-shm")
+            {
                 continue;
             }
             let Ok(meta) = fs::symlink_metadata(&p) else {
@@ -1211,23 +1672,65 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
             if meta.file_type().is_symlink() || !meta.is_file() {
                 continue;
             }
-            let modified = meta.modified().unwrap_or(SystemTime::now());
-            if modified > temp_cutoff {
-                continue;
+            if meta.modified().unwrap_or(SystemTime::now()) <= sys_age_cutoff {
+                push_target(
+                    "system_caches",
+                    "System Caches & Logs (Admin)",
+                    format!("Power Log: {}", fname),
+                    p,
+                    false,
+                    Some("Requires administrator password"),
+                    true,
+                );
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            push_target(
-                "old_installers",
-                "Old Installers",
-                name,
-                p,
-                false,
-                Some("Installer archive in Downloads"),
-            );
         }
     }
 
-    // 8. User Trash (optional, unchecked by default)
+    // Orphaned system LaunchDaemons / LaunchAgents (non-Apple, readable plist whose absolute Program binary no longer exists)
+    for sys_launch_dir in ["/Library/LaunchDaemons", "/Library/LaunchAgents"] {
+        if let Ok(entries) = fs::read_dir(sys_launch_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                let lower = fname.to_ascii_lowercase();
+                if !lower.ends_with(".plist") || lower.starts_with("com.apple.") {
+                    continue;
+                }
+                let Ok(parsed) = plist::from_file::<_, SystemLaunchPlist>(&p) else {
+                    continue; // fail closed on unreadable/root-only plists
+                };
+                let program = parsed
+                    .program
+                    .as_deref()
+                    .or_else(|| parsed.program_arguments.as_ref().and_then(|v| v.first()).map(String::as_str));
+                let Some(prog_path) = program else {
+                    continue;
+                };
+                if !prog_path.starts_with('/')
+                    || prog_path.starts_with("/usr/")
+                    || prog_path.starts_with("/bin/")
+                    || prog_path.starts_with("/sbin/")
+                    || prog_path.starts_with("/System/")
+                    || prog_path.starts_with("/opt/homebrew/")
+                {
+                    continue;
+                }
+                if !Path::new(prog_path).exists() {
+                    push_target(
+                        "orphaned_leftovers",
+                        "Orphaned App Leftovers",
+                        format!("Orphaned Service: {}", fname),
+                        p,
+                        false,
+                        Some("Missing binary · Requires administrator password"),
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    // 11. User Trash (optional, unchecked by default)
     push_target(
         "user_trash",
         "Trash",
@@ -1235,6 +1738,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
         home_path.join(".Trash"),
         false,
         Some("Permanently empties Trash"),
+        false,
     );
 
     // Parallel APFS sizing via getattrlistbulk + Rayon
@@ -1242,7 +1746,10 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
         .into_par_iter()
         .filter_map(|target| {
             let size = calculate_path_size_accurate(&target.path);
-            if size < 4096 {
+            if size < 4096 && !target.requires_admin {
+                return None;
+            }
+            if size == 0 {
                 return None;
             }
             let path_str = target.path.to_string_lossy().into_owned();
@@ -1258,6 +1765,7 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
                     size_bytes: size,
                     default_selected: target.default_selected,
                     holdback_reason: target.holdback_reason.map(|s| s.to_string()),
+                    requires_admin: target.requires_admin,
                 },
             ))
         })
@@ -1429,9 +1937,13 @@ mod tests {
         assert!(validate_clean_target(Path::new("/Users/tester/Library/Caches/bad\nname"), home, tmp).is_err());
         assert!(is_cleaner_protected_rel("/.yarn/berry/cache"));
         assert!(is_cleaner_protected_rel("/library/jupyter/runtime"));
+        assert!(is_cleaner_protected_rel("/library/mail/v10"));
+        assert!(is_cleaner_protected_rel("/library/messages/attachments/00"));
         assert!(is_cleaner_protected_rel("/library/application support/com.apple.wallpaper/aerials"));
         assert!(is_cleaner_protected_rel("/library/containers/com.docker.docker/data/library/caches"));
         assert!(is_cleaner_protected_rel("/.orbstack/data"));
+        assert!(!is_cleaner_protected_rel("/library/caches/com.apple.quicklook.thumbnailcache"));
+        assert!(!is_cleaner_protected_rel("/library/containers/com.apple.mail/data/library/mail downloads/report.pdf"));
     }
 
     #[test]

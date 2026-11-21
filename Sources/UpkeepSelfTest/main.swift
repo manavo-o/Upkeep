@@ -19,7 +19,7 @@ struct UpkeepSelfTest {
     }
 
     static func main() async {
-        print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.2.0) ===")
+        print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.3.0) ===")
         print("  Engine: \(UpkeepEngine.isUsingRustCore ? "Rust upkeep_core C-ABI" : "Swift fallback")")
 
         // 1. CLIExecutor & ANSI tests
@@ -40,7 +40,7 @@ struct UpkeepSelfTest {
                    cleanerScan.formattedTotalSize, cleanerScan.categories.count)
         )
 
-        // Safety guard: protected root paths must be rejected
+        // Safety guard: protected root paths & forbidden admin paths must be rejected
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let protectedTargets = [
             "/",
@@ -48,11 +48,21 @@ struct UpkeepSelfTest {
             (home as NSString).appendingPathComponent("Library"),
             (home as NSString).appendingPathComponent("Library/Caches/com.local.Upkeep")
         ]
-        let protectedRes = await MoleService.shared.executeNativeClean(paths: protectedTargets, dryRun: true)
+        let forbiddenAdminTargets = [
+            "/System",
+            "/Library/LaunchDaemons/com.apple.test.plist",
+            "/private/var/db/powerlog/CurrentPowerlog.PLSQL"
+        ]
+        let protectedRes = await MoleService.shared.executeNativeClean(
+            paths: protectedTargets,
+            adminPaths: forbiddenAdminTargets,
+            dryRun: true
+        )
+        let totalForbidden = protectedTargets.count + forbiddenAdminTargets.count
         check(
-            "Native Cleaner rejects protected/root paths",
-            protectedRes.removedCount == 0 && protectedRes.failedItems.count == protectedTargets.count,
-            "rejected \(protectedRes.failedItems.count)/\(protectedTargets.count)"
+            "Native Cleaner rejects protected user & admin paths",
+            protectedRes.removedCount == 0 && protectedRes.failedItems.count == totalForbidden,
+            "rejected \(protectedRes.failedItems.count)/\(totalForbidden)"
         )
 
         // Temp-dir dry-run & real deletion test

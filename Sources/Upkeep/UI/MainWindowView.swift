@@ -1114,8 +1114,9 @@ private struct CleanerWorkspacePane: View {
                     }
 
                     if vm.confirmClean, !vm.selectedCleanPaths.isEmpty {
+                        let adminSuffix = vm.hasSelectedAdminCleanItems ? " (will prompt for admin password)" : ""
                         MenuBarDestructiveConfirmBar(
-                            title: "Delete \(vm.formattedSelectedCleanSize) across \(vm.selectedCleanPaths.count) selected items?",
+                            title: "Delete \(vm.formattedSelectedCleanSize) across \(vm.selectedCleanPaths.count) selected items?\(adminSuffix)",
                             confirmLabel: "Clean",
                             confirmIcon: "trash",
                             onCancel: {
@@ -1371,7 +1372,14 @@ private struct CleanerWorkspacePane: View {
                                 .foregroundStyle(.primary)
                                 .lineLimit(1)
 
-                            if !item.defaultSelected {
+                            if item.requiresAdmin {
+                                Label("Admin", systemImage: "lock.fill")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .foregroundStyle(.purple)
+                                    .padding(.horizontal, 5.5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.purple.opacity(0.14), in: Capsule())
+                            } else if !item.defaultSelected {
                                 Text("Held back · \(item.holdbackReason ?? "Optional")")
                                     .font(.system(size: 9.5, weight: .semibold))
                                     .foregroundStyle(.orange)

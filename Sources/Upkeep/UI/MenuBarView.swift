@@ -77,6 +77,11 @@ public final class TrayViewModel {
             .reduce(0) { $0 + $1.sizeBytes }
     }
 
+    public var hasSelectedAdminCleanItems: Bool {
+        guard let scan = cleanerScan else { return false }
+        return scan.allItems.contains { $0.requiresAdmin && selectedCleanPaths.contains($0.path) }
+    }
+
     public var formattedSelectedCleanSize: String {
         ByteCountFormatter.string(fromByteCount: selectedCleanBytes, countStyle: .file)
     }
@@ -206,13 +211,20 @@ public final class TrayViewModel {
 
     public func executeMoleClean() {
         guard !isCleaning else { return }
-        let targets = Array(selectedCleanPaths)
-        guard !targets.isEmpty else { return }
+        let allItems = cleanerScan?.allItems ?? []
+        let adminSet = Set(allItems.filter(\.requiresAdmin).map(\.path))
+        let userTargets = selectedCleanPaths.filter { !adminSet.contains($0) }
+        let adminTargets = selectedCleanPaths.filter { adminSet.contains($0) }
+        guard !userTargets.isEmpty || !adminTargets.isEmpty else { return }
         confirmClean = false
         isCleaning = true
         cleanError = nil
         Task {
-            let exec = await MoleService.shared.executeNativeClean(paths: targets, dryRun: false)
+            let exec = await MoleService.shared.executeNativeClean(
+                paths: Array(userTargets),
+                adminPaths: Array(adminTargets),
+                dryRun: false
+            )
             self.lastCleanResult = exec
             let refreshed = await MoleService.shared.scanCleanerNative()
             self.cleanerScan = refreshed
