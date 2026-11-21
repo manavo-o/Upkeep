@@ -9,19 +9,34 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-release:
-    runs-on: xcode-27
+    runs-on: macos-26
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Ensure Rust arm64 target
+        run: |
+          if command -v rustup >/dev/null 2>&1; then
+            rustup target add aarch64-apple-darwin || true
+          fi
+
       - name: Build Upkeep.app
-        run: ./Scripts/build-app.sh
+        env:
+          UPKEEP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '1.0.1' }}
+        run: |
+          export UPKEEP_VERSION="${UPKEEP_VERSION#v}"
+          ./Scripts/build-app.sh
 
       - name: Package Release Archive
         run: |
-          VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${GITHUB_REF_NAME:-v1.0.1}"
           mkdir -p release
           ditto -c -k --sequesterRsrc --keepParent dist/Upkeep.app "release/Upkeep-${VERSION}.zip"
 

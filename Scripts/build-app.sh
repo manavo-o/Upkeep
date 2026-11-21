@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EXECUTABLE_NAME="Upkeep"
 APP_NAME="Upkeep"
 BUNDLE_ID="com.local.Upkeep"
+APP_VERSION="${UPKEEP_VERSION:-1.0.1}"
 BUILD_DIR="$ROOT_DIR/.build/release"
 APP_BUNDLE="$ROOT_DIR/dist/$APP_NAME.app"
 DEV_CERT_NAME="Upkeep Local Signing"
@@ -37,7 +38,7 @@ if [[ -d "$ROOT_DIR/Resources/Icons/Upkeep.icon" ]]; then
     cp -R "$ROOT_DIR/Resources/Icons/Upkeep.icon" "$APP_BUNDLE/Contents/Resources/Upkeep.icon"
 fi
 
-cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
+cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -61,9 +62,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSUIElement</key>
@@ -124,15 +125,21 @@ EOF
     security find-identity -v -p codesigning 2>/dev/null | grep "$DEV_CERT_NAME" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' || true
 }
 
-SIGN_IDENTITY="$(ensure_signing_identity)"
-if [[ -n "$SIGN_IDENTITY" ]]; then
-    echo "Signing $APP_BUNDLE with persistent identity '$SIGN_IDENTITY' (preserves TCC permissions)..."
-    codesign --force --deep --sign "$SIGN_IDENTITY" \
-        "$APP_BUNDLE"
+if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+    echo "CI environment detected; using non-interactive ad-hoc signing..."
+    codesign --force --deep --sign - "$APP_BUNDLE"
     codesign --verify --deep --strict "$APP_BUNDLE"
 else
-    echo "Warning: Could not create persistent signing cert; falling back to ad-hoc signing."
-    codesign --force --deep --sign - "$APP_BUNDLE"
+    SIGN_IDENTITY="$(ensure_signing_identity)"
+    if [[ -n "$SIGN_IDENTITY" ]]; then
+        echo "Signing $APP_BUNDLE with persistent identity '$SIGN_IDENTITY' (preserves TCC permissions)..."
+        codesign --force --deep --sign "$SIGN_IDENTITY" \
+            "$APP_BUNDLE"
+        codesign --verify --deep --strict "$APP_BUNDLE"
+    else
+        echo "Warning: Could not create persistent signing cert; falling back to ad-hoc signing."
+        codesign --force --deep --sign - "$APP_BUNDLE"
+    fi
 fi
 
 echo "Done: $APP_BUNDLE"
