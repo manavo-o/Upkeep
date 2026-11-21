@@ -1,4 +1,16 @@
-## What's New in v1.1.2
+## What's New in v1.2.0
+
+- **Native Rust App & System Cleaner (Zero `mo` Dependency)**: Replaced the external `mo` (Mole) CLI completely with a built-in parallel Rust cleaner (`upkeep_scan_cleaner_json` / `upkeep_clean_paths_json`) covering Developer Tools (Xcode DerivedData, DeviceSupport, CoreSimulator, Homebrew, SwiftPM, CocoaPods, npm, pnpm, Yarn, Bun, pip, uv, Cargo, Gradle, Maven, Go), Browser Caches (Chrome, Brave, Edge, Arc, Firefox, Zen, Vivaldi, Opera — caches only), User App Caches, Logs & Diagnostics, Saved Application State & stale temp files, and Trash.
+- **Interactive macOS 27 Cleaner Workspace**: Upgraded the Cleaner pane with collapsible grouped categories, per-category and per-item checkboxes, live selected-size badge, held-back amber pills for optional items, Reveal-in-Finder buttons, and strict Rust safety guards (canonical path allowlist, symlink refusal, protected-path exclusions, and parent-directory preservation).
+- **Compact Binary Homebrew Index Cache (`catalog.bin`)**: Persists the ~15k Homebrew API catalog in a lightweight versioned binary format for `<5 ms` cold startup, with automatic ETag `304` revalidation and in-place Cellar/Caskroom merging.
+- **Rust & Swift Performance Optimizations**:
+  - Eliminated the duplicate local Rust search index and double JSON round-trip by routing local searches directly through `rustRemoteIndex` (`installed_only` scoped search).
+  - Enabled NEON/SIMD byte scanning via `memchr` (`memchr`, `memchr2`, `memmem`) for ANSI ESC checks, XML plist scanning, and case-insensitive substring search.
+  - Replaced deep `PathBuf` allocations in `macos_bulk` (`getattrlistbulk`) with zero-`PathBuf` `openat` DFS and a single-FD deep fallback.
+  - Short-circuited Tier 5 description scoring inside each `par_chunks(512)` worker once top-K name matches are full.
+  - Pre-formatted `formattedSize` once at initialization on `MoleInstalledApp`, `UninstallLeftoverItem`, and `CleanerItem` to eliminate per-row `ByteCountFormatter` work during scrolling.
+
+### Included from v1.1.2
 
 - **Minimalist Native macOS Settings UI**: Redesigned the Settings window with a cleaner `216pt` sidebar, seamless transparent titlebar, centered `620pt` grouped reading columns, Canapé-style pane headers, inline `(i)` popovers, and zero per-row icon clutter.
 - **Tiered Homebrew Search Ranking**: Upgraded the Rust and Swift search engines with 5-tier name-first scoring (Exact > Prefix > Substring > Fuzzy Name > Description) and cleaner cask version display so exact/prefix package names always rank first.

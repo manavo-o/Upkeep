@@ -1,3 +1,4 @@
+use memchr::{memchr, memchr2, memmem};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
@@ -12,6 +13,9 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
+
+mod cleaner;
+pub use cleaner::{upkeep_clean_paths_json, upkeep_scan_cleaner_json};
 
 // MARK: - Core Data Structures
 
@@ -144,14 +148,14 @@ thread_local! {
 
 // MARK: - String & Sorting Helpers
 
-fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
+pub(crate) fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
     if ptr.is_null() {
         return "";
     }
     unsafe { CStr::from_ptr(ptr) }.to_str().unwrap_or("")
 }
 
-fn string_to_cstr(s: String) -> *mut c_char {
+pub(crate) fn string_to_cstr(s: String) -> *mut c_char {
     CString::new(s)
         .unwrap_or_else(|_| CString::new("").unwrap())
         .into_raw()
@@ -232,7 +236,7 @@ fn cmp_versions_natural(a: &str, b: &str) -> Ordering {
     ab.len().cmp(&bb.len())
 }
 
-/// Fast zero-allocation ASCII case-insensitive substring search on raw byte slices.
+/// NEON/SIMD-accelerated zero-allocation ASCII case-insensitive substring search via `memchr2`.
 #[inline]
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
@@ -243,24 +247,18 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     }
     let first_lo = needle[0].to_ascii_lowercase();
     let first_hi = needle[0].to_ascii_uppercase();
-    let end = haystack.len() - needle.len();
-
-    let mut i = 0;
-    while i <= end {
-        let b = haystack[i];
-        if b == first_lo || b == first_hi {
-            let mut matched = true;
-            for k in 1..needle.len() {
-                if !haystack[i + k].eq_ignore_ascii_case(&needle[k]) {
-                    matched = false;
-                    break;
-                }
-            }
-            if matched {
-                return true;
-            }
+    let tail = &needle[1..];
+    let max_start = haystack.len() - needle.len();
+    let mut offset = 0usize;
+    while offset <= max_start {
+        let Some(rel) = memchr2(first_lo, first_hi, &haystack[offset..=max_start]) else {
+            return false;
+        };
+        let pos = offset + rel;
+        if haystack[pos + 1..pos + needle.len()].eq_ignore_ascii_case(tail) {
+            return true;
         }
-        i += 1;
+        offset = pos + 1;
     }
     false
 }
@@ -326,6 +324,7 @@ mod macos_bulk {
 
     extern "C" {
         fn open(path: *const c_char, oflag: c_int, ...) -> c_int;
+        fn openat(dirfd: c_int, path: *const c_char, oflag: c_int, ...) -> c_int;
         fn close(fd: c_int) -> c_int;
         fn getattrlistbulk(
             dirfd: c_int,
@@ -513,14 +512,271 @@ mod macos_bulk {
         })
     }
 
-    fn walk_subtree_dfs(root: PathBuf, seen_objs: &Mutex<HashSet<u64>>) -> u64 {
-        let mut stack: Vec<PathBuf> = vec![root];
-        let mut total: u64 = 0;
-        while let Some(dir) = stack.pop() {
-            if let Some(bytes) = read_single_dir_bulk(&dir, false, seen_objs, &mut stack) {
-                total = total.saturating_add(bytes);
+    /// Reads all entries from an already-open directory FD using the thread-local 128KB bulk buffer,
+    /// pushing NUL-terminated child directory names into `child_names` (zero `PathBuf` allocations).
+    fn read_fd_bulk(
+        fd: c_int,
+        seen_objs: &Mutex<HashSet<u64>>,
+        child_names: &mut Vec<u8>,
+        child_offsets: &mut Vec<usize>,
+    ) -> u64 {
+        TL_BULK_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let (buf, _) = &mut *guard;
+
+            let mut attrlist = AttrList {
+                bitmapcount: ATTR_BIT_MAP_COUNT,
+                reserved: 0,
+                commonattr: ATTR_CMN_RETURNED_ATTRS
+                    | ATTR_CMN_NAME
+                    | ATTR_CMN_OBJTYPE
+                    | ATTR_CMN_OBJID,
+                volattr: 0,
+                dirattr: 0,
+                fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
+                forkattr: 0,
+            };
+
+            let mut total: u64 = 0;
+
+            loop {
+                let count = unsafe {
+                    getattrlistbulk(
+                        fd,
+                        &mut attrlist,
+                        buf.as_mut_ptr() as *mut c_void,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if count <= 0 {
+                    break;
+                }
+
+                let mut offset: usize = 0;
+                for _ in 0..count {
+                    if offset + 4 > buf.len() {
+                        break;
+                    }
+                    let entry_len =
+                        u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+                    if entry_len == 0 || offset + entry_len > buf.len() {
+                        break;
+                    }
+
+                    let entry = &buf[offset..offset + entry_len];
+                    let mut field = 4usize;
+
+                    if field + std::mem::size_of::<AttributeSet>() > entry.len() {
+                        offset += entry_len;
+                        continue;
+                    }
+                    let returned: AttributeSet = unsafe {
+                        std::ptr::read_unaligned(entry.as_ptr().add(field) as *const AttributeSet)
+                    };
+                    field += std::mem::size_of::<AttributeSet>();
+
+                    let mut name_bytes: &[u8] = &[];
+                    if returned.commonattr & ATTR_CMN_NAME != 0 {
+                        if field + std::mem::size_of::<AttrReference>() <= entry.len() {
+                            let name_field_start = field;
+                            let attr_ref: AttrReference = unsafe {
+                                std::ptr::read_unaligned(
+                                    entry.as_ptr().add(field) as *const AttrReference,
+                                )
+                            };
+                            field += std::mem::size_of::<AttrReference>();
+                            let start =
+                                name_field_start.wrapping_add(attr_ref.attr_dataoffset as usize);
+                            let len = attr_ref.attr_length as usize;
+                            if start < entry.len() && start + len <= entry.len() && len > 0 {
+                                let slice = &entry[start..start + len];
+                                name_bytes = slice.strip_suffix(&[0]).unwrap_or(slice);
+                            }
+                        }
+                    }
+
+                    let mut obj_type: u32 = 0;
+                    if returned.commonattr & ATTR_CMN_OBJTYPE != 0 {
+                        if field + 4 <= entry.len() {
+                            obj_type =
+                                u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
+                            field += 4;
+                        }
+                    }
+
+                    let mut obj_key: u64 = 0;
+                    if returned.commonattr & ATTR_CMN_OBJID != 0 {
+                        if field + std::mem::size_of::<FsObjId>() <= entry.len() {
+                            let id: FsObjId = unsafe {
+                                std::ptr::read_unaligned(entry.as_ptr().add(field) as *const FsObjId)
+                            };
+                            obj_key = ((id.objid as u64) << 32) | (id.objno as u64);
+                            field += std::mem::size_of::<FsObjId>();
+                        }
+                    }
+
+                    if obj_type == VDIR {
+                        if !name_bytes.is_empty() && name_bytes != b"." && name_bytes != b".." {
+                            child_offsets.push(child_names.len());
+                            child_names.extend_from_slice(name_bytes);
+                            child_names.push(0);
+                        }
+                    } else if obj_type == VREG {
+                        let mut link_count: u32 = 1;
+                        if returned.fileattr & ATTR_FILE_LINKCOUNT != 0 && field + 4 <= entry.len() {
+                            link_count =
+                                u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
+                            field += 4;
+                        }
+
+                        let mut total_size: i64 = 0;
+                        if returned.fileattr & ATTR_FILE_TOTALSIZE != 0 && field + 8 <= entry.len() {
+                            total_size =
+                                i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
+                            field += 8;
+                        }
+
+                        let mut alloc_size: i64 = 0;
+                        if returned.fileattr & ATTR_FILE_ALLOCSIZE != 0 && field + 8 <= entry.len() {
+                            alloc_size =
+                                i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
+                        }
+
+                        if link_count > 1 && obj_key != 0 {
+                            if let Ok(mut seen) = seen_objs.lock() {
+                                if !seen.insert(obj_key) {
+                                    offset += entry_len;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let bytes = if alloc_size > 0 {
+                            alloc_size as u64
+                        } else if total_size > 0 {
+                            total_size as u64
+                        } else {
+                            0
+                        };
+                        total = total.saturating_add(bytes);
+                    }
+
+                    offset += entry_len;
+                }
             }
+
+            total
+        })
+    }
+
+    /// Single-FD zero-PathBuf DFS fallback for extreme nesting depths (> 16), keeping FD usage at 1.
+    fn walk_deep_single_fd(
+        path_bytes: &mut Vec<u8>,
+        depth: u16,
+        seen_objs: &Mutex<HashSet<u64>>,
+    ) -> u64 {
+        if depth > 256 {
+            return 0;
         }
+        path_bytes.push(0);
+        let fd = unsafe {
+            open(
+                path_bytes.as_ptr() as *const c_char,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            )
+        };
+        path_bytes.pop();
+        if fd < 0 {
+            return 0;
+        }
+
+        let mut child_names = Vec::new();
+        let mut child_offsets = Vec::new();
+        let mut total = read_fd_bulk(fd, seen_objs, &mut child_names, &mut child_offsets);
+        unsafe { close(fd) };
+
+        let saved_len = path_bytes.len();
+        for (i, &start) in child_offsets.iter().enumerate() {
+            let end_with_nul = if i + 1 < child_offsets.len() {
+                child_offsets[i + 1]
+            } else {
+                child_names.len()
+            };
+            let name_slice = &child_names[start..end_with_nul.saturating_sub(1)];
+            path_bytes.push(b'/');
+            path_bytes.extend_from_slice(name_slice);
+            total = total.saturating_add(walk_deep_single_fd(path_bytes, depth + 1, seen_objs));
+            path_bytes.truncate(saved_len);
+        }
+        total
+    }
+
+    /// Zero-PathBuf `openat` DFS bounded to 16 open FDs per thread (falls back to single-FD path buffer beyond depth 16).
+    fn walk_openat_dfs(
+        dirfd: c_int,
+        depth: u8,
+        path_bytes: &mut Vec<u8>,
+        seen_objs: &Mutex<HashSet<u64>>,
+    ) -> u64 {
+        let mut child_names = Vec::new();
+        let mut child_offsets = Vec::new();
+        let mut total = read_fd_bulk(dirfd, seen_objs, &mut child_names, &mut child_offsets);
+
+        let saved_len = path_bytes.len();
+        for (i, &start) in child_offsets.iter().enumerate() {
+            let end_with_nul = if i + 1 < child_offsets.len() {
+                child_offsets[i + 1]
+            } else {
+                child_names.len()
+            };
+            let name_slice = &child_names[start..end_with_nul.saturating_sub(1)];
+            path_bytes.push(b'/');
+            path_bytes.extend_from_slice(name_slice);
+
+            if depth < 16 {
+                let name_ptr = unsafe { child_names.as_ptr().add(start) as *const c_char };
+                let child_fd = unsafe {
+                    openat(
+                        dirfd,
+                        name_ptr,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                    )
+                };
+                if child_fd >= 0 {
+                    total = total.saturating_add(walk_openat_dfs(
+                        child_fd,
+                        depth + 1,
+                        path_bytes,
+                        seen_objs,
+                    ));
+                    unsafe { close(child_fd) };
+                }
+            } else {
+                total = total.saturating_add(walk_deep_single_fd(path_bytes, 0, seen_objs));
+            }
+
+            path_bytes.truncate(saved_len);
+        }
+        total
+    }
+
+    fn walk_subtree_dfs(root: &Path, seen_objs: &Mutex<HashSet<u64>>) -> u64 {
+        let mut path_bytes = Vec::with_capacity(512);
+        path_bytes.extend_from_slice(root.as_os_str().as_encoded_bytes());
+        path_bytes.push(0);
+        let fd = unsafe {
+            open(
+                path_bytes.as_ptr() as *const c_char,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            )
+        };
+        path_bytes.pop();
+        if fd < 0 {
+            return 0;
+        }
+        let total = walk_openat_dfs(fd, 0, &mut path_bytes, seen_objs);
+        unsafe { close(fd) };
         total
     }
 
@@ -537,16 +793,14 @@ mod macos_bulk {
                     if depth + 1 < 2 {
                         walk_parallel(&sub, depth + 1, seen_objs).unwrap_or(0)
                     } else {
-                        walk_subtree_dfs(sub, seen_objs)
+                        walk_subtree_dfs(&sub, seen_objs)
                     }
                 })
                 .sum()
         } else {
             let mut acc: u64 = 0;
-            while let Some(sub) = subdirs.pop() {
-                if let Some(bytes) = read_single_dir_bulk(&sub, false, seen_objs, &mut subdirs) {
-                    acc = acc.saturating_add(bytes);
-                }
+            for sub in &subdirs {
+                acc = acc.saturating_add(walk_subtree_dfs(sub, seen_objs));
             }
             acc
         };
@@ -587,7 +841,7 @@ fn calculate_dir_size_fallback(path: &Path, seen_inodes: &mut HashSet<(u64, u64)
     total
 }
 
-fn calculate_path_size_accurate(path: &Path) -> u64 {
+pub(crate) fn calculate_path_size_accurate(path: &Path) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return 0;
     };
@@ -857,6 +1111,207 @@ pub extern "C" fn upkeep_brew_index_load_api_json(
     result.unwrap_or(0)
 }
 
+const BREW_CACHE_MAGIC: &[u8; 4] = b"UKBC";
+const BREW_CACHE_VERSION: u32 = 1;
+
+#[inline]
+fn write_len_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+#[inline]
+fn read_len_str<'a>(data: &'a [u8], cursor: &mut usize) -> Option<&'a str> {
+    if *cursor + 4 > data.len() {
+        return None;
+    }
+    let len = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().ok()?) as usize;
+    *cursor += 4;
+    if *cursor + len > data.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(&data[*cursor..*cursor + len]).ok()?;
+    *cursor += len;
+    Some(s)
+}
+
+fn save_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path) -> bool {
+    let Ok(guard) = index.packages.read() else {
+        return false;
+    };
+    if guard.is_empty() {
+        return false;
+    }
+    let mut buf = Vec::with_capacity(guard.len() * 96);
+    buf.extend_from_slice(BREW_CACHE_MAGIC);
+    buf.extend_from_slice(&BREW_CACHE_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(guard.len() as u32).to_le_bytes());
+    for item in guard.iter() {
+        let flags: u8 = if item.pkg.is_cask { 1 } else { 0 };
+        buf.push(flags);
+        write_len_str(&mut buf, &item.pkg.name);
+        write_len_str(&mut buf, &item.pkg.description);
+        write_len_str(&mut buf, &item.api_version);
+        write_len_str(&mut buf, &item.pkg.homepage);
+    }
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let tmp_path = cache_path.with_extension("bin.tmp");
+    if fs::write(&tmp_path, &buf).is_err() {
+        return false;
+    }
+    fs::rename(&tmp_path, cache_path).is_ok()
+}
+
+fn load_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path, prefix: &str) -> u32 {
+    let (raw_res, installed) = rayon::join(|| fs::read(cache_path), || scan_brew_dirs_internal(prefix));
+    let Ok(data) = raw_res else {
+        return 0;
+    };
+    if data.len() < 12 || &data[0..4] != BREW_CACHE_MAGIC {
+        return 0;
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != BREW_CACHE_VERSION {
+        return 0;
+    }
+    let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let mut cursor = 12usize;
+
+    let mut installed_formulae: HashMap<String, BrewPackage> = HashMap::new();
+    let mut installed_casks: HashMap<String, BrewPackage> = HashMap::new();
+    for pkg in installed {
+        if pkg.is_cask {
+            installed_casks.insert(pkg.name.clone(), pkg);
+        } else {
+            installed_formulae.insert(pkg.name.clone(), pkg);
+        }
+    }
+
+    let mut merged = Vec::with_capacity(count + 32);
+    for _ in 0..count {
+        if cursor >= data.len() {
+            return 0;
+        }
+        let flags = data[cursor];
+        cursor += 1;
+        let is_cask = (flags & 1) != 0;
+        let Some(name_str) = read_len_str(&data, &mut cursor) else {
+            return 0;
+        };
+        let Some(desc_str) = read_len_str(&data, &mut cursor) else {
+            return 0;
+        };
+        let Some(api_ver_str) = read_len_str(&data, &mut cursor) else {
+            return 0;
+        };
+        let Some(homepage_str) = read_len_str(&data, &mut cursor) else {
+            return 0;
+        };
+
+        let local = if is_cask {
+            installed_casks.remove(name_str)
+        } else {
+            installed_formulae.remove(name_str)
+        };
+
+        let (version_str, is_installed, is_outdated, is_pinned) = if let Some(loc) = local {
+            let outdated = if is_cask {
+                !loc.version.is_empty()
+                    && !api_ver_str.is_empty()
+                    && api_ver_str != "latest"
+                    && loc.version != "latest"
+                    && api_ver_str != loc.version
+                    && cmp_versions_natural(api_ver_str, &loc.version) == Ordering::Greater
+            } else {
+                !loc.is_pinned
+                    && !loc.version.is_empty()
+                    && !api_ver_str.is_empty()
+                    && cmp_versions_natural(api_ver_str, &loc.version) == Ordering::Greater
+            };
+            let ver = if !loc.version.is_empty() {
+                loc.version
+            } else {
+                api_ver_str.to_string()
+            };
+            (ver, true, outdated, loc.is_pinned)
+        } else {
+            (api_ver_str.to_string(), false, false, false)
+        };
+
+        merged.push(IndexedPackage::with_api_version(
+            BrewPackage {
+                name: name_str.to_string(),
+                description: desc_str.to_string(),
+                version: version_str,
+                is_cask,
+                is_installed,
+                is_outdated,
+                is_pinned,
+                homepage: homepage_str.to_string(),
+            },
+            api_ver_str.to_string(),
+        ));
+    }
+
+    for (_, pkg) in installed_formulae {
+        merged.push(IndexedPackage::new(pkg));
+    }
+    for (_, pkg) in installed_casks {
+        merged.push(IndexedPackage::new(pkg));
+    }
+
+    let loaded = merged.len() as u32;
+    if let Ok(mut guard) = index.packages.write() {
+        *guard = merged;
+    }
+    loaded
+}
+
+/// Loads a compact binary Homebrew catalog cache from disk (<5ms) and merges local Cellar/Caskroom state in parallel.
+#[no_mangle]
+pub extern "C" fn upkeep_brew_index_load_binary_cache(
+    ptr: *mut BrewSearchIndex,
+    cache_path_utf8: *const c_char,
+    prefix_utf8: *const c_char,
+) -> u32 {
+    let result = std::panic::catch_unwind(|| {
+        if ptr.is_null() || cache_path_utf8.is_null() {
+            return 0;
+        }
+        let index = unsafe { &*ptr };
+        let cache_path = cstr_to_str(cache_path_utf8);
+        if cache_path.is_empty() {
+            return 0;
+        }
+        let prefix = cstr_to_str(prefix_utf8);
+        load_binary_cache_internal(index, Path::new(cache_path), prefix)
+    });
+    result.unwrap_or(0)
+}
+
+/// Persists the current Homebrew catalog index to a compact binary cache file atomically.
+#[no_mangle]
+pub extern "C" fn upkeep_brew_index_save_binary_cache(
+    ptr: *const BrewSearchIndex,
+    cache_path_utf8: *const c_char,
+) -> bool {
+    let result = std::panic::catch_unwind(|| {
+        if ptr.is_null() || cache_path_utf8.is_null() {
+            return false;
+        }
+        let index = unsafe { &*ptr };
+        let cache_path = cstr_to_str(cache_path_utf8);
+        if cache_path.is_empty() {
+            return false;
+        }
+        save_binary_cache_internal(index, Path::new(cache_path))
+    });
+    result.unwrap_or(false)
+}
+
 /// Refreshes only local Cellar/Caskroom/pinned state in-place (~5ms) without re-parsing API JSON.
 #[no_mangle]
 pub extern "C" fn upkeep_brew_index_refresh_local(
@@ -1039,6 +1494,7 @@ fn score_indexed_package(
     pattern: &Pattern,
     matcher: &mut Matcher,
     char_buf: &mut Vec<char>,
+    skip_description: bool,
 ) -> Option<u32> {
     let installed_bonus: u32 = if item.pkg.is_installed { 180 } else { 0 };
 
@@ -1077,6 +1533,11 @@ fn score_indexed_package(
         return Some(25_000u32.saturating_add(name_score).saturating_sub(len_penalty) + installed_bonus);
     }
 
+    // Short-circuit Tier 5 description scan when top-K name matches are already full.
+    if skip_description {
+        return None;
+    }
+
     // Tier 5: Description match — require exact substring match for short queries (< 4 chars)
     // or strong word/substring presence so scattered letters never pollute top results
     if !item.pkg.description.is_empty() {
@@ -1106,11 +1567,15 @@ fn parallel_score_indices(
     query: &str,
     filter_mode: i32,
     limit: usize,
+    installed_only: bool,
 ) -> Vec<(u32, u32)> {
-    let matches_filter = |p: &BrewPackage| match filter_mode {
-        0 => !p.is_cask,
-        1 => p.is_cask,
-        _ => true,
+    let matches_filter = |p: &BrewPackage| {
+        (!installed_only || p.is_installed)
+            && match filter_mode {
+                0 => !p.is_cask,
+                1 => p.is_cask,
+                _ => true,
+            }
     };
 
     let trimmed = query.trim();
@@ -1133,22 +1598,29 @@ fn parallel_score_indices(
         TL_MATCHER.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (matcher, char_buf) = &mut *guard;
-            items
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| matches_filter(&item.pkg))
-                .filter_map(|(idx, item)| {
-                    let score = score_indexed_package(
-                        item,
-                        &query_lower,
-                        q_bytes,
-                        &pattern,
-                        matcher,
-                        char_buf,
-                    )?;
-                    Some((score, idx as u32))
-                })
-                .collect()
+            let mut high_tier_count = 0usize;
+            let mut local = Vec::new();
+            for (idx, item) in items.iter().enumerate() {
+                if !matches_filter(&item.pkg) {
+                    continue;
+                }
+                let skip_desc = limit > 0 && high_tier_count >= limit;
+                if let Some(score) = score_indexed_package(
+                    item,
+                    &query_lower,
+                    q_bytes,
+                    &pattern,
+                    matcher,
+                    char_buf,
+                    skip_desc,
+                ) {
+                    if score >= 25_000 {
+                        high_tier_count += 1;
+                    }
+                    local.push((score, idx as u32));
+                }
+            }
+            local
         })
     } else {
         // Chunked parallel scan reusing thread-local Matcher + scratch buffer with per-chunk top-K pruning.
@@ -1161,11 +1633,13 @@ fn parallel_score_indices(
                 TL_MATCHER.with(|cell| {
                     let mut guard = cell.borrow_mut();
                     let (matcher, char_buf) = &mut *guard;
+                    let mut high_tier_count = 0usize;
                     let mut local = Vec::new();
                     for (offset, item) in chunk.iter().enumerate() {
                         if !matches_filter(&item.pkg) {
                             continue;
                         }
+                        let skip_desc = limit > 0 && high_tier_count >= limit;
                         if let Some(score) = score_indexed_package(
                             item,
                             &query_lower,
@@ -1173,7 +1647,11 @@ fn parallel_score_indices(
                             &pattern,
                             matcher,
                             char_buf,
+                            skip_desc,
                         ) {
+                            if score >= 25_000 {
+                                high_tier_count += 1;
+                            }
                             local.push((score, (base_idx + offset) as u32));
                         }
                     }
@@ -1206,11 +1684,12 @@ fn parallel_score_indices(
 }
 
 #[no_mangle]
-pub extern "C" fn upkeep_brew_index_search_json(
+pub extern "C" fn upkeep_brew_index_search_scoped_json(
     ptr: *const BrewSearchIndex,
     query_utf8: *const c_char,
     limit: u32,
     filter_mode: i32,
+    installed_only: bool,
 ) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         if ptr.is_null() {
@@ -1222,7 +1701,7 @@ pub extern "C" fn upkeep_brew_index_search_json(
             return string_to_cstr("[]".to_string());
         };
 
-        let top_indices = parallel_score_indices(&guard, query, filter_mode, limit as usize);
+        let top_indices = parallel_score_indices(&guard, query, filter_mode, limit as usize, installed_only);
         let top: Vec<&BrewPackage> = top_indices
             .into_iter()
             .map(|(_, idx)| &guard[idx as usize].pkg)
@@ -1230,6 +1709,16 @@ pub extern "C" fn upkeep_brew_index_search_json(
         string_to_cstr(serde_json::to_string(&top).unwrap_or_else(|_| "[]".into()))
     });
     result.unwrap_or_else(|_| string_to_cstr("[]".to_string()))
+}
+
+#[no_mangle]
+pub extern "C" fn upkeep_brew_index_search_json(
+    ptr: *const BrewSearchIndex,
+    query_utf8: *const c_char,
+    limit: u32,
+    filter_mode: i32,
+) -> *mut c_char {
+    upkeep_brew_index_search_scoped_json(ptr, query_utf8, limit, filter_mode, false)
 }
 
 /// Zero-allocation parallel search: writes matches into caller-allocated UpkeepMatch array.
@@ -1251,7 +1740,7 @@ pub extern "C" fn upkeep_brew_index_search_fast(
             return 0;
         };
 
-        let scored = parallel_score_indices(&guard, query, filter_mode, capacity as usize);
+        let scored = parallel_score_indices(&guard, query, filter_mode, capacity as usize, false);
         let count = (scored.len() as u32).min(capacity);
         for (i, (score, idx)) in scored.into_iter().take(count as usize).enumerate() {
             unsafe {
@@ -1332,18 +1821,18 @@ struct JetBrainsInfoPlist {
 }
 
 fn extract_xml_plist_string(bytes: &[u8], key_tag: &[u8]) -> Option<String> {
-    let pos = bytes.windows(key_tag.len()).position(|w| w == key_tag)?;
+    let pos = memmem::find(bytes, key_tag)?;
     let after_key = &bytes[pos + key_tag.len()..];
     let open_tag = b"<string>";
-    let open_pos = after_key.windows(open_tag.len()).position(|w| w == open_tag)?;
-    if after_key[..open_pos].windows(5).any(|w| w == b"<key>") {
+    let open_pos = memmem::find(after_key, open_tag)?;
+    if memmem::find(&after_key[..open_pos], b"<key>").is_some() {
         return None;
     }
     let rest = &after_key[open_pos + open_tag.len()..];
     let close_tag = b"</string>";
-    let close_pos = rest.windows(close_tag.len()).position(|w| w == close_tag)?;
+    let close_pos = memmem::find(rest, close_tag)?;
     let raw = std::str::from_utf8(&rest[..close_pos]).ok()?.trim();
-    if raw.contains('&') {
+    if memchr(b'&', raw.as_bytes()).is_some() {
         return None;
     }
     Some(raw.to_string())
@@ -1732,7 +2221,7 @@ fn read_jetbrains_paths_selector(app_path: &Path) -> Option<String> {
         .paths_selector
 }
 
-fn is_protected_path(path: &Path, home: &str) -> bool {
+pub(crate) fn is_protected_path(path: &Path, home: &str) -> bool {
     let path_str = path.to_string_lossy();
     let path_bytes = path_str.as_bytes();
     let home_bytes = home.as_bytes();
@@ -2563,7 +3052,7 @@ pub extern "C" fn upkeep_scan_brew_dirs_json(prefix_utf8: *const c_char) -> *mut
 pub extern "C" fn upkeep_strip_ansi(raw_utf8: *const c_char) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         let raw = cstr_to_str(raw_utf8);
-        if !raw.as_bytes().contains(&0x1b) {
+        if memchr(0x1b, raw.as_bytes()).is_none() {
             return string_to_cstr(raw.to_string());
         }
         string_to_cstr(strip_ansi_escapes::strip_str(raw))
@@ -2587,7 +3076,7 @@ pub extern "C" fn upkeep_parse_mole_clean_json(
 ) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         let raw = cstr_to_str(raw_utf8);
-        let cleaned: Cow<'_, str> = if raw.as_bytes().contains(&0x1b) {
+        let cleaned: Cow<'_, str> = if memchr(0x1b, raw.as_bytes()).is_some() {
             Cow::Owned(strip_ansi_escapes::strip_str(raw))
         } else {
             Cow::Borrowed(raw)

@@ -1049,36 +1049,11 @@ private struct HomebrewSettingsPane: View {
 
 // MARK: - 3. Cleaner (Centered macOS 27 Workspace Aligned with Traffic Lights)
 
-private enum CleanerFilter: String, CaseIterable, Identifiable {
-    case all = "All"
-    case candidates = "Candidates"
-    case cleaned = "Cleaned"
-
-    var id: String { rawValue }
-}
-
 private struct CleanerWorkspacePane: View {
     @Bindable var vm: TrayViewModel
-    @State private var hoveredIndex: Int?
-    @State private var filter: CleanerFilter = .all
-    @State private var copiedMoleInstall = false
+    @State private var collapsedCategories: Set<String> = []
+    @State private var hoveredItemID: String?
     @State private var copiedCleanError = false
-
-    private var filteredLines: [String] {
-        guard let lines = vm.cleanPreview?.lines else { return [] }
-        switch filter {
-        case .all:
-            return lines
-        case .candidates:
-            return lines.filter { $0.hasPrefix("➤") || $0.hasPrefix("○") || $0.hasPrefix("◎") }
-        case .cleaned:
-            return lines.filter { $0.hasPrefix("➤") || $0.hasPrefix("✓") }
-        }
-    }
-
-    private var hasNonHeaderFilteredItems: Bool {
-        filteredLines.contains { !$0.hasPrefix("➤") }
-    }
 
     var body: some View {
         GeometryReader { geo in
@@ -1094,14 +1069,14 @@ private struct CleanerWorkspacePane: View {
                                     .font(.system(size: 16.5, weight: .semibold))
                                     .foregroundStyle(.primary)
 
-                                if let summary = vm.cleanPreview {
-                                    Text(summary.totalReclaimed)
+                                if let scan = vm.cleanerScan, scan.itemCount > 0 {
+                                    Text("\(vm.formattedSelectedCleanSize) selected")
                                         .font(.system(size: 11.5, weight: .semibold, design: .rounded).monospacedDigit())
-                                        .foregroundStyle(summary.isDryRun ? MenuBarTheme.Colors.moleClean : MenuBarTheme.Colors.success)
+                                        .foregroundStyle(MenuBarTheme.Colors.moleClean)
                                         .padding(.horizontal, 8)
                                         .padding(.vertical, 2)
                                         .background(
-                                            (summary.isDryRun ? MenuBarTheme.Colors.moleClean : MenuBarTheme.Colors.success).opacity(0.14),
+                                            MenuBarTheme.Colors.moleClean.opacity(0.14),
                                             in: Capsule()
                                         )
                                 }
@@ -1125,22 +1100,22 @@ private struct CleanerWorkspacePane: View {
                             .disabled(vm.isScanningClean || vm.isCleaning)
                             .help("Rescan cleanable caches")
 
-                            if let summary = vm.cleanPreview, summary.isDryRun, !summary.lines.isEmpty, !vm.confirmClean {
+                            if let scan = vm.cleanerScan, scan.itemCount > 0, !vm.confirmClean {
                                 Button(role: .destructive) {
                                     withAnimation(.snappy) { vm.confirmClean = true }
                                 } label: {
-                                    Text("Clean Now")
+                                    Text("Clean Selected")
                                 }
                                 .buttonStyle(.upkeepPrimary)
                                 .tint(.red)
-                                .disabled(vm.isScanningClean || vm.isCleaning)
+                                .disabled(vm.selectedCleanPaths.isEmpty || vm.isScanningClean || vm.isCleaning)
                             }
                         }
                     }
 
-                    if let summary = vm.cleanPreview, summary.isDryRun, vm.confirmClean {
+                    if vm.confirmClean, !vm.selectedCleanPaths.isEmpty {
                         MenuBarDestructiveConfirmBar(
-                            title: "Delete \(summary.totalReclaimed) of cached data?",
+                            title: "Delete \(vm.formattedSelectedCleanSize) across \(vm.selectedCleanPaths.count) selected items?",
                             confirmLabel: "Clean",
                             confirmIcon: "trash",
                             onCancel: {
@@ -1153,24 +1128,64 @@ private struct CleanerWorkspacePane: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                     }
 
-                    if vm.cleanPreview != nil && !(vm.cleanPreview?.lines.isEmpty ?? true) {
-                        HStack {
-                            Picker("Filter", selection: $filter) {
-                                ForEach(CleanerFilter.allCases) { item in
-                                    Text(item.rawValue).tag(item)
-                                }
+                    if let result = vm.lastCleanResult {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 12))
+                                .foregroundStyle(MenuBarTheme.Colors.success)
+                            Text("Reclaimed \(result.formattedReclaimedSize) across \(result.removedCount) \(result.removedCount == 1 ? "item" : "items") in \(result.durationMs) ms")
+                                .font(.footnote.weight(.medium))
+                                .foregroundStyle(.primary)
+                            if !result.failedItems.isEmpty {
+                                Text("· \(result.failedItems.count) skipped")
+                                    .font(.footnote)
+                                    .foregroundStyle(.orange)
                             }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            .frame(maxWidth: 260)
+                            Spacer()
+                            Button("Dismiss") {
+                                withAnimation(.snappy) { vm.lastCleanResult = nil }
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(MenuBarTheme.Colors.success.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+
+                    if let scan = vm.cleanerScan, scan.itemCount > 0 {
+                        HStack(spacing: 8) {
+                            Button("Select Safe") {
+                                vm.selectedCleanPaths = scan.defaultSelectedPaths
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(Color.accentColor)
+
+                            Text("·").foregroundStyle(.tertiary)
+
+                            Button("Select All") {
+                                vm.selectedCleanPaths = Set(scan.allItems.map(\.path))
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+
+                            Text("·").foregroundStyle(.tertiary)
+
+                            Button("None") {
+                                vm.selectedCleanPaths.removeAll()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
 
                             Spacer()
 
-                            if let summary = vm.cleanPreview {
-                                Text("\(summary.itemCount) items")
-                                    .font(.footnote.monospacedDigit())
-                                    .foregroundStyle(.tertiary)
-                            }
+                            Text("\(scan.formattedTotalSize) total · \(scan.itemCount) items")
+                                .font(.footnote.monospacedDigit())
+                                .foregroundStyle(.tertiary)
                         }
                     }
                 }
@@ -1181,34 +1196,12 @@ private struct CleanerWorkspacePane: View {
 
                 Divider().opacity(0.16)
 
-                if !MoleService.isInstalled() {
-                    ContentUnavailableView {
-                        Label("Mole CLI Not Installed", systemImage: "terminal")
-                    } description: {
-                        Text("Upkeep uses Mole (`mo clean`) for safe dry-run cache inspection. Install it via Homebrew to enable Cleaner.")
-                    } actions: {
-                        HStack(spacing: 8) {
-                            Button(copiedMoleInstall ? "Copied Command" : "Copy `brew install` Command") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString("brew install tw93/tap/mole", forType: .string)
-                                copiedMoleInstall = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                    copiedMoleInstall = false
-                                }
-                            }
-                            .buttonStyle(.upkeepPrimary)
-
-                            Button("Retry") { vm.runMoleDryRun() }
-                                .buttonStyle(.upkeepSecondary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if vm.isScanningClean || vm.isCleaning {
+                if vm.isScanningClean || vm.isCleaning {
                     VStack(spacing: 10) {
                         ProgressView()
-                        Text(vm.isCleaning ? "Cleaning caches…" : "Scanning caches safely…")
+                        Text(vm.isCleaning ? "Cleaning selected caches…" : "Scanning system & developer caches…")
                             .font(.system(size: 13, weight: .medium))
-                        Text(vm.isCleaning ? "Reclaiming disk space" : "Running `mo clean --dry-run` without deleting files")
+                        Text(vm.isCleaning ? "Removing selected items safely in parallel" : "Measuring APFS disk usage without deleting files")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -1235,34 +1228,22 @@ private struct CleanerWorkspacePane: View {
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if let summary = vm.cleanPreview {
-                    if summary.lines.isEmpty {
+                } else if let scan = vm.cleanerScan {
+                    if scan.categories.isEmpty {
                         ContentUnavailableView {
                             Label("System is Clean", systemImage: "checkmark.circle")
                         } description: {
-                            Text("No reclaimable caches were reported by Mole.")
+                            Text("No reclaimable caches or stale temporary files were found.")
                         } actions: {
                             Button("Rescan") { vm.runMoleDryRun() }
                                 .buttonStyle(.upkeepSecondary)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else if !hasNonHeaderFilteredItems {
-                        ContentUnavailableView {
-                            Label("No \(filter.rawValue) Items", systemImage: "line.3.horizontal.decrease.circle")
-                        } description: {
-                            Text(filter == .cleaned
-                                 ? "No files have been deleted yet — this is a dry-run preview."
-                                 : "No candidate cache entries match this filter.")
-                        } actions: {
-                            Button("Show All Items") { filter = .all }
-                                .buttonStyle(.upkeepSecondary)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 2) {
-                                ForEach(Array(filteredLines.prefix(150).enumerated()), id: \.offset) { idx, line in
-                                    cleanerRow(line, index: idx)
+                            LazyVStack(alignment: .leading, spacing: 14) {
+                                ForEach(scan.categories) { category in
+                                    cleanerCategorySection(category)
                                 }
                             }
                             .padding(.horizontal, sideMargin)
@@ -1275,9 +1256,9 @@ private struct CleanerWorkspacePane: View {
                     ContentUnavailableView {
                         Label("Ready to Scan", systemImage: "doc.text.magnifyingglass")
                     } description: {
-                        Text("Inspect system and app caches safely without deleting any files.")
+                        Text("Inspect user, browser, and developer caches safely without deleting any files.")
                     } actions: {
-                        Button("Start Dry-Run") { vm.runMoleDryRun() }
+                        Button("Start Scan") { vm.runMoleDryRun() }
                             .buttonStyle(.upkeepPrimary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1289,49 +1270,154 @@ private struct CleanerWorkspacePane: View {
     }
 
     private var headerSubtitle: String {
-        if let summary = vm.cleanPreview {
-            return summary.isDryRun
-                ? "Dry-run preview · \(summary.itemCount) candidate items · No files deleted yet"
-                : "Cleanup complete · \(summary.totalReclaimed) reclaimed safely"
+        if let scan = vm.cleanerScan {
+            return "Native APFS dry-run · \(scan.categories.count) categories · Scanned in \(scan.scanDurationMs) ms"
         }
-        return "Inspects system and app caches safely before deleting"
+        return "Inspects user, browser, and developer caches safely before deleting"
     }
 
-    private func cleanerRow(_ line: String, index: Int) -> some View {
-        let isHeader = line.hasPrefix("➤")
-        let isCandidate = line.hasPrefix("○") || line.hasPrefix("◎")
-        let isCleaned = line.hasPrefix("✓")
-        let stripped = line.dropFirst().trimmingCharacters(in: .whitespaces)
+    private func cleanerCategorySection(_ category: CleanerCategory) -> some View {
+        let isCollapsed = collapsedCategories.contains(category.id)
+        let paths = category.items.map(\.path)
+        let selectedCount = paths.filter { vm.selectedCleanPaths.contains($0) }.count
+        let allSelected = selectedCount == paths.count && !paths.isEmpty
+        let someSelected = selectedCount > 0 && !allSelected
 
-        return HStack(spacing: 10) {
-            if isHeader {
-                Text(stripped)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .padding(.top, index == 0 ? 0 : 12)
-                    .padding(.bottom, 4)
-            } else {
-                Image(systemName: isCleaned ? "checkmark.circle.fill" : (isCandidate ? "circle.dashed" : "info.circle"))
-                    .font(.system(size: 11))
-                    .foregroundStyle(isCleaned ? MenuBarTheme.Colors.success : (isCandidate ? MenuBarTheme.Colors.moleClean : .secondary))
-                    .frame(width: 14)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Button {
+                    if allSelected {
+                        for p in paths { vm.selectedCleanPaths.remove(p) }
+                    } else {
+                        for p in paths { vm.selectedCleanPaths.insert(p) }
+                    }
+                } label: {
+                    Image(systemName: allSelected ? "checkmark.square.fill" : (someSelected ? "minus.square.fill" : "square"))
+                        .foregroundStyle((allSelected || someSelected) ? Color.accentColor : Color.secondary)
+                        .font(.system(size: 14))
+                }
+                .buttonStyle(.plain)
+                .help(allSelected ? "Deselect all in \(category.title)" : "Select all in \(category.title)")
 
-                Text(stripped)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                Button {
+                    withAnimation(.snappy(duration: 0.18)) {
+                        if isCollapsed {
+                            collapsedCategories.remove(category.id)
+                        } else {
+                            collapsedCategories.insert(category.id)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 12)
+
+                        Text(category.title)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.primary)
+
+                        Text("(\(selectedCount)/\(category.items.count))")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+
+                        Spacer()
+
+                        Text(category.formattedTotalSize)
+                            .font(.system(size: 11.5, weight: .medium, design: .rounded).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
-            Spacer(minLength: 0)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            if !isCollapsed {
+                VStack(spacing: 3) {
+                    ForEach(category.items) { item in
+                        cleanerItemRow(item)
+                    }
+                }
+                .padding(.leading, 8)
+            }
+        }
+    }
+
+    private func cleanerItemRow(_ item: CleanerItem) -> some View {
+        let isChecked = vm.selectedCleanPaths.contains(item.path)
+
+        return HStack(spacing: 8) {
+            Button {
+                if isChecked {
+                    vm.selectedCleanPaths.remove(item.path)
+                } else {
+                    vm.selectedCleanPaths.insert(item.path)
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: isChecked ? "checkmark.square.fill" : "square")
+                        .foregroundStyle(isChecked ? Color.accentColor : Color.secondary)
+                        .font(.system(size: 14))
+                        .frame(width: 16)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(item.name)
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+
+                            if !item.defaultSelected {
+                                Text("Held back · \(item.holdbackReason ?? "Optional")")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .foregroundStyle(.orange)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.orange.opacity(0.14), in: Capsule())
+                            }
+                        }
+
+                        Text(item.displayPath)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer(minLength: 6)
+
+                    Text(item.formattedSize)
+                        .font(.system(size: 11.5, design: .rounded).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)])
+            } label: {
+                Image(systemName: "folder")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .help("Reveal in Finder")
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, isHeader ? 2 : 5)
+        .padding(.vertical, 6)
         .background(
-            hoveredIndex == index && !isHeader
-                ? Color.primary.opacity(0.05)
-                : Color.clear,
+            hoveredItemID == item.id
+                ? Color.primary.opacity(0.055)
+                : Color.primary.opacity(0.025),
             in: RoundedRectangle(cornerRadius: 7, style: .continuous)
         )
-        .onHover { hoveredIndex = $0 ? index : nil }
+        .onHover { hoveredItemID = $0 ? item.id : nil }
     }
 }
 
@@ -1916,7 +2002,7 @@ private struct UpdatesSettingsPane: View {
 
             UpkeepSettingsSection("CLI Utilities") {
                 LabeledContent {
-                    Button("Update CLI Tools") {
+                    Button("Update Homebrew") {
                         Task {
                             await updater.updateCLIUtilities()
                             vm.refreshOverview(force: true)
@@ -1924,11 +2010,11 @@ private struct UpdatesSettingsPane: View {
                     }
                     .buttonStyle(.upkeepSecondary)
                     .controlSize(.small)
-                    .disabled(updater.isInstalling)
+                    .disabled(updater.isInstalling || !BrewService.isInstalled())
                 } label: {
                     UpkeepSettingLabel(
-                        "Mole & Homebrew",
-                        subtitle: "Runs `mo update` and `brew update` in parallel."
+                        "Homebrew CLI",
+                        subtitle: "Runs `brew update` to refresh local package definitions."
                     )
                 }
                 .upkeepSearchTarget("updates.cli")
@@ -1950,13 +2036,6 @@ private struct UpdatesSettingsPane: View {
                     cleaning.openAccessibilitySettings()
                 }
                 .upkeepSearchTarget("updates.permissions")
-
-                UpkeepStatusRow(
-                    title: "Mole CLI",
-                    description: "Powers dry-run cache scanning and app uninstallation",
-                    icon: "sparkles",
-                    isGranted: MoleService.isInstalled()
-                )
 
                 UpkeepStatusRow(
                     title: "Homebrew CLI",

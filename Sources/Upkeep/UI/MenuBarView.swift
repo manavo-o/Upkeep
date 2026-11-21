@@ -60,12 +60,26 @@ public final class TrayViewModel {
     public var brewStatusText: String?
     public var brewErrorText: String?
 
-    // Mole Cleaner state
+    // Native Cleaner state
+    public var cleanerScan: CleanerScanResult?
+    public var selectedCleanPaths: Set<String> = []
+    public var lastCleanResult: CleanExecutionResult?
     public var cleanPreview: MoleCleanSummary?
     public var confirmClean: Bool = false
     public var isScanningClean: Bool = false
     public var isCleaning: Bool = false
     public var cleanError: String?
+
+    public var selectedCleanBytes: Int64 {
+        guard let scan = cleanerScan else { return 0 }
+        return scan.allItems
+            .filter { selectedCleanPaths.contains($0.path) }
+            .reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    public var formattedSelectedCleanSize: String {
+        ByteCountFormatter.string(fromByteCount: selectedCleanBytes, countStyle: .file)
+    }
 
     public enum AppSortOrder: String, CaseIterable, Identifiable, Sendable {
         case name = "Name"
@@ -180,38 +194,35 @@ public final class TrayViewModel {
         isScanningClean = true
         confirmClean = false
         cleanError = nil
+        lastCleanResult = nil
         Task {
-            // Phase 1: instant (~50-150ms) native Rust APFS cache scan so Cleaner never blocks on a blank spinner
-            if let fastPreview = await MoleService.shared.fastScanCaches() {
-                self.cleanPreview = fastPreview
-                self.isScanningClean = false
-                if !MoleService.isInstalled() { return }
-            }
-            // Phase 2: refine with Mole dry-run when installed
-            if MoleService.isInstalled() {
-                do {
-                    self.cleanPreview = try await MoleService.shared.dryRunClean()
-                } catch {
-                    if self.cleanPreview == nil {
-                        self.cleanError = error.localizedDescription
-                    }
-                }
-            }
+            let scan = await MoleService.shared.scanCleanerNative()
+            self.cleanerScan = scan
+            self.selectedCleanPaths = scan.defaultSelectedPaths
+            self.cleanPreview = scan.toSummary()
             self.isScanningClean = false
         }
     }
 
     public func executeMoleClean() {
         guard !isCleaning else { return }
+        let targets = Array(selectedCleanPaths)
+        guard !targets.isEmpty else { return }
         confirmClean = false
         isCleaning = true
         cleanError = nil
         Task {
-            do {
-                self.cleanPreview = try await MoleService.shared.runClean()
-            } catch {
-                self.cleanError = error.localizedDescription
-            }
+            let exec = await MoleService.shared.executeNativeClean(paths: targets, dryRun: false)
+            self.lastCleanResult = exec
+            let refreshed = await MoleService.shared.scanCleanerNative()
+            self.cleanerScan = refreshed
+            self.selectedCleanPaths = refreshed.defaultSelectedPaths
+            self.cleanPreview = MoleCleanSummary(
+                totalReclaimed: exec.formattedReclaimedSize,
+                itemCount: exec.removedCount,
+                lines: refreshed.toSummary().lines,
+                isDryRun: false
+            )
             self.isCleaning = false
         }
     }

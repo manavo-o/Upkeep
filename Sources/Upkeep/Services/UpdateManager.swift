@@ -81,7 +81,7 @@ public final class UpdateManager {
         guard !trimmedRepo.isEmpty,
               let apiURL = URL(string: "https://api.github.com/repos/\(trimmedRepo)/releases/latest") else {
             availableRelease = nil
-            statusMessage = "v\(currentVersion) · Set a GitHub repo (owner/repo) to check app releases, or update Mole & Brew below."
+            statusMessage = "v\(currentVersion) · Set a GitHub repo (owner/repo) to check app releases, or update Homebrew below."
             return
         }
 
@@ -225,35 +225,22 @@ public final class UpdateManager {
         guard !isInstalling else { return }
         isInstalling = true
         errorMessage = nil
-        statusMessage = "Updating Mole & Homebrew…"
+        statusMessage = "Updating Homebrew…"
 
         defer { isInstalling = false }
 
-        let moleInstalled = MoleService.isInstalled()
-        let brewInstalled = BrewService.isInstalled()
+        guard BrewService.isInstalled() else {
+            statusMessage = "Homebrew CLI not found."
+            return
+        }
 
-        async let moleNote: String? = {
-            guard moleInstalled else { return nil }
-            do {
-                _ = try await MoleService.shared.updateMole()
-                return "Mole updated"
-            } catch {
-                return "Mole: \(error.localizedDescription)"
-            }
-        }()
-
-        async let brewNote: String? = {
-            guard brewInstalled else { return nil }
-            do {
-                _ = try await BrewService.shared.updateBrew()
-                return "Brew index updated"
-            } catch {
-                return "Brew: \(error.localizedDescription)"
-            }
-        }()
-
-        let notes = await [moleNote, brewNote].compactMap { $0 }
-        statusMessage = notes.isEmpty ? "No CLI utilities found." : notes.joined(separator: " · ")
+        do {
+            _ = try await BrewService.shared.updateBrew()
+            statusMessage = "Homebrew index updated."
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+        }
     }
 
     private static func findAppBundle(in directory: URL) -> URL? {

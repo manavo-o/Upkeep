@@ -1,6 +1,155 @@
 import AppKit
 import Foundation
 
+// MARK: - Native Cleaner Models
+
+public struct CleanerItem: Identifiable, Sendable, Hashable {
+    public let id: String
+    public let category: String
+    public let name: String
+    public let path: String
+    public let displayPath: String
+    public let sizeBytes: Int64
+    public let defaultSelected: Bool
+    public let holdbackReason: String?
+    public let formattedSize: String
+
+    public init(
+        id: String,
+        category: String,
+        name: String,
+        path: String,
+        displayPath: String,
+        sizeBytes: Int64,
+        defaultSelected: Bool,
+        holdbackReason: String?
+    ) {
+        self.id = id
+        self.category = category
+        self.name = name
+        self.path = path
+        self.displayPath = displayPath
+        self.sizeBytes = sizeBytes
+        self.defaultSelected = defaultSelected
+        self.holdbackReason = holdbackReason
+        self.formattedSize = sizeBytes > 0
+            ? ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+            : "< 1 KB"
+    }
+}
+
+public struct CleanerCategory: Identifiable, Sendable, Hashable {
+    public let id: String
+    public let title: String
+    public let totalBytes: Int64
+    public let items: [CleanerItem]
+    public let formattedTotalSize: String
+
+    public init(id: String, title: String, totalBytes: Int64, items: [CleanerItem]) {
+        self.id = id
+        self.title = title
+        self.totalBytes = totalBytes
+        self.items = items
+        self.formattedTotalSize = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+    }
+}
+
+public struct CleanerScanResult: Sendable, Equatable {
+    public let totalBytes: Int64
+    public let selectedBytes: Int64
+    public let itemCount: Int
+    public let scanDurationMs: Int
+    public let categories: [CleanerCategory]
+    public let formattedTotalSize: String
+
+    public static let empty = CleanerScanResult(
+        totalBytes: 0,
+        selectedBytes: 0,
+        itemCount: 0,
+        scanDurationMs: 0,
+        categories: []
+    )
+
+    public init(
+        totalBytes: Int64,
+        selectedBytes: Int64,
+        itemCount: Int,
+        scanDurationMs: Int,
+        categories: [CleanerCategory]
+    ) {
+        self.totalBytes = totalBytes
+        self.selectedBytes = selectedBytes
+        self.itemCount = itemCount
+        self.scanDurationMs = scanDurationMs
+        self.categories = categories
+        self.formattedTotalSize = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+    }
+
+    public var allItems: [CleanerItem] {
+        categories.flatMap(\.items)
+    }
+
+    public var defaultSelectedPaths: Set<String> {
+        Set(allItems.filter(\.defaultSelected).map(\.path))
+    }
+
+    public func toSummary() -> MoleCleanSummary {
+        var lines: [String] = []
+        for cat in categories {
+            lines.append("➤ \(cat.title)")
+            for item in cat.items {
+                let prefix = item.defaultSelected ? "○" : "◎"
+                lines.append("\(prefix) \(item.name) · \(item.formattedSize)")
+            }
+        }
+        return MoleCleanSummary(
+            totalReclaimed: formattedTotalSize,
+            itemCount: itemCount,
+            lines: lines,
+            isDryRun: true
+        )
+    }
+}
+
+public struct CleanFailedItem: Identifiable, Sendable, Hashable {
+    public var id: String { path }
+    public let path: String
+    public let error: String
+
+    public init(path: String, error: String) {
+        self.path = path
+        self.error = error
+    }
+}
+
+public struct CleanExecutionResult: Sendable, Equatable {
+    public let reclaimedBytes: Int64
+    public let removedCount: Int
+    public let failedItems: [CleanFailedItem]
+    public let durationMs: Int
+    public let dryRun: Bool
+    public let formattedReclaimedSize: String
+
+    public static func empty(dryRun: Bool) -> CleanExecutionResult {
+        CleanExecutionResult(reclaimedBytes: 0, removedCount: 0, failedItems: [], durationMs: 0, dryRun: dryRun)
+    }
+
+    public init(
+        reclaimedBytes: Int64,
+        removedCount: Int,
+        failedItems: [CleanFailedItem],
+        durationMs: Int,
+        dryRun: Bool
+    ) {
+        self.reclaimedBytes = reclaimedBytes
+        self.removedCount = removedCount
+        self.failedItems = failedItems
+        self.durationMs = durationMs
+        self.dryRun = dryRun
+        self.formattedReclaimedSize = ByteCountFormatter.string(fromByteCount: reclaimedBytes, countStyle: .file)
+    }
+}
+
 public struct MoleCleanSummary: Sendable, Equatable {
     public let totalReclaimed: String
     public let itemCount: Int
@@ -15,6 +164,8 @@ public struct MoleCleanSummary: Sendable, Equatable {
     }
 }
 
+// MARK: - Uninstaller Models (Pre-Formatted Sizes)
+
 public struct MoleInstalledApp: Identifiable, Codable, Sendable, Hashable {
     public var id: String { path }
     public let name: String
@@ -23,6 +174,7 @@ public struct MoleInstalledApp: Identifiable, Codable, Sendable, Hashable {
     public let uninstallName: String?
     public let path: String
     public let size: Int64?
+    public let formattedSize: String
 
     public init(
         name: String,
@@ -38,6 +190,29 @@ public struct MoleInstalledApp: Identifiable, Codable, Sendable, Hashable {
         self.uninstallName = uninstallName
         self.path = path
         self.size = size
+        if let size, size > 0 {
+            self.formattedSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        } else {
+            self.formattedSize = "App"
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let name = try container.decode(String.self, forKey: .name)
+        let bundleId = try container.decodeIfPresent(String.self, forKey: .bundleId)
+        let source = try container.decodeIfPresent(String.self, forKey: .source)
+        let uninstallName = try container.decodeIfPresent(String.self, forKey: .uninstallName)
+        let path = try container.decode(String.self, forKey: .path)
+        let size = try container.decodeIfPresent(Int64.self, forKey: .size)
+        self.init(
+            name: name,
+            bundleId: bundleId,
+            source: source,
+            uninstallName: uninstallName,
+            path: path,
+            size: size
+        )
     }
 
     enum CodingKeys: String, CodingKey {
@@ -47,11 +222,6 @@ public struct MoleInstalledApp: Identifiable, Codable, Sendable, Hashable {
         case uninstallName = "uninstall_name"
         case path
         case size
-    }
-
-    public var formattedSize: String {
-        guard let size, size > 0 else { return "App" }
-        return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
     }
 }
 
@@ -64,6 +234,7 @@ public struct UninstallLeftoverItem: Identifiable, Sendable, Hashable {
     public let isSystem: Bool
     public let defaultSelected: Bool
     public let holdbackReason: String?
+    public let formattedSize: String
 
     public init(
         path: String,
@@ -81,11 +252,9 @@ public struct UninstallLeftoverItem: Identifiable, Sendable, Hashable {
         self.isSystem = isSystem
         self.defaultSelected = defaultSelected
         self.holdbackReason = holdbackReason
-    }
-
-    public var formattedSize: String {
-        guard sizeBytes > 0 else { return "< 1 KB" }
-        return ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        self.formattedSize = sizeBytes > 0
+            ? ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+            : "< 1 KB"
     }
 }
 
@@ -123,54 +292,27 @@ public struct UninstallInspection: Sendable, Equatable {
     }
 }
 
+// MARK: - Native Cleaner & Uninstaller Service
+
+public typealias CleanerService = MoleService
+
 public actor MoleService {
     public static let shared = MoleService()
     private var cachedApps: [MoleInstalledApp] = []
     private var lastAppFetch: Date?
 
-    public static func isInstalled() -> Bool {
-        CLIExecutor.resolveBinary("mo") != nil
-    }
-
     public static func parseCleanOutput(_ raw: String, isDryRun: Bool) -> MoleCleanSummary {
         UpkeepEngine.parseMoleCleanOutput(raw, isDryRun: isDryRun)
     }
 
-    /// Fast native Rust cache scan (~50-150ms via getattrlistbulk) with Mole fallback.
-    public func fastScanCaches() async -> MoleCleanSummary? {
-        await UpkeepEngine.scanCachesNative()
+    /// Runs the native Rust parallel APFS dry-run scanner across caches, developer tools, logs, and temp files.
+    public func scanCleanerNative() async -> CleanerScanResult {
+        await UpkeepEngine.scanCleanerNative()
     }
 
-    public func dryRunClean(onLine: (@Sendable (String) -> Void)? = nil) async throws -> MoleCleanSummary {
-        let result = try await CLIExecutor.runStreaming(
-            binary: "mo",
-            arguments: ["clean", "--dry-run"],
-            onLine: onLine
-        )
-        guard result.succeeded else {
-            throw CLIError.executionFailed(command: "mo clean --dry-run", exitCode: result.exitCode, stderr: result.stderr)
-        }
-        return Self.parseCleanOutput(result.stdout, isDryRun: true)
-    }
-
-    public func runClean(onLine: (@Sendable (String) -> Void)? = nil) async throws -> MoleCleanSummary {
-        let result = try await CLIExecutor.runStreaming(
-            binary: "mo",
-            arguments: ["clean"],
-            onLine: onLine
-        )
-        guard result.succeeded else {
-            throw CLIError.executionFailed(command: "mo clean", exitCode: result.exitCode, stderr: result.stderr)
-        }
-        return Self.parseCleanOutput(result.stdout, isDryRun: false)
-    }
-
-    public func updateMole() async throws -> String {
-        let result = try await CLIExecutor.run(binary: "mo", arguments: ["update"])
-        guard result.succeeded else {
-            throw CLIError.executionFailed(command: "mo update", exitCode: result.exitCode, stderr: result.stderr)
-        }
-        return CLIExecutor.stripANSI(result.stdout)
+    /// Executes safe parallel cleanup of the selected paths via the native Rust cleaner engine.
+    public func executeNativeClean(paths: [String], dryRun: Bool = false) async -> CleanExecutionResult {
+        await UpkeepEngine.cleanPathsNative(paths, dryRun: dryRun)
     }
 
     public func listInstalledApps(forceRefresh: Bool = false) async throws -> [MoleInstalledApp] {
@@ -178,54 +320,14 @@ public actor MoleService {
             return cachedApps
         }
 
-        // Fast parallel scan across /Applications and ~/Applications computing real bundle sizes
         let apps = await UpkeepEngine.scanInstalledApplications()
         cachedApps = apps
         lastAppFetch = Date()
         return apps
     }
 
-    /// Uninstalls an application using Mole's full uninstaller (`mo uninstall`) via a POSIX PTY
-    /// so Mole's leftover rules, receipt scans, and safety protections run natively after the user
-    /// confirms in Upkeep's UI. Falls back to native macOS Trash if `mo` is not installed.
+    /// Moves an application (and optionally its discovered leftovers) to Trash natively without external CLIs.
     public func uninstallApp(_ app: MoleInstalledApp, withData: Bool = false, dryRun: Bool = false) async throws -> String {
-        if Self.isInstalled() {
-            var args = ["uninstall"]
-            if withData { args.append("--with-data") }
-            if dryRun { args.append("--dry-run") }
-            args.append(app.uninstallName ?? app.name)
-
-            let result: CLIResult
-            if dryRun {
-                result = try await CLIExecutor.run(binary: "mo", arguments: args)
-            } else {
-                result = try await CLIExecutor.runInPTY(
-                    binary: "mo",
-                    arguments: args,
-                    autoConfirmTrigger: "ESC cancel",
-                    autoConfirmInput: "y\n",
-                    confirmDelayMs: 200
-                )
-            }
-
-            if result.succeeded || (dryRun && !result.stdout.isEmpty) {
-                if !dryRun {
-                    cachedApps.removeAll { $0.path == app.path || $0.name.caseInsensitiveCompare(app.name) == .orderedSame }
-                }
-                return dryRun ? CLIExecutor.stripANSI(result.stdout) : "Moved \(app.name) to Trash via Mole"
-            }
-
-            let detail = CLIExecutor.stripANSI(result.stderr.isEmpty ? result.stdout : result.stderr)
-                .components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .last(where: { !$0.isEmpty }) ?? "Exit status \(result.exitCode)"
-            throw CLIError.executionFailed(command: "mo " + args.joined(separator: " "), exitCode: result.exitCode, stderr: detail)
-        }
-
-        return try await uninstallAppNativeFallback(app, withData: withData, dryRun: dryRun)
-    }
-
-    private func uninstallAppNativeFallback(_ app: MoleInstalledApp, withData: Bool = false, dryRun: Bool = false) async throws -> String {
         let appURL = URL(fileURLWithPath: app.path)
         let fm = FileManager.default
         guard fm.fileExists(atPath: app.path) else {
@@ -238,14 +340,17 @@ public actor MoleService {
 
         var targets: [URL] = [appURL]
         if withData {
-            targets.append(contentsOf: Self.discoverLeftoverURLs(for: app))
+            let inspection = await inspectAppForUninstall(app)
+            let safeLeftovers = inspection.leftovers
+                .filter { $0.defaultSelected && !$0.isSystem }
+                .map { URL(fileURLWithPath: $0.path) }
+            targets.append(contentsOf: safeLeftovers)
         }
 
         if dryRun {
             return targets.map(\.path).joined(separator: "\n")
         }
 
-        // Gracefully quit the app if it is currently running
         if let bundleId = app.bundleId, !bundleId.isEmpty {
             await MainActor.run {
                 for running in NSRunningApplication.runningApplications(withBundleIdentifier: bundleId) {
@@ -261,7 +366,6 @@ public actor MoleService {
                 try fm.trashItem(at: url, resultingItemURL: nil)
                 trashedCount += 1
             } catch {
-                // Only fail hard if the primary .app bundle itself could not be moved to Trash
                 if url == appURL {
                     throw NSError(
                         domain: "Upkeep.Uninstaller",
@@ -371,7 +475,6 @@ public actor MoleService {
 
         var trashedLeftovers = 0
         for path in selectedLeftoverPaths where fm.fileExists(atPath: path) {
-            // Skip system-level read-only paths from unprivileged Trash calls
             if path.hasPrefix("/Library/") || path.hasPrefix("/private/") || path.hasPrefix("/Users/Shared/") {
                 continue
             }
@@ -405,29 +508,6 @@ public actor MoleService {
         if path.contains("/LaunchAgents/") { return "Launch Agents" }
         if path.contains("/HTTPStorages/") || path.contains("/WebKit/") { return "Web & Network Data" }
         return "Library Data"
-    }
-
-    private static func directoryOrFileSize(at url: URL) -> Int64 {
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { return 0 }
-        if !isDir.boolValue {
-            let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey])
-            return Int64(values?.totalFileAllocatedSize ?? values?.fileSize ?? 0)
-        }
-        guard let enumerator = fm.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileSizeKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return 0 }
-        var total: Int64 = 0
-        for case let fileURL as URL in enumerator {
-            if let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey, .isRegularFileKey]),
-               values.isRegularFile == true {
-                total += Int64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
-            }
-        }
-        return total
     }
 
     public func uninstallApp(name: String, withData: Bool = false, dryRun: Bool = false) async throws -> String {

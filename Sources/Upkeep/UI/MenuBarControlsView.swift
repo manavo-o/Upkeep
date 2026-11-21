@@ -535,11 +535,6 @@ public struct MenuBarFooterView: View {
 
             HStack(spacing: 8) {
                 MenuBarStatusBadge(
-                    label: "Mole",
-                    status: MoleService.isInstalled() ? .ok : .warning
-                )
-
-                MenuBarStatusBadge(
                     label: "Brew",
                     status: BrewService.isInstalled() ? .ok : .warning
                 )
@@ -695,18 +690,18 @@ public struct MenuBarUpdaterPanel: View {
 
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("CLI Tooling (Mole & Homebrew)")
+                    Text("Homebrew CLI")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
 
-                    Text("Runs `mo update` and `brew update`")
+                    Text("Runs `brew update`")
                         .font(MenuBarTheme.Typography.popoverSubtitle)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
 
-                Button("Update CLI") {
+                Button("Update Brew") {
                     Task {
                         await updater.updateCLIUtilities()
                         vm?.refreshOverview()

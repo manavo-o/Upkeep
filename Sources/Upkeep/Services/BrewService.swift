@@ -333,7 +333,10 @@ public actor BrewService {
         catalogLookup = map
         lastLoadedAt = Date()
         #if USE_RUST_UPKEEP_CORE
-        rustLocalIndex.load(items: items)
+        // Skip double JSON round-trip when rustRemoteIndex is loaded; keep rustLocalIndex only as offline fallback.
+        if rustRemoteIndex.count == 0 {
+            rustLocalIndex.load(items: items)
+        }
         #endif
     }
 
@@ -479,7 +482,11 @@ public actor BrewService {
         let homepage: String?
     }
 
-    private static func fetchOrLoadCachedJSON(urlString: String, cacheFileName: String) async -> Data? {
+    private static var catalogBinURL: URL {
+        cacheDirURL.appendingPathComponent("catalog.bin")
+    }
+
+    private static func fetchOrLoadCachedJSON(urlString: String, cacheFileName: String) async -> (data: Data?, notModified: Bool) {
         let fm = FileManager.default
         try? fm.createDirectory(at: cacheDirURL, withIntermediateDirectories: true)
         let dataURL = cacheDirURL.appendingPathComponent(cacheFileName)
@@ -490,11 +497,11 @@ public actor BrewService {
            let modDate = attrs[.modificationDate] as? Date,
            Date().timeIntervalSince(modDate) < 6 * 3600,
            let cached = try? Data(contentsOf: dataURL), !cached.isEmpty {
-            return cached
+            return (cached, true)
         }
 
         guard let url = URL(string: urlString) else {
-            return try? Data(contentsOf: dataURL)
+            return (try? Data(contentsOf: dataURL), false)
         }
 
         var request = URLRequest(url: url)
@@ -507,23 +514,23 @@ public actor BrewService {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse {
-                if http.statusCode == 304, let cached = try? Data(contentsOf: dataURL) {
+                if http.statusCode == 304 {
                     try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: dataURL.path)
-                    return cached
+                    return (try? Data(contentsOf: dataURL), true)
                 }
                 if (200..<300).contains(http.statusCode), !data.isEmpty {
                     try? data.write(to: dataURL, options: .atomic)
                     if let etag = http.value(forHTTPHeaderField: "ETag") {
                         try? etag.write(to: etagURL, atomically: true, encoding: .utf8)
                     }
-                    return data
+                    return (data, false)
                 }
             }
         } catch {
             // Fall through to stale disk cache if offline
         }
 
-        return try? Data(contentsOf: dataURL)
+        return (try? Data(contentsOf: dataURL), false)
     }
 
     /// Pre-warms the 15k-package Rust Homebrew index quietly in the background after app launch.
@@ -570,21 +577,46 @@ public actor BrewService {
         #endif
 
         let task = Task<[BrewPackageItem], Never> {
-            async let formulaeData = Self.fetchOrLoadCachedJSON(
+            #if USE_RUST_UPKEEP_CORE
+            let fm = FileManager.default
+            let binURL = Self.catalogBinURL
+            let hasBinCache = fm.fileExists(atPath: binURL.path)
+            // Ultra-fast <5ms cold-start path: load compact binary cache directly when fresher than 6 hours.
+            if hasBinCache,
+               let attrs = try? fm.attributesOfItem(atPath: binURL.path),
+               let modDate = attrs[.modificationDate] as? Date,
+               Date().timeIntervalSince(modDate) < 6 * 3600 {
+                if rustIndex.loadBinaryCache(path: binURL.path) > 0 {
+                    return []
+                }
+            }
+            #endif
+
+            async let formulaeFetch = Self.fetchOrLoadCachedJSON(
                 urlString: "https://formulae.brew.sh/api/formula.json",
                 cacheFileName: "formula.json"
             )
-            async let casksData = Self.fetchOrLoadCachedJSON(
+            async let casksFetch = Self.fetchOrLoadCachedJSON(
                 urlString: "https://formulae.brew.sh/api/cask.json",
                 cacheFileName: "cask.json"
             )
 
-            let (fData, cData) = await (formulaeData, casksData)
+            let (fRes, cRes) = await (formulaeFetch, casksFetch)
+            let fData = fRes.data
+            let cData = cRes.data
 
             #if USE_RUST_UPKEEP_CORE
-            // Zero-copy raw-byte ingestion directly into Rust (skips Swift decoding 15k structs + re-encoding!)
+            // If both ETags returned 304 Not Modified and catalog.bin exists, load binary cache directly.
+            if fRes.notModified && cRes.notModified && hasBinCache {
+                try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: binURL.path)
+                if rustIndex.loadBinaryCache(path: binURL.path) > 0 {
+                    return []
+                }
+            }
+            // Zero-copy raw-byte ingestion directly into Rust, then persist compact binary cache.
             let loadedCount = rustIndex.loadAPI(formulaeData: fData, casksData: cData)
             if loadedCount > 0 {
+                rustIndex.saveBinaryCache(path: binURL.path)
                 return []
             }
             #endif
@@ -756,6 +788,9 @@ public actor BrewService {
             return catalog.filter { $0.isCask == filterCasks }
         }
         #if USE_RUST_UPKEEP_CORE
+        if rustRemoteIndex.count > 0 {
+            return rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 120, installedOnly: true)
+        }
         return rustLocalIndex.search(query: trimmed, filterCasks: filterCasks, limit: 120)
         #else
         return scorePool(catalog, query: trimmed, filterCasks: filterCasks, limit: 120)
@@ -803,6 +838,9 @@ public actor BrewService {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
         let updated = catalog.filter { !($0.name == name && $0.isCask == isCask) }
+        #if USE_RUST_UPKEEP_CORE
+        if rustRemoteIndex.count > 0 { rustRemoteIndex.refreshLocal() }
+        #endif
         updateLocalCatalog(updated)
         return CLIExecutor.stripANSI(res.stdout)
     }
@@ -840,6 +878,9 @@ public actor BrewService {
                 homepage: item.homepage
             )
         }
+        #if USE_RUST_UPKEEP_CORE
+        if rustRemoteIndex.count > 0 { rustRemoteIndex.refreshLocal() }
+        #endif
         updateLocalCatalog(updated)
         return CLIExecutor.stripANSI(res.stdout)
     }
@@ -864,6 +905,9 @@ public actor BrewService {
                 homepage: item.homepage
             )
         }
+        #if USE_RUST_UPKEEP_CORE
+        if rustRemoteIndex.count > 0 { rustRemoteIndex.refreshLocal() }
+        #endif
         updateLocalCatalog(updated)
         return CLIExecutor.stripANSI(res.stdout)
     }

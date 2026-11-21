@@ -158,6 +158,27 @@ public enum UpkeepEngine {
             return Int(loadedCount)
         }
 
+        /// Loads the compact binary Homebrew catalog cache (<5ms) and merges local Cellar/Caskroom state in parallel.
+        @discardableResult
+        public func loadBinaryCache(path: String, prefix: String = "/opt/homebrew") -> Int {
+            guard let ptr else { return 0 }
+            let loaded: UInt32 = path.withCString { cPtr in
+                prefix.withCString { pPtr in
+                    upkeep_brew_index_load_binary_cache(ptr, cPtr, pPtr)
+                }
+            }
+            return Int(loaded)
+        }
+
+        /// Persists the current Homebrew catalog index to a compact binary cache file atomically.
+        @discardableResult
+        public func saveBinaryCache(path: String) -> Bool {
+            guard let ptr else { return false }
+            return path.withCString { cPtr in
+                upkeep_brew_index_save_binary_cache(ptr, cPtr)
+            }
+        }
+
         /// Refreshes local Cellar/Caskroom/pinned state in-place (~5ms) without re-parsing API JSON.
         @discardableResult
         public func refreshLocal(prefix: String = "/opt/homebrew") -> Int {
@@ -179,11 +200,16 @@ public enum UpkeepEngine {
         }
 
         /// Searches directly inside the Rust index and decodes only the top-N hits into Swift.
-        public func searchJSON(query: String, filterCasks: Bool?, limit: Int = 80) -> [BrewPackageItem] {
+        public func searchJSON(
+            query: String,
+            filterCasks: Bool?,
+            limit: Int = 80,
+            installedOnly: Bool = false
+        ) -> [BrewPackageItem] {
             guard let ptr else { return [] }
             let filterMode: Int32 = filterCasks == nil ? -1 : (filterCasks! ? 1 : 0)
             let rawPtr: UnsafeMutablePointer<CChar>? = query.withCString { qPtr in
-                upkeep_brew_index_search_json(ptr, qPtr, UInt32(max(1, limit)), filterMode)
+                upkeep_brew_index_search_scoped_json(ptr, qPtr, UInt32(max(1, limit)), filterMode, installedOnly)
             }
             guard let rawPtr else { return [] }
             defer { upkeep_string_free(rawPtr) }
@@ -648,53 +674,170 @@ public enum UpkeepEngine {
         #endif
     }
 
-    /// Fast parallel native macOS user cache scanner (~50-150ms via Rust getattrlistbulk + Rayon).
-    public static func scanCachesNative() async -> MoleCleanSummary? {
+    /// Comprehensive native macOS Cleaner dry-run scanner (~50-150ms via Rust getattrlistbulk + Rayon).
+    public static func scanCleanerNative() async -> CleanerScanResult {
         #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
-            struct WireCacheItem: Decodable {
+            struct WireCleanerItem: Decodable {
+                let id: String
                 let category: String
                 let name: String
                 let path: String
+                let display_path: String
                 let size_bytes: UInt64
+                let default_selected: Bool
+                let holdback_reason: String?
             }
-            struct WireCachePayload: Decodable {
+            struct WireCleanerCategory: Decodable {
+                let id: String
+                let title: String
                 let total_bytes: UInt64
-                let items: [WireCacheItem]
+                let items: [WireCleanerItem]
             }
-            guard let rawPtr = upkeep_scan_caches_json() else { return nil }
+            struct WireCleanerPayload: Decodable {
+                let total_bytes: UInt64
+                let selected_bytes: UInt64
+                let item_count: Int
+                let scan_duration_ms: UInt64
+                let categories: [WireCleanerCategory]
+            }
+            guard let rawPtr = upkeep_scan_cleaner_json() else {
+                return CleanerScanResult.empty
+            }
             defer { upkeep_string_free(rawPtr) }
-            guard let payload = decodeRustJSON(WireCachePayload.self, from: rawPtr),
-                  !payload.items.isEmpty else {
-                return nil
+            guard let payload = decodeRustJSON(WireCleanerPayload.self, from: rawPtr) else {
+                return CleanerScanResult.empty
             }
-
-            var grouped: [String: [WireCacheItem]] = [:]
-            let order = ["Developer Tools", "User App Caches", "User Logs"]
-            for item in payload.items {
-                grouped[item.category, default: []].append(item)
+            let categories = payload.categories.map { cat in
+                CleanerCategory(
+                    id: cat.id,
+                    title: cat.title,
+                    totalBytes: Int64(cat.total_bytes),
+                    items: cat.items.map { item in
+                        CleanerItem(
+                            id: item.id,
+                            category: item.category,
+                            name: item.name,
+                            path: item.path,
+                            displayPath: item.display_path,
+                            sizeBytes: Int64(item.size_bytes),
+                            defaultSelected: item.default_selected,
+                            holdbackReason: item.holdback_reason
+                        )
+                    }
+                )
             }
-
-            var lines: [String] = []
-            for cat in order {
-                guard let entries = grouped[cat], !entries.isEmpty else { continue }
-                lines.append("➤ \(cat)")
-                for entry in entries.prefix(50) {
-                    let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(entry.size_bytes), countStyle: .file)
-                    lines.append("○ \(entry.name) · \(sizeStr)")
-                }
-            }
-
-            let totalStr = ByteCountFormatter.string(fromByteCount: Int64(payload.total_bytes), countStyle: .file)
-            return MoleCleanSummary(
-                totalReclaimed: totalStr,
-                itemCount: payload.items.count,
-                lines: lines,
-                isDryRun: true
+            return CleanerScanResult(
+                totalBytes: Int64(payload.total_bytes),
+                selectedBytes: Int64(payload.selected_bytes),
+                itemCount: payload.item_count,
+                scanDurationMs: Int(payload.scan_duration_ms),
+                categories: categories
             )
         }.value
         #else
-        return nil
+        return await Task.detached(priority: .userInitiated) {
+            let started = Date()
+            let fm = FileManager.default
+            let home = fm.homeDirectoryForCurrentUser.path
+            var items: [CleanerItem] = []
+            let cachesDir = (home as NSString).appendingPathComponent("Library/Caches")
+            if let entries = try? fm.contentsOfDirectory(atPath: cachesDir) {
+                for name in entries where !name.hasPrefix(".") && !name.hasPrefix("com.apple.") && name != "CloudKit" && name != "com.local.Upkeep" {
+                    let full = (cachesDir as NSString).appendingPathComponent(name)
+                    let size = calculatePathSize(atPath: full)
+                    guard size >= 4096 else { continue }
+                    items.append(CleanerItem(
+                        id: full,
+                        category: "User App Caches",
+                        name: name,
+                        path: full,
+                        displayPath: "~/Library/Caches/\(name)",
+                        sizeBytes: size,
+                        defaultSelected: true,
+                        holdbackReason: nil
+                    ))
+                }
+            }
+            items.sort { $0.sizeBytes > $1.sizeBytes }
+            let total = items.reduce(0) { $0 + $1.sizeBytes }
+            let cats = items.isEmpty ? [] : [CleanerCategory(id: "user_app_caches", title: "User App Caches", totalBytes: total, items: items)]
+            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            return CleanerScanResult(totalBytes: total, selectedBytes: total, itemCount: items.count, scanDurationMs: elapsed, categories: cats)
+        }.value
+        #endif
+    }
+
+    /// Safe parallel native Rust Cleaner executor with strict allowlist & symlink guards.
+    public static func cleanPathsNative(_ paths: [String], dryRun: Bool = false) async -> CleanExecutionResult {
+        #if USE_RUST_UPKEEP_CORE
+        return await Task.detached(priority: .userInitiated) {
+            struct WireFailedItem: Decodable {
+                let path: String
+                let error: String
+            }
+            struct WireExecPayload: Decodable {
+                let reclaimed_bytes: UInt64
+                let removed_count: Int
+                let failed_items: [WireFailedItem]
+                let duration_ms: UInt64
+                let dry_run: Bool
+            }
+            guard let jsonData = try? JSONEncoder().encode(paths),
+                  let jsonStr = String(data: jsonData, encoding: .utf8) else {
+                return CleanExecutionResult.empty(dryRun: dryRun)
+            }
+            let rawPtr: UnsafeMutablePointer<CChar>? = jsonStr.withCString { cstr in
+                upkeep_clean_paths_json(cstr, dryRun)
+            }
+            guard let rawPtr else {
+                return CleanExecutionResult.empty(dryRun: dryRun)
+            }
+            defer { upkeep_string_free(rawPtr) }
+            guard let payload = decodeRustJSON(WireExecPayload.self, from: rawPtr) else {
+                return CleanExecutionResult.empty(dryRun: dryRun)
+            }
+            return CleanExecutionResult(
+                reclaimedBytes: Int64(payload.reclaimed_bytes),
+                removedCount: payload.removed_count,
+                failedItems: payload.failed_items.map { CleanFailedItem(path: $0.path, error: $0.error) },
+                durationMs: Int(payload.duration_ms),
+                dryRun: payload.dry_run
+            )
+        }.value
+        #else
+        return await Task.detached(priority: .userInitiated) {
+            let started = Date()
+            let fm = FileManager.default
+            let home = fm.homeDirectoryForCurrentUser.path
+            let tmp = NSTemporaryDirectory()
+            var reclaimed: Int64 = 0
+            var removed = 0
+            var failed: [CleanFailedItem] = []
+            for path in Set(paths) {
+                guard path.hasPrefix(home + "/") || path.hasPrefix(tmp),
+                      !path.contains("/.."),
+                      !path.hasSuffix("/com.local.Upkeep") else {
+                    failed.append(CleanFailedItem(path: path, error: "Path is protected"))
+                    continue
+                }
+                let size = calculatePathSize(atPath: path)
+                if dryRun {
+                    reclaimed += size
+                    removed += 1
+                    continue
+                }
+                do {
+                    try fm.removeItem(atPath: path)
+                    reclaimed += size
+                    removed += 1
+                } catch {
+                    failed.append(CleanFailedItem(path: path, error: error.localizedDescription))
+                }
+            }
+            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            return CleanExecutionResult(reclaimedBytes: reclaimed, removedCount: removed, failedItems: failed, durationMs: elapsed, dryRun: dryRun)
+        }.value
         #endif
     }
 }

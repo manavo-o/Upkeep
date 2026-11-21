@@ -124,11 +124,11 @@ public enum UpkeepSearchCatalog {
         // Cleaner
         UpkeepSearchItem(
             id: "cleaner.dryRun",
-            title: "Cache Dry-Run Preview",
+            title: "System & Cache Cleaner",
             section: "Cleaner",
             tab: .cleaner,
             icon: "sparkles",
-            keywords: ["mole", "clean", "cache", "disk", "space", "storage", "dry-run"]
+            keywords: ["clean", "cache", "disk", "space", "storage", "dry-run", "logs", "trash"]
         ),
 
         // Uninstaller
@@ -138,7 +138,7 @@ public enum UpkeepSearchCatalog {
             section: "Uninstaller",
             tab: .uninstaller,
             icon: "trash",
-            keywords: ["uninstall", "remove", "apps", "trash", "personal data", "mole"]
+            keywords: ["uninstall", "remove", "apps", "trash", "leftovers", "cask"]
         ),
 
         // Updates & System
@@ -152,11 +152,11 @@ public enum UpkeepSearchCatalog {
         ),
         UpkeepSearchItem(
             id: "updates.cli",
-            title: "Update CLI Utilities (Mole & Homebrew)",
+            title: "Update Homebrew CLI",
             section: "CLI Utilities",
             tab: .updates,
             icon: "terminal",
-            keywords: ["mole", "brew", "cli", "update", "terminal"]
+            keywords: ["brew", "homebrew", "cli", "update", "terminal"]
         ),
         UpkeepSearchItem(
             id: "updates.permissions",

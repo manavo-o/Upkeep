@@ -93,7 +93,7 @@ public struct MenuBarCleanerTab: View {
         if vm.cleanPreview?.isDryRun == false {
             return "Cleanup Complete"
         }
-        return "Mole Dry-Run Preview"
+        return "Cache Dry-Run Preview"
     }
 
     private var headerSubtitle: String {
@@ -137,7 +137,7 @@ public struct MenuBarCleanerTab: View {
                 ProgressView()
                     .controlSize(.regular)
 
-                Text(vm.isCleaning ? "Purging cleanable caches…" : "Scanning system with `mo clean --dry-run`…")
+                Text(vm.isCleaning ? "Purging cleanable caches…" : "Scanning system caches safely…")
                     .font(MenuBarTheme.Typography.rowTitle)
                     .foregroundStyle(.primary)
 
@@ -178,7 +178,7 @@ public struct MenuBarCleanerTab: View {
                     Text("System is Clean")
                         .font(MenuBarTheme.Typography.wideTileTitle)
 
-                    Text("No cleanable items reported by Mole.")
+                    Text("No reclaimable caches found.")
                         .font(MenuBarTheme.Typography.wideTileSubtitle)
                         .foregroundStyle(.secondary)
                 }

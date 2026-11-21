@@ -55,6 +55,20 @@ uint32_t upkeep_brew_index_load_api_json(
     const char *prefix_utf8
 );
 
+/// Loads a compact binary Homebrew catalog cache from disk (<5ms) and merges local Cellar/Caskroom state in parallel.
+/// Returns the number of indexed packages loaded, or 0 if the cache is missing/corrupt/outdated.
+uint32_t upkeep_brew_index_load_binary_cache(
+    BrewSearchIndex *ptr,
+    const char *cache_path_utf8,
+    const char *prefix_utf8
+);
+
+/// Persists the current Homebrew catalog index to a compact binary cache file atomically.
+bool upkeep_brew_index_save_binary_cache(
+    const BrewSearchIndex *ptr,
+    const char *cache_path_utf8
+);
+
 /// Refreshes only local Cellar/Caskroom/pinned state in-place (~5ms) without re-parsing API JSON.
 /// Returns the number of installed packages found.
 uint32_t upkeep_brew_index_refresh_local(
@@ -69,6 +83,14 @@ char *upkeep_brew_index_installed_json(const BrewSearchIndex *ptr);
 /// Returns a newly allocated JSON payload with total_bytes and sorted cache items.
 char *upkeep_scan_caches_json(void);
 
+/// Comprehensive Mole-parity native macOS Cleaner dry-run scanner using parallel getattrlistbulk sizing.
+/// Returns a newly allocated JSON payload with grouped categories, holdbacks, and scan_duration_ms.
+char *upkeep_scan_cleaner_json(void);
+
+/// Safe parallel Rust Cleaner executor with strict path allowlist, symlink, and protected-path guards.
+/// `paths_json_utf8` is a JSON array of absolute path strings.
+char *upkeep_clean_paths_json(const char *paths_json_utf8, bool dry_run);
+
 /// Searches the index with parallel nucleo fuzzy matching. Returns a newly allocated JSON string.
 /// Filter mode: -1 = all, 0 = formulae only, 1 = casks only.
 char *upkeep_brew_index_search_json(
@@ -76,6 +98,16 @@ char *upkeep_brew_index_search_json(
     const char *query_utf8,
     uint32_t limit,
     int32_t filter_mode
+);
+
+/// Scoped search with optional installed_only filtering (eliminates separate local index).
+/// Filter mode: -1 = all, 0 = formulae only, 1 = casks only.
+char *upkeep_brew_index_search_scoped_json(
+    const BrewSearchIndex *ptr,
+    const char *query_utf8,
+    uint32_t limit,
+    int32_t filter_mode,
+    bool installed_only
 );
 
 /// Zero-allocation parallel search: writes top matches into caller-allocated UpkeepMatch array.
