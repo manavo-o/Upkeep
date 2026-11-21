@@ -1,127 +1,119 @@
 <p align="center">
-  <img src="Resources/Icons/AppIcon.png" width="128" height="128" alt="Upkeep App Icon" />
+  <img src="Resources/Icons/AppIcon.png" width="120" height="120" alt="Upkeep App Icon" />
 </p>
 
 <h1 align="center">Upkeep</h1>
 
 <p align="center">
-  <strong>Native macOS menu-bar utility for power control, Homebrew management, cache cleaning, and deep app uninstallation.</strong><br/>
-  Built with Swift 6, SwiftUI Liquid Glass, AppKit, and a Rust C-ABI performance core (<code>upkeep_core</code>).
+  <strong>A fast, native macOS menu-bar toolkit for power control, Homebrew management, deep disk cleaning, and complete app uninstallation.</strong><br/>
+  <code>macOS 26+ Liquid Glass</code> · <code>Swift 6</code> · <code>Rust upkeep_core</code> · <code>v1.3.0</code>
 </p>
 
-## Overview
+Upkeep sits quietly in your macOS menu bar and opens into a native Liquid Glass workspace modeled on System Settings. Everything runs locally with **zero third-party cleaner dependencies**: a Swift 6 / SwiftUI / AppKit interface paired with a Rust static library (`libupkeep_core.a`) for APFS-accurate disk sizing, sub-millisecond fuzzy search, parallel cache cleaning, and deep leftover discovery.
 
-Upkeep lives quietly in your macOS menu bar and opens into a native Liquid Glass workspace modeled on macOS System Settings. It combines five everyday Mac maintenance utilities into one fast, native app — with a Rust static library (`libupkeep_core.a`) accelerating APFS disk sizing, fuzzy package search, cache scanning, and deep application leftover discovery.
+## Features at a Glance
 
-## Everything Inside Upkeep
+| Module | What It Does |
+| --- | --- |
+| **Power & Input** | Native IOKit **Caffeinate** (Display & System or System Only) + **Clean Keys** keyboard & trackpad lock with screen dimming and emergency unlock failsafes. |
+| **Homebrew** | Floating Liquid Glass **Search HUD** + unified Settings downloader over ~15,000 formulae & casks (`<5 ms` binary cache startup) with live streaming logs. |
+| **Cleaner** | Native parallel Rust cleaner across **12 categories** — user, browser, Electron/Chromium, sandboxed container, Apple/macOS, 49 dev/AI/ML caches, project build artifacts, orphaned leftovers, old installers, and opt-in Admin system caches. |
+| **Uninstaller** | Two-phase `<15 ms` app scanner + deep leftover inspector with Homebrew Caskroom `--zap` detection, sibling-app protection, and personal-data holdbacks. |
+| **Updates & Diagnostics** | Built-in GitHub Releases auto-updater (`manavo-o/Upkeep`), `brew update` runner, Accessibility permission checks, and `⌘F` settings search. |
+
+## Inside Upkeep
 
 ### 1. Power & Input
-- **Caffeinate (Keep Mac Awake)**:
-  - Uses native macOS **IOKit power assertions** (`IOPMAssertionCreateWithName`) with zero background `caffeinate` subprocesses.
-  - Supports **Display & System** (keeps screen lit and system awake) or **System Only** (lets display dim/lock while background tasks keep running).
-  - Quick duration presets (`30m`, `1h`, `2h`, `Indefinite`), one-click `+30m` extension, and a live countdown badge in both the menu bar and main window toolbar.
-- **Clean Keys (Keyboard & Pointer Cleaning Lock)**:
-  - Intercepts keyboard events (and optionally trackpad/mouse pointer input) using a macOS CoreGraphics event tap so you can wipe down your MacBook safely without triggering shortcuts.
-  - Configurable lock durations (`30s`, `60s`, `2m`) and optional **Dim Screen While Locked** to make dust and smudges easier to spot.
-  - Built-in emergency unlock failsafes: **hold `⌘ + Esc` for 1 second** or **press `⌘` six times** to unlock immediately.
+- **Caffeinate (Keep Mac Awake)**: Uses native macOS IOKit power assertions (`IOPMAssertionCreateWithName`) with no background subprocesses. Pick **Display & System** or **System Only**, choose quick presets (`30m`, `1h`, `2h`, `Indefinite`), extend by `+30m` in one click, and track remaining time from a live badge.
+- **Clean Keys (Keyboard & Pointer Lock)**: Uses a CoreGraphics event tap to block accidental keystrokes (and optionally trackpad/pointer input) while you wipe down your MacBook. Includes configurable timers (`30s`, `60s`, `2m`), **Dim Screen While Locked**, and two hardware-safe emergency exits: **hold `⌘ + Esc` for 1 second** or **press `⌘` six times**.
 
 ### 2. Homebrew Search HUD & Package Manager
-- **Floating Liquid Glass Search HUD**:
-  - Backed by an ETag-cached copy of Homebrew's public `formula.json` and `cask.json` catalog (~15,000 packages), ingested directly into Rust with zero-copy raw bytes and searched in sub-millisecond time via `nucleo-matcher`.
-  - Pre-warms quietly in the background after launch and refreshes local `Cellar`/`Caskroom`/pinned state in ~5 ms without spawning Ruby.
-  - Four instant filter scopes (**Installed**, **Formulae**, **Casks**, **Upgrades**) plus a `⌘K` package action menu for **Install**, **Upgrade**, **Pin / Unpin**, **Uninstall**, and opening homepages.
-- **Persistent Live Operation Log**:
-  - Streams live output from `brew install`, `brew upgrade`, `brew uninstall`, and `brew doctor`, and persists the latest operation log across app relaunches with one-click copy and clear.
+- **Instant Rust Catalog Index**: Persists Homebrew's ~15k `formula.json` / `cask.json` catalog in a compact versioned binary cache (`catalog.bin`) for `<5 ms` cold startup, revalidates quietly via HTTP `ETag` (`304 Not Modified`), and refreshes local `Cellar`/`Caskroom`/pinned state directly from disk in ~5 ms without invoking Ruby.
+- **Tiered Name-First Search**: 5-tier ranking (Exact > Prefix > Substring > Fuzzy Name > Description) powered by `nucleo-matcher` and `memchr` NEON/SIMD byte scanning, shared between the floating Liquid Glass Search HUD and the Settings **Homebrew** pane.
+- **Full Package Lifecycle**: Switch scopes (`Installed`, `Formulae`, `Casks`, `Upgrades`), open `⌘K` actions (**Install**, **Upgrade**, **Pin / Unpin**, **Uninstall**, **Homepage**), and inspect persisted live logs from `brew install`, `brew upgrade`, `brew uninstall`, and `brew doctor`.
 
-### 3. Cleaner
-- **Two-Phase Dry-Run Cache Inspection**:
-  - **Phase 1 (Instant, ~50–150 ms)**: Native Rust scanner using macOS `getattrlistbulk` + Rayon walks user app caches (`~/Library/Caches`), developer caches (Xcode DerivedData, Homebrew downloads, npm, pip, Cargo, Gradle, Yarn, pnpm), and `~/Library/Logs` with APFS-accurate physical disk sizes.
-  - **Phase 2 (Optional Refinement)**: Automatically enriches results with `mo clean --dry-run` when Mole CLI is installed.
-- **Safe Confirmation Workflow**:
-  - Filterable dry-run list (*All*, *Candidates*, *Cleaned*) showing estimated reclaimable space before deleting anything, gated behind an explicit confirmation bar.
+### 3. Native Rust Cleaner (12 Categories)
+Built directly into `upkeep_core` using macOS `getattrlistbulk` + `O_NOFOLLOW` + Rayon parallelism, Upkeep previews every reclaimable item with checkboxes, category totals, amber `Held back` pills, purple `Admin` pills, and one-click **Reveal in Finder** before deleting anything:
 
-### 4. Deep Uninstaller
-- **Two-Phase Application Scanner**:
-  - Discovers apps in `/Applications` and `~/Applications` with bundle IDs in under 15 ms (Phase 1), then computes APFS-accurate bundle sizes concurrently via `getattrlistbulk` (Phase 2).
-  - Supports instant fuzzy filtering and **Name / Size** sorting.
-- **Interactive Uninstall Review Sheet**:
-  - Inspects related leftover files across `~/Library` and XDG locations — including naming variants, channel/version suffix stripping, camelCase bundle-leaf splitting, embedded `.appex`/`.xpc`/`LoginItems` bundle IDs, `Group Containers` (`<TeamID>.` boundary matching), UUID sandbox containers (`MCMMetadataIdentifier`), `ByHost`, `Cookies`, `HTTPStorages`, `SyncedPreferences`, `Autosave Information`, `FileProvider`, `ApplicationRecentDocuments` (`.sfl2`/`.sfl3`/`.sfl4`), `nsurlsessiond/Downloads`, `*.ShipIt`, `*-updater`, crash reporters, verified `NativeMessagingHosts`, user plug-ins, vendor-nested `<Vendor>/<Product>` directories, special-app rules (VS Code, Xcode, JetBrains, Android Studio, Claude Desktop, Docker, Anki, Godot), and `LaunchAgents` matched by `Program`/`ProgramArguments[0]`/`Label`.
-  - Automatically unloads selected user `LaunchAgents` via `launchctl bootout` before moving them to Trash.
-  - Detects system-level remnants (`/Library/*`, `/Library/PrivilegedHelperTools`, `/Users/Shared`, `/private/var/db/receipts`) as read-only entries with one-click **Reveal in Finder**.
-  - Cross-checks Homebrew's `Caskroom` and offers `brew uninstall --cask --zap <token>` when safe.
-- **Safety Guards**:
-  - **Sibling-App Protection**: Detects co-installed channels/copies (e.g., *Zed* + *Zed Nightly*, *VS Code* + *VS Code Insiders*) and automatically skips shared folders and `--zap`.
-  - **Independent CLI & Shared-Root Protection**: Never touches independent CLI data directories (Claude Code, Codex, Gemini, OpenCode), Steam, Epic, Unity, or shared XDG roots.
-  - **Personal-Data Holdbacks**: Leaves browser profiles, `Group Containers`, and VM/game libraries unchecked by default with `Held back` badges.
-  - **Official Uninstaller Warnings**: Highlights security, MDM, and VPN suites (CrowdStrike, Jamf, SentinelOne, ESET, GlobalProtect, Cisco Secure Client, Malwarebytes, TeamViewer, etc.) and recommends using the vendor's official uninstaller.
+1. **Developer Tools (49 targets)** — Xcode (`DerivedData`, Caches, Products, SwiftUI Previews, held-back Archives & iOS/watchOS/tvOS DeviceSupport), CoreSimulator, Homebrew, SwiftPM, CocoaPods, JetBrains, Android Studio, Docker Buildx cache, npm, pnpm, Yarn Classic, Bun, `node-gyp`, Electron, Deno, TypeScript, pip, uv, Poetry, Pipenv, Ruff, Mypy, `pre-commit`, Cargo (`cache` & `src`), Rustup downloads, Gradle, Maven (held back), Go build cache, Playwright, Puppeteer, Composer, RubyGems, `pyenv`, `nvm`, Hugging Face Hub (held back), NuGet (held back), and Dart/Flutter Pub Cache (held back).
+2. **Browser Caches** — Chrome, Brave, Edge, Arc, Firefox, Zen, Vivaldi, and Opera (**caches only** — never touches profiles, history, cookies, passwords, or sessions).
+3. **App Internal Caches** — Exact disposable Electron/Chromium cache leaves (`Cache`, `Code Cache`, `GPUCache`, `DawnCache`, `DawnGraphiteCache`, `DawnWebGPUCache`, `CachedData`, `Service Worker/CacheStorage`, `Crashpad/completed`) inside `~/Library/Application Support/<App>/`.
+4. **User App & Sandboxed Container Caches** — `~/Library/Caches/*` and third-party `~/Library/Containers/<bundle_id>/Data/Library/Caches` (preserving parent directories).
+5. **macOS & Apple Caches** — QuickLook thumbnails & cache, Icon Services, Safari Webpage Previews, WebKit Network cache, App Store caches, Media/Photo Analysis, Siri/Calendar/Address Book caches, Messages sticker/preview caches, 30d+ Mail Downloads attachment copies (held back), Autosave Information (held back), and local iOS Device Backups (held back).
+6. **Project Build Artifacts** — Bounded, marker-verified discovery of rebuildable `node_modules`, `target`, `.build`, `Pods`, `.venv`, `venv`, `__pycache__`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.gradle`, `.dart_tool`, `dist`, and `build` folders across standard developer roots (`~/Projects`, `~/Developer`, `~/Code`, `~/GitHub`, `~/dev`, etc.) with nested `.git` protection and 7-day activity badges (held back by default).
+7. **Orphaned App Leftovers** — 30d+ inactive caches and saved states whose reverse-DNS bundle ID is no longer installed across `/Applications`, `/System/Applications`, `~/Applications`, Setapp, or Homebrew Caskroom, plus orphaned non-Apple `/Library/LaunchDaemons` & `/Library/LaunchAgents` whose target binaries no longer exist (`Admin`).
+8. **Logs & Diagnostics** — `~/Library/Logs`, `DiagnosticReports`, and 30d+ `CrashReporter` entries.
+9. **Saved State, Temp & Incomplete Downloads** — `Saved Application State` (held back), user-owned `$TMPDIR` files >24h old, and stale `.crdownload` / `.download` / `.part` files >24h old.
+10. **Old Installers** — `.dmg`, `.pkg`, `.mpkg`, `.iso`, and `.xip` files older than 24h in `~/Downloads` and `~/Desktop` (held back).
+11. **System Caches & Logs (Admin)** — Opt-in allowlisted system cleanup (`/Library/Developer/CoreSimulator/Caches/dyld`, `/Library/Logs/DiagnosticReports`, `/private/var/db/diagnostics/{Special,Persist}`, `/private/var/db/DiagnosticPipeline`, `/private/var/db/reportmemoryexception`, stale `/private/var/log`, `/Library/Caches`, `/private/tmp`, `/private/var/tmp`, and `/private/var/db/powerlog` excluding live `Current*` PerfPowerTelemetry files). Only prompts for an administrator password when you explicitly select Admin items.
+12. **Trash** — `~/.Trash` (held back by default).
 
-### 5. Updates, Permissions & Settings Search
-- **Built-In Auto-Updater**: Checks GitHub Releases (`manavo-o/Upkeep`) automatically every 6 hours or on demand, with one-click download, install, and relaunch.
-- **Parallel CLI Updates**: Runs `mo update` and `brew update` concurrently from the Updates pane.
-- **Environment Diagnostics**: Live status indicators for macOS Accessibility permission, Homebrew CLI, and Mole CLI, plus `⌘F` sidebar settings search across all panes.
+### 4. Deep App Uninstaller
+- **Two-Phase Discovery**: Lists apps in `/Applications` and `~/Applications` with bundle IDs in `<15 ms`, then fills APFS-accurate sizes concurrently.
+- **Comprehensive Leftover Inspector**: Discovers `Application Support`, `Caches`, `Preferences`, `ByHost`, `SyncedPreferences`, `Logs`, `Containers`, UUID sandbox containers (`MCMMetadataIdentifier`), `Group Containers` (`<TeamID>.` boundary matching), `HTTPStorages`, `WebKit`, `Cookies`, `Saved Application State`, `Autosave Information`, `FileProvider`, `ApplicationRecentDocuments` (`.sfl2`–`.sfl4`), `ShipIt`/updaters, crash reporters, `NativeMessagingHosts`, plug-ins, vendor-nested folders, special-app rules (VS Code, Xcode, JetBrains, Android Studio, Claude Desktop, Docker, Anki, Godot), and `LaunchAgents` (unloaded cleanly via `launchctl bootout` before trashing).
+- **Homebrew Caskroom Integration**: Automatically detects Caskroom-managed apps and offers `brew uninstall --cask --zap <token>` (skipping `--zap` whenever a sibling channel is installed).
+
+## Safety Architecture
+
+Upkeep is built around conservative, review-before-delete defaults:
+
+- **Live Running-App Protection**: Enumerates running `.app` bundles natively via macOS `libproc` (`proc_listallpids` + `proc_pidpath`) and automatically holds back caches of open apps and browsers so open SQLite caches (`-wal`/`-shm`) are never corrupted.
+- **Strict Path & Symlink Guards**: Enforces canonicalized user-home and temp allowlists (plus a separate strict system-path allowlist for Admin targets), rejects parent-directory traversal, control characters, leaf symlinks, and symlinked ancestor directories, deduplicates targets by `(dev, ino)`, and preserves parent cache folders.
+- **Protected User & System Data**: Permanently blocks deletion of Keychains, credential directories, independent CLI directories (Claude Code, Codex, Gemini, OpenCode), Yarn Berry archive stores, Jupyter runtime, macOS aerial wallpapers, OrbStack/Docker/VM state, Mail message stores, Messages attachments, Apple Notes group containers, Steam, Epic, Unity, and live `Current*` powerlog databases.
+- **Uninstaller Holdbacks & Warnings**: Holds back browser profiles, `Group Containers`, and VM/game libraries unchecked by default; protects shared data when sibling channels exist (e.g., *VS Code* + *VS Code Insiders*); flags MDM/security/VPN suites (CrowdStrike, Jamf, SentinelOne, ESET, GlobalProtect, Cisco Secure Client, etc.) to recommend their official vendor uninstallers.
 
 ## Keyboard Shortcuts
 
 | Context | Shortcut | Action |
 | --- | --- | --- |
 | Main Window | `⌘F` | Focus sidebar settings search |
-| Menu Bar | `⌘,` | Open Upkeep main window |
+| Menu Bar | `⌘,` | Open Upkeep window |
 | Menu Bar | `⌘Q` | Quit Upkeep |
 | Homebrew HUD | `⌘1` – `⌘4` | Switch scopes (Installed, Formulae, Casks, Upgrades) |
 | Homebrew HUD | `⌘K` | Open package actions menu |
 | Homebrew HUD | `Esc` | Dismiss Search HUD |
 | Clean Keys | Hold `⌘ + Esc` (1s) | Emergency unlock keyboard |
 
-## Architecture
+## Architecture & Performance
 
-| Layer | Technology | Responsibility |
+| Layer | Stack | Highlights |
 | --- | --- | --- |
-| UI & Windowing | Swift 6, SwiftUI, AppKit | Native Liquid Glass sidebar window, `MenuBarExtra`, floating Search HUD |
-| System Services | IOKit, CoreGraphics, POSIX PTY | Caffeinate power assertions, Clean Keys event tap, streaming CLI executor |
-| Native Core (`upkeep_core`) | Rust C-ABI (`libupkeep_core.a`) | `getattrlistbulk` APFS sizing, Rayon parallel scanners, `nucleo-matcher` index, deep uninstaller inspection |
+| **UI & Windowing** | Swift 6, SwiftUI, AppKit | macOS 26/27 Liquid Glass sidebar window, `MenuBarExtra`, floating `NSPanel` HUD |
+| **System Services** | IOKit, CoreGraphics | Native power assertions, keyboard/pointer event tap, single-prompt allowlisted admin helper |
+| **Native Core** | Rust C-ABI (`rust/upkeep_core`) | Zero-`PathBuf` `openat` + `getattrlistbulk` APFS sizing, Rayon parallelism, `nucleo-matcher`, `memchr` NEON/SIMD, `libproc` live-app detection, `catalog.bin` cache |
 
-Upkeep builds and runs seamlessly both **with** and **without** `libupkeep_core.a` (falling back to Swift implementations if Cargo is not installed).
+Upkeep compiles and runs both **with** and **without** `libupkeep_core.a` (automatically falling back to Swift implementations if `cargo` is unavailable).
 
-## How to Run Upkeep
+## Installation & Building from Source
 
-### Option 1: Download a Prebuilt Release
-1. Open the **Releases** page for `manavo-o/Upkeep` and download the latest `Upkeep-v*.zip`.
-2. Unzip and drag `Upkeep.app` into `/Applications`.
-3. Launch `Upkeep.app` — look for the Upkeep icon in your macOS menu bar.
+### Download a Release
+1. Download the latest `Upkeep-v*.zip` from GitHub Releases (`manavo-o/Upkeep`).
+2. Unzip and move `Upkeep.app` into `/Applications`.
+3. Launch **Upkeep** — it runs quietly from the top menu bar.
 
-### Option 2: Build & Run from Source
+### Build Locally
 
-#### Prerequisites
-- **macOS 26.0+** (built for macOS 26/27 Liquid Glass)
+**Prerequisites**
+- **macOS 26.0+** (Liquid Glass UI; Swift package minimum deployment target macOS 15)
 - **Swift 6** / Xcode Command Line Tools (`xcode-select --install`)
-- **Rust (`cargo`)** *(optional, recommended)* — automatically compiled into `Frameworks/lib/libupkeep_core.a` by `Scripts/build-app.sh`
+- **Rust (`cargo`)** *(recommended)* — compiled automatically into `Frameworks/lib/libupkeep_core.a` by `Scripts/build-app.sh`
 - **Homebrew** *(optional)* — enables the Homebrew Search HUD and Caskroom integration
-- **Mole CLI** *(optional)* — `brew install tw93/tap/mole` for full `mo clean` execution
 
-#### Build and Launch
+**Test, Build, Sign & Launch**
 
-Run in Terminal so macOS Keychain can create or reuse a persistent code-signing identity (preserving TCC Accessibility permissions across rebuilds):
+Run in your Terminal so `build-app.sh` can sign with a persistent local certificate and preserve macOS Accessibility permissions across rebuilds:
 
 ```zsh
 cd Upkeep
-pkill -x Upkeep 2>/dev/null; ./Scripts/build-app.sh && open dist/Upkeep.app
+(cd rust/upkeep_core && cargo test) && ./Scripts/build-app.sh && open dist/Upkeep.app
 ```
 
-#### Grant Accessibility Permission (for Clean Keys)
-1. Open Upkeep from the menu bar (`⌘,`) and go to **Power & Input** or **Updates**.
-2. Click **Grant Accessibility…** to open **System Settings → Privacy & Security → Accessibility**.
-3. Enable **Upkeep** (if rebuilding locally, the persistent signing identity keeps this permission intact across builds).
-
-#### Run the Self-Test Suite
+**Run the Swift Self-Test Suite**
 
 ```zsh
 ./.build/release/UpkeepSelfTest
 ```
 
-## Releases
-
-Pushing a version tag (for example `v1.1.0`) triggers `.github/workflows/release.yml` on `macos-26` to compile `upkeep_core`, build and package `Upkeep-<tag>.zip`, attach `RELEASE_NOTES.md`, and publish a GitHub Release compatible with Upkeep's built-in updater:
-
-```zsh
-git tag -f v1.1.0 && git push -f origin v1.1.0
-```
+### Permissions
+- **Accessibility** *(Clean Keys only)*: Open **Upkeep → Power & Input** (or **Updates**) and click **Grant Accessibility…** to enable Upkeep in **System Settings → Privacy & Security → Accessibility**.
+- **Administrator Password** *(optional)*: Never requested during normal cache cleans; macOS prompts once only if you explicitly check items under **System Caches & Logs (Admin)** or orphaned system services.
