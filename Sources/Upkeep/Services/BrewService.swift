@@ -22,6 +22,9 @@ public struct BrewOperationLog: Codable, Sendable, Equatable {
 public final class BrewLogStore {
     public static let shared = BrewLogStore()
     public private(set) var lastLog: BrewOperationLog?
+    public private(set) var isRunning: Bool = false
+    public private(set) var activeCommand: String? = nil
+    public private(set) var liveStatusLine: String? = nil
 
     private static let fileURL: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -45,6 +48,9 @@ public final class BrewLogStore {
     }
 
     public func beginLive(command: String) {
+        self.isRunning = true
+        self.activeCommand = command
+        self.liveStatusLine = "Starting `\(command)`…"
         self.lastLog = BrewOperationLog(
             command: command,
             output: "Running `\(command)`…",
@@ -56,11 +62,15 @@ public final class BrewLogStore {
 
     public func appendLiveLine(_ line: String) {
         guard let current = lastLog else { return }
+        let cleanedLine = CLIExecutor.stripANSI(line).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanedLine.isEmpty {
+            self.liveStatusLine = cleanedLine
+        }
         let nextOutput: String
         if current.output.hasPrefix("Running `") && current.output.hasSuffix("…") {
-            nextOutput = line
+            nextOutput = cleanedLine.isEmpty ? line : cleanedLine
         } else {
-            nextOutput = current.output + "\n" + line
+            nextOutput = current.output + "\n" + (cleanedLine.isEmpty ? line : cleanedLine)
         }
         self.lastLog = BrewOperationLog(
             command: current.command,
@@ -72,6 +82,9 @@ public final class BrewLogStore {
     }
 
     public func record(command: String, stdout: String, stderr: String, exitCode: Int32) {
+        self.isRunning = false
+        self.activeCommand = nil
+        self.liveStatusLine = nil
         let cleanOut = CLIExecutor.stripANSI(stdout).trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanErr = CLIExecutor.stripANSI(stderr).trimmingCharacters(in: .whitespacesAndNewlines)
         let combined: String
@@ -125,6 +138,16 @@ public struct BrewPackageItem: Identifiable, Sendable, Hashable {
     public let isOutdated: Bool
     public let isPinned: Bool
     public let homepage: String
+
+    /// Clean, human-readable version string (trims trailing cask build hashes/UUIDs after commas).
+    public var displayVersion: String {
+        guard !version.isEmpty else { return "" }
+        if let comma = version.firstIndex(of: ",") {
+            let prefix = String(version[..<comma])
+            if !prefix.isEmpty { return prefix }
+        }
+        return version
+    }
 
     public init(
         name: String,
@@ -657,18 +680,40 @@ public actor BrewService {
     }
 
     private func scorePool(_ pool: [BrewPackageItem], query: String, filterCasks: Bool?, limit: Int) -> [BrewPackageItem] {
+        let qLower = query.lowercased()
         var scored: [(BrewPackageItem, Int)] = []
         scored.reserveCapacity(min(256, pool.count))
         for item in pool {
             if let filterCasks, item.isCask != filterCasks { continue }
-            if let nameScore = UpkeepEngine.scoreFuzzy(query: query, candidate: item.name) {
-                scored.append((item, nameScore + 500))
-            } else if !item.description.isEmpty,
-                      let descScore = UpkeepEngine.scoreFuzzy(query: query, candidate: item.description) {
-                scored.append((item, descScore))
+            let nameLower = item.name.lowercased()
+            let installedBonus = item.isInstalled ? 180 : 0
+
+            if nameLower == qLower {
+                scored.append((item, 200_000 + installedBonus))
+            } else if nameLower.hasPrefix(qLower) {
+                let extra = min(4_000, nameLower.count - qLower.count)
+                scored.append((item, 120_000 - extra * 10 + installedBonus))
+            } else if let range = nameLower.range(of: qLower) {
+                let pos = nameLower.distance(from: nameLower.startIndex, to: range.lowerBound)
+                let extra = min(500, nameLower.count - qLower.count)
+                scored.append((item, 75_000 - min(500, pos) * 40 - extra * 15 + installedBonus))
+            } else if let nameScore = UpkeepEngine.scoreFuzzy(query: query, candidate: item.name) {
+                scored.append((item, 25_000 + nameScore - min(200, nameLower.count) * 10 + installedBonus))
+            } else if !item.description.isEmpty {
+                if item.description.localizedCaseInsensitiveContains(query) {
+                    let descScore = UpkeepEngine.scoreFuzzy(query: query, candidate: item.description) ?? 100
+                    scored.append((item, 8_000 + descScore + installedBonus))
+                } else if qLower.count >= 4,
+                          let descScore = UpkeepEngine.scoreFuzzy(query: query, candidate: item.description),
+                          descScore >= qLower.count * 28 {
+                    scored.append((item, min(4_000, descScore) + installedBonus))
+                }
             }
         }
-        scored.sort { $0.1 > $1.1 }
+        scored.sort {
+            if $0.1 != $1.1 { return $0.1 > $1.1 }
+            return $0.0.name.localizedCaseInsensitiveCompare($1.0.name) == .orderedAscending
+        }
         return Array(scored.prefix(limit).map(\.0))
     }
 

@@ -1,13 +1,14 @@
 import AppKit
 import SwiftUI
 
-/// Dedicated macOS 27 Native Liquid Glass Window for Upkeep.
-/// Modeled on Apple System Settings, DockDoor, and Handy:
-/// - Locked 232pt Floating Liquid Glass Sidebar with pinned Liquid Glass Search (`⌘F`)
-/// - Consistent `.unified` titlebar & toolbar chrome across every pane (zero height jumps)
-/// - Native `.formStyle(.grouped)` panes with `.scrollEdgeEffectStyle(.soft, for: .top)`
-/// - Unified `.glass` / `.glassProminent` button hierarchy, leading `UpkeepSettingsIcon` badges,
-///   toggleable inline annotations with `(i)` popovers, and search scroll-to highlight flash
+/// Dedicated macOS 27 Native Settings & Utility Window for Upkeep.
+/// Modeled on Canapé, DockDoor, Handy, and Apple System Settings:
+/// - Minimalist 216pt sidebar with pinned Liquid Glass Search (`⌘F`), bespoke squircle section badges,
+///   and quiet version footer (no bulky brand header)
+/// - Seamless transparent titlebar + Canapé-style pane headers (`[Icon] Title`)
+/// - Centered 620pt grouped reading columns with zero per-row icon clutter, clean typography,
+///   and inline `(i)` popovers
+/// - Revamped Homebrew Downloader seamlessly wired to the floating Liquid Glass Search HUD
 public struct MainWindowView: View {
     @Bindable public var vm: TrayViewModel
     public let coordinator: HUDCoordinator
@@ -25,25 +26,11 @@ public struct MainWindowView: View {
         self.coordinator = coordinator
     }
 
-    private var toolbarTitle: String {
-        searchEngine.isSearching ? "Search" : vm.activeSection.rawValue
-    }
-
-    private var toolbarSubtitle: String {
-        if searchEngine.isSearching {
-            let count = searchEngine.results.count
-            return count == 1 ? "1 matching setting" : "\(count) matching settings"
-        }
-        return vm.activeSection.subtitle
-    }
-
     public var body: some View {
         NavigationSplitView(columnVisibility: .constant(.all)) {
             sidebar
         } detail: {
             detailPane
-                .navigationTitle(toolbarTitle)
-                .navigationSubtitle(toolbarSubtitle)
                 .toolbar {
                     toolbarContent
                 }
@@ -69,7 +56,7 @@ public struct MainWindowView: View {
         }
     }
 
-    // MARK: - Floating Liquid Glass Sidebar
+    // MARK: - Minimalist Native macOS Sidebar (Canapé + DockDoor Pattern)
 
     private var sidebar: some View {
         List(selection: $vm.activeSection) {
@@ -90,13 +77,32 @@ public struct MainWindowView: View {
         .listStyle(.sidebar)
         .upkeepSoftTopScrollEdge()
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 8) {
-                sidebarBrandHeader
-                sidebarSearchField
-            }
-            .padding(.bottom, 6)
+            sidebarSearchField
+                .padding(.top, 4)
+                .padding(.bottom, 8)
         }
-        .navigationSplitViewColumnWidth(min: 232, ideal: 232, max: 232)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack(spacing: 6) {
+                Text("Upkeep")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                Text("v\(updater.currentVersion)")
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundStyle(.quaternary)
+                Spacer()
+                if updater.hasUpdateAvailable {
+                    Button("Update") {
+                        vm.activeSection = .updates
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+        }
+        .navigationSplitViewColumnWidth(min: 216, ideal: 216, max: 216)
         .toolbar(removing: .sidebarToggle)
     }
 
@@ -104,10 +110,10 @@ public struct MainWindowView: View {
         let isSelected = !searchEngine.isSearching && vm.activeSection == section
 
         return HStack(spacing: 10) {
-            UpkeepSectionIcon(section: section, size: 22)
+            UpkeepSectionIcon(section: section, size: 21)
 
             Text(section.rawValue)
-                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
                 .lineLimit(1)
 
             Spacer(minLength: 4)
@@ -115,47 +121,25 @@ public struct MainWindowView: View {
             if section == .controls && (keepAwake.isActive || cleaning.isLocked) {
                 Circle()
                     .fill(isSelected ? Color.white : (keepAwake.isActive ? MenuBarTheme.Colors.caffeinate : MenuBarTheme.Colors.cleanKeys))
-                    .frame(width: 7, height: 7)
+                    .frame(width: 6.5, height: 6.5)
             } else if section == .homebrew && vm.brewOutdatedCount > 0 {
                 Text("\(vm.brewOutdatedCount)")
                     .font(.system(size: 10.5, weight: .semibold, design: .rounded).monospacedDigit())
-                    .padding(.horizontal, 6.5)
+                    .padding(.horizontal, 6)
                     .padding(.vertical, 1.5)
                     .background(
-                        isSelected ? Color.white.opacity(0.24) : Color.primary.opacity(0.09),
+                        isSelected ? Color.white.opacity(0.24) : Color.primary.opacity(0.08),
                         in: Capsule()
                     )
                     .foregroundStyle(isSelected ? Color.white : Color.secondary)
             } else if section == .updates && updater.hasUpdateAvailable {
                 Circle()
                     .fill(isSelected ? Color.white : MenuBarTheme.Colors.success)
-                    .frame(width: 7, height: 7)
+                    .frame(width: 6.5, height: 6.5)
             }
         }
         .padding(.vertical, 2)
         .tag(section)
-    }
-
-    private var sidebarBrandHeader: some View {
-        HStack(spacing: 10) {
-            UpkeepAppIconView(size: 32)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Upkeep")
-                    .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-
-                Text("Version \(updater.currentVersion)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 14)
-        .padding(.top, 6)
     }
 
     private var sidebarSearchField: some View {
@@ -164,7 +148,7 @@ public struct MainWindowView: View {
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            TextField("Search…", text: $searchEngine.query)
+            TextField("Search settings…", text: $searchEngine.query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12.5))
                 .focused($isSearchFieldFocused)
@@ -188,8 +172,8 @@ public struct MainWindowView: View {
                 .accessibilityLabel("Clear search")
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5.5)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .background {
             if #available(macOS 26.0, *) {
                 Color.clear
@@ -202,7 +186,7 @@ public struct MainWindowView: View {
         .padding(.horizontal, 12)
     }
 
-    // MARK: - Unified Toolbar Controls (Always Populated for Consistent Titlebar Height)
+    // MARK: - Minimalist Contextual Toolbar
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
@@ -372,7 +356,7 @@ private struct CaffeinateToolbarBadge: View {
     }
 }
 
-// MARK: - 1. Power & Input (Native macOS 27 Grouped Form)
+// MARK: - 1. Power & Input (Minimalist DockDoor / Handy / Canapé Grouped Form)
 
 private struct PowerAndInputSettingsPane: View {
     @Bindable var vm: TrayViewModel
@@ -381,6 +365,10 @@ private struct PowerAndInputSettingsPane: View {
 
     var body: some View {
         UpkeepSettingsFormView {
+            Section {
+                UpkeepPaneHeader(section: .controls)
+            }
+
             if cleaning.permissionDenied || !cleaning.hasAccessibility {
                 Section {
                     UpkeepSettingsCallout(
@@ -398,7 +386,7 @@ private struct PowerAndInputSettingsPane: View {
             if keepAwake.isActive {
                 Section {
                     HStack(spacing: 12) {
-                        UpkeepSettingsIcon(systemName: "cup.and.saucer.fill", color: MenuBarTheme.Colors.caffeinate, size: 26)
+                        UpkeepSettingsIcon(systemName: "cup.and.saucer.fill", color: MenuBarTheme.Colors.caffeinate, size: 28)
 
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Caffeinate is Active")
@@ -440,7 +428,7 @@ private struct PowerAndInputSettingsPane: View {
 
             UpkeepSettingsSection(
                 "Caffeinate",
-                footer: "Uses native IOKit power assertions so your Mac stays awake cleanly without spawning background processes."
+                footer: "Uses native IOKit power assertions so your Mac stays awake cleanly without background processes."
             ) {
                 Toggle(isOn: Binding(
                     get: { keepAwake.isActive },
@@ -454,14 +442,12 @@ private struct PowerAndInputSettingsPane: View {
                         }
                     }
                 )) {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "cup.and.saucer.fill", color: MenuBarTheme.Colors.caffeinate)
-                        Text("Keep Mac Awake")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel(
+                        "Keep Mac Awake",
+                        subtitle: "Prevent idle display and system sleep during downloads, builds, or presentations."
+                    )
                 }
                 .tint(MenuBarTheme.Colors.caffeinate)
-                .upkeepAnnotation("Prevent idle display and system sleep while running downloads, builds, or presentations.")
                 .upkeepSearchTarget("power.keepAwake")
 
                 Picker(selection: Binding(
@@ -477,17 +463,13 @@ private struct PowerAndInputSettingsPane: View {
                     Text("Display & System").tag(KeepAwakeMode.displayAndSystem)
                     Text("System Only").tag(KeepAwakeMode.systemOnly)
                 } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "display", color: .blue)
-                        Text("Assertion Mode")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel(
+                        "Assertion Mode",
+                        subtitle: "Keep the screen lit or let the display sleep while tasks continue.",
+                        info: "Display & System holds both kIOPMAssertionTypePreventUserIdleDisplaySleep and system sleep assertions. System Only lets your screen dim and lock normally."
+                    )
                 }
                 .pickerStyle(.segmented)
-                .upkeepAnnotation(
-                    "Choose whether to keep the screen lit or allow the display to sleep while background tasks continue.",
-                    more: "Display & System holds both kIOPMAssertionTypePreventUserIdleDisplaySleep and system sleep assertions. System Only lets your screen dim and lock normally."
-                )
                 .upkeepSearchTarget("power.assertionMode")
 
                 LabeledContent {
@@ -498,11 +480,7 @@ private struct PowerAndInputSettingsPane: View {
                         durationButton("Indefinite", minutes: nil)
                     }
                 } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "timer", color: .indigo)
-                        Text("Quick Duration")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel("Quick Duration")
                 }
                 .upkeepSearchTarget("power.quickDuration")
             }
@@ -535,33 +513,22 @@ private struct PowerAndInputSettingsPane: View {
                         .tint(cleaning.isLocked ? MenuBarTheme.Colors.cleanKeys : .accentColor)
                     }
                 } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "keyboard.badge.ellipsis", color: MenuBarTheme.Colors.cleanKeys)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Keyboard Cleaning Lock")
-                                .font(.system(size: 13, weight: .medium))
-                            if cleaning.isLocked {
-                                Text("Locked · \(cleaning.remainingSeconds)s remaining")
-                                    .font(.footnote)
-                                    .foregroundStyle(MenuBarTheme.Colors.cleanKeys)
-                            }
-                        }
-                    }
+                    UpkeepSettingLabel(
+                        "Keyboard Cleaning Lock",
+                        subtitle: cleaning.isLocked
+                            ? "Locked · \(cleaning.remainingSeconds)s remaining"
+                            : "Temporarily intercept keyboard input so you can wipe down your MacBook safely."
+                    )
                 }
-                .upkeepAnnotation("Temporarily intercept all keyboard input so you can wipe down your MacBook without triggering shortcuts.")
                 .upkeepSearchTarget("power.cleanKeys")
 
                 HStack(spacing: 8) {
                     Picker(selection: $vm.cleaningDuration) {
-                        Text("30 Seconds").tag(30)
-                        Text("60 Seconds").tag(60)
-                        Text("2 Minutes").tag(120)
+                        Text("30s").tag(30)
+                        Text("60s").tag(60)
+                        Text("2m").tag(120)
                     } label: {
-                        HStack(spacing: 10) {
-                            UpkeepSettingsIcon(systemName: "clock", color: .teal)
-                            Text("Lock Duration")
-                                .font(.system(size: 13, weight: .medium))
-                        }
+                        UpkeepSettingLabel("Lock Duration")
                     }
                     .pickerStyle(.segmented)
 
@@ -572,23 +539,19 @@ private struct PowerAndInputSettingsPane: View {
                 .upkeepSearchTarget("power.lockDuration")
 
                 Toggle(isOn: $vm.cleaningDimScreen) {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "moon.fill", color: .purple)
-                        Text("Dim Screen While Locked")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel(
+                        "Dim Screen While Locked",
+                        subtitle: "Dims connected displays so smudges and dust are easier to spot."
+                    )
                 }
-                .upkeepAnnotation("Dims connected displays so smudges and dust are easier to spot while cleaning.")
                 .upkeepSearchTarget("power.dimScreen")
 
                 Toggle(isOn: $vm.cleaningLockPointer) {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "cursorarrow.slash", color: .pink)
-                        Text("Lock Pointer & Trackpad")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel(
+                        "Lock Pointer & Trackpad",
+                        subtitle: "Ignore accidental trackpad taps and clicks while Clean Keys is active."
+                    )
                 }
-                .upkeepAnnotation("Also ignores accidental trackpad taps and clicks while Clean Keys is active.")
                 .upkeepSearchTarget("power.lockPointer")
             }
         }
@@ -620,20 +583,94 @@ private struct PowerAndInputSettingsPane: View {
     }
 }
 
-// MARK: - 2. Homebrew (Native macOS 27 Grouped Form + Persistent Operation Log)
+// MARK: - 2. Homebrew (Revamped Unified Search & Package Downloader Connected to Floating HUD)
+
+private enum BrewSettingsScope: String, CaseIterable, Identifiable {
+    case all = "All"
+    case installed = "Installed"
+    case formulae = "Formulae"
+    case casks = "Casks"
+    case upgrades = "Upgrades"
+
+    var id: String { rawValue }
+
+    var hudTab: BrewHUDTab? {
+        switch self {
+        case .all: return nil
+        case .installed: return .installed
+        case .formulae: return .formulae
+        case .casks: return .casks
+        case .upgrades: return .upgrades
+        }
+    }
+
+    var caskFilter: Bool? {
+        switch self {
+        case .formulae: return false
+        case .casks: return true
+        case .all, .installed, .upgrades: return nil
+        }
+    }
+}
 
 private struct HomebrewSettingsPane: View {
     @Bindable var vm: TrayViewModel
     let coordinator: HUDCoordinator
     @Bindable var logStore = BrewLogStore.shared
 
+    @State private var scope: BrewSettingsScope = .upgrades
+    @State private var query: String = ""
+    @State private var packages: [BrewPackageItem] = []
+    @State private var isSearching: Bool = false
+    @State private var activePackageID: String? = nil
+    @State private var searchTask: Task<Void, Never>?
+    @State private var showFullLog: Bool = false
     @State private var copiedInstallCommand = false
     @State private var copiedLog = false
 
     private static let brewInstallCommand = #"/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)""#
 
+    private var isOperating: Bool {
+        activePackageID != nil || vm.isUpgradingBrew || logStore.isRunning
+    }
+
     var body: some View {
-        UpkeepSettingsFormView {
+        UpkeepSettingsFormView(maxColumnWidth: 660) {
+            Section {
+                UpkeepPaneHeader(section: .homebrew) {
+                    HStack(spacing: 8) {
+                        if vm.brewOutdatedCount > 0 {
+                            Button {
+                                vm.upgradeAllBrew()
+                            } label: {
+                                if vm.isUpgradingBrew {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Label("Upgrade \(vm.brewOutdatedCount)", systemImage: "arrow.up.circle.fill")
+                                }
+                            }
+                            .buttonStyle(.upkeepPrimary)
+                            .tint(.orange)
+                            .controlSize(.regular)
+                            .disabled(isOperating)
+                        }
+
+                        Button {
+                            coordinator.showHomebrewHUD(
+                                initialQuery: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : query,
+                                initialTab: scope.hudTab
+                            )
+                        } label: {
+                            Label("Pop Out HUD", systemImage: "macwindow.on.rectangle")
+                        }
+                        .buttonStyle(.upkeepSecondary)
+                        .controlSize(.regular)
+                        .disabled(!BrewService.isInstalled())
+                        .help("Open this search in the floating Liquid Glass HUD")
+                    }
+                }
+            }
+
             if !BrewService.isInstalled() {
                 Section {
                     UpkeepSettingsCallout(
@@ -662,120 +699,149 @@ private struct HomebrewSettingsPane: View {
                     ) {
                         vm.brewErrorText = nil
                         vm.refreshOverview(force: true)
+                        runSearch()
                     }
                 }
             }
 
-            UpkeepSettingsSection(
-                "Packages",
-                footer: "The floating Search HUD caches Homebrew's public formulae and cask index with ETag validation for instant search."
-            ) {
-                LabeledContent {
-                    HStack(spacing: 8) {
-                        if vm.brewOutdatedCount > 0 {
-                            Button {
-                                vm.upgradeAllBrew()
-                            } label: {
-                                if vm.isUpgradingBrew {
-                                    ProgressView().controlSize(.small)
-                                } else {
-                                    Text("Upgrade \(vm.brewOutdatedCount)")
-                                }
+            // Live Transfer / Activity Banner (Synced with both Settings & Floating HUD)
+            if logStore.isRunning {
+                Section {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.small)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(logStore.activeCommand ?? "Running Homebrew operation…")
+                                .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
+                                .lineLimit(1)
+                            if let line = logStore.liveStatusLine {
+                                Text(line)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
                             }
-                            .buttonStyle(.upkeepSecondary)
-                            .disabled(vm.isUpgradingBrew)
                         }
 
-                        Button("Open Search HUD") {
-                            coordinator.showHomebrewHUD()
-                        }
-                        .buttonStyle(.upkeepPrimary)
-                        .disabled(!BrewService.isInstalled())
+                        Spacer()
                     }
-                } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "magnifyingglass", color: MenuBarTheme.Colors.homebrew)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Homebrew Search HUD")
-                                .font(.system(size: 13, weight: .medium))
-                            Text(statusSummary)
+                    .padding(.vertical, 2)
+                }
+            }
+
+            // Unified Search & Package Downloader (Same Rust Engine as Floating HUD)
+            if BrewService.isInstalled() {
+                UpkeepSettingsSection(
+                    "Packages",
+                    footer: "\(vm.brewInstalledCount) installed · \(vm.brewOutdatedCount) outdated. Searches share the same instant Rust index as the floating HUD."
+                ) {
+                    VStack(spacing: 10) {
+                        HStack(spacing: 8) {
+                            MenuBarSearchField(
+                                text: $query,
+                                placeholder: searchPlaceholder
+                            )
+                            .onChange(of: query) { _, _ in
+                                runSearch()
+                            }
+
+                            Button {
+                                coordinator.showHomebrewHUD(
+                                    initialQuery: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : query,
+                                    initialTab: scope.hudTab
+                                )
+                            } label: {
+                                Image(systemName: "arrow.up.right.square")
+                                    .font(.system(size: 13, weight: .medium))
+                            }
+                            .buttonStyle(.upkeepSecondary)
+                            .controlSize(.regular)
+                            .help("Continue search in Floating HUD")
+                        }
+
+                        Picker("Scope", selection: $scope) {
+                            ForEach(BrewSettingsScope.allCases) { s in
+                                if s == .upgrades && vm.brewOutdatedCount > 0 {
+                                    Text("Upgrades (\(vm.brewOutdatedCount))").tag(s)
+                                } else {
+                                    Text(s.rawValue).tag(s)
+                                }
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .onChange(of: scope) { _, _ in
+                            runSearch()
+                        }
+                    }
+                    .padding(.vertical, 2)
+                    .upkeepSearchTarget("brew.hud")
+
+                    if isSearching && packages.isEmpty {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Searching Homebrew catalog…")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
-                    }
-                }
-                .upkeepSearchTarget("brew.hud")
-
-                LabeledContent {
-                    if vm.isRefreshingBrew && vm.brewInstalledCount == 0 {
-                        ProgressView().controlSize(.small)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 14)
+                    } else if packages.isEmpty {
+                        emptyPackagesRow
                     } else {
-                        Text("\(vm.brewInstalledCount)")
-                            .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "shippingbox.fill", color: .blue)
-                        Text("Installed Packages")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                }
-
-                LabeledContent {
-                    Text("\(vm.brewOutdatedCount)")
-                        .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
-                        .foregroundStyle(vm.brewOutdatedCount > 0 ? MenuBarTheme.Colors.warning : .secondary)
-                } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(
-                            systemName: "arrow.up.circle.fill",
-                            color: vm.brewOutdatedCount > 0 ? MenuBarTheme.Colors.warning : .secondary
-                        )
-                        Text("Outdated Packages")
-                            .font(.system(size: 13, weight: .medium))
+                        ForEach(packages.prefix(24)) { pkg in
+                            brewDownloaderRow(pkg)
+                        }
+                        if packages.count > 24 {
+                            HStack {
+                                Text("Showing top 24 of \(packages.count) matches")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button("View All in HUD") {
+                                    coordinator.showHomebrewHUD(
+                                        initialQuery: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : query,
+                                        initialTab: scope.hudTab
+                                    )
+                                }
+                                .buttonStyle(.upkeepSecondary)
+                                .controlSize(.small)
+                            }
+                            .padding(.vertical, 2)
+                        }
                     }
                 }
-                .upkeepSearchTarget("brew.outdated")
-
-                UpkeepStatusRow(
-                    title: "Homebrew CLI",
-                    description: "Local `brew` binary for package operations",
-                    icon: "terminal",
-                    isGranted: BrewService.isInstalled()
-                )
             }
 
+            // Minimalist Collapsible Operation Log (No Giant Terminal Box Unless Expanded)
             UpkeepSettingsSection(
-                "Last Operation Log",
-                footer: "Persists across relaunches so you can inspect the full output of your latest brew install, upgrade, uninstall, or doctor run."
+                "Activity",
+                footer: "Captures output from installs, upgrades, and brew doctor across both Settings and the floating HUD."
             ) {
                 if let log = logStore.lastLog {
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
                             Image(systemName: log.succeeded ? "checkmark.circle.fill" : "xmark.circle.fill")
                                 .foregroundStyle(log.succeeded ? Color.green : Color.red)
                                 .font(.system(size: 13))
 
-                            Text(log.command)
-                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                .lineLimit(1)
-
-                            Text(log.succeeded ? "Succeeded" : "Exit \(log.exitCode)")
-                                .font(.system(size: 10.5, weight: .semibold))
-                                .foregroundStyle(log.succeeded ? Color.green : Color.red)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2)
-                                .background(
-                                    (log.succeeded ? Color.green : Color.red).opacity(0.14),
-                                    in: Capsule()
-                                )
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(log.command)
+                                    .font(.system(size: 12.5, weight: .medium, design: .monospaced))
+                                    .lineLimit(1)
+                                HStack(spacing: 6) {
+                                    Text(log.succeeded ? "Succeeded" : "Failed (Exit \(log.exitCode))")
+                                        .foregroundStyle(log.succeeded ? Color.secondary : Color.red)
+                                    Text("·")
+                                        .foregroundStyle(.tertiary)
+                                    Text(log.timestamp, style: .relative)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .font(.caption)
+                            }
 
                             Spacer()
-
-                            Text(log.timestamp, style: .relative)
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
 
                             Button(copiedLog ? "Copied" : "Copy") {
                                 NSPasteboard.general.clearContents()
@@ -790,6 +856,7 @@ private struct HomebrewSettingsPane: View {
 
                             Button("Clear") {
                                 withAnimation(.snappy(duration: 0.18)) {
+                                    showFullLog = false
                                     logStore.clear()
                                 }
                             }
@@ -797,37 +864,28 @@ private struct HomebrewSettingsPane: View {
                             .controlSize(.small)
                         }
 
-                        ScrollView([.vertical, .horizontal]) {
-                            Text(log.output)
-                                .font(.system(size: 11, design: .monospaced))
+                        DisclosureGroup(isExpanded: $showFullLog) {
+                            ScrollView([.vertical, .horizontal]) {
+                                Text(log.output)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(10)
+                            }
+                            .frame(maxHeight: 160)
+                            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .padding(.top, 4)
+                        } label: {
+                            Text(showFullLog ? "Hide Output" : "View Output")
+                                .font(.footnote.weight(.medium))
                                 .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(10)
-                        }
-                        .frame(maxHeight: 180)
-                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
                         }
                     }
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 2)
                     .upkeepSearchTarget("brew.log")
                 } else {
-                    HStack(spacing: 12) {
-                        UpkeepSettingsIcon(systemName: "doc.text", color: .secondary, size: 24)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("No Homebrew operations recorded yet")
-                                .font(.system(size: 13, weight: .medium))
-                            Text("Run an upgrade, install, or brew doctor to capture persistent output here.")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Spacer()
-
+                    LabeledContent {
                         if BrewService.isInstalled() {
                             Button {
                                 vm.runBrewDoctor()
@@ -842,37 +900,243 @@ private struct HomebrewSettingsPane: View {
                             .controlSize(.small)
                             .disabled(vm.isRunningBrewDoctor)
                         }
+                    } label: {
+                        UpkeepSettingLabel(
+                            "No Recent Operations",
+                            subtitle: "Install, upgrade, or run brew doctor to view live progress and logs here."
+                        )
                     }
-                    .padding(.vertical, 2)
                     .upkeepSearchTarget("brew.log")
                 }
             }
 
-            UpkeepSettingsSection("HUD Shortcuts") {
-                LabeledContent("Switch Scopes (Installed, Formulae, Casks, Upgrades)") {
+            // Compact Environment & HUD Shortcuts
+            UpkeepSettingsSection("Environment & Shortcuts") {
+                UpkeepStatusRow(
+                    title: "Homebrew CLI",
+                    description: "Local `brew` binary for package operations",
+                    icon: "terminal",
+                    isGranted: BrewService.isInstalled()
+                )
+                .upkeepSearchTarget("brew.outdated")
+
+                LabeledContent("Switch HUD Scopes (Installed, Formulae, Casks, Upgrades)") {
                     UpkeepKeycapGroup(["⌘1", "–", "⌘4"])
                 }
                 .upkeepSearchTarget("brew.shortcuts")
 
-                LabeledContent("Open Package Actions Menu") {
+                LabeledContent("Package Actions Menu") {
                     UpkeepKeycapGroup(["⌘", "K"])
                 }
 
-                LabeledContent("Dismiss Search HUD") {
+                LabeledContent("Dismiss Floating HUD") {
                     UpkeepKeycapGroup(["Esc"])
                 }
             }
         }
+        .onAppear {
+            if vm.brewOutdatedCount == 0 && scope == .upgrades {
+                scope = .installed
+            }
+            runSearch()
+        }
+        .onChange(of: vm.brewInstalledCount) { _, _ in
+            runSearch()
+        }
+        .onChange(of: vm.brewOutdatedCount) { _, newOutdated in
+            if newOutdated > 0 && query.isEmpty && scope == .installed {
+                // Keep user's selected scope, just refresh items
+            }
+            runSearch()
+        }
     }
 
-    private var statusSummary: String {
-        if let status = vm.brewStatusText { return status }
-        if !BrewService.isInstalled() { return "Homebrew binary not found" }
-        if vm.brewInstalledCount == 0 { return "Search formulae & casks in a floating Liquid Glass HUD" }
-        if vm.brewOutdatedCount > 0 {
-            return "\(vm.brewInstalledCount) installed · \(vm.brewOutdatedCount) updates available"
+    private var searchPlaceholder: String {
+        switch scope {
+        case .all: return "Search formulae & casks…"
+        case .installed: return "Filter installed packages…"
+        case .formulae: return "Search Homebrew formulae…"
+        case .casks: return "Search Homebrew casks…"
+        case .upgrades: return "Filter outdated packages…"
         }
-        return "\(vm.brewInstalledCount) installed · All packages up to date"
+    }
+
+    @ViewBuilder
+    private var emptyPackagesRow: some View {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        HStack(spacing: 10) {
+            Image(systemName: scope == .upgrades && trimmed.isEmpty ? "checkmark.circle.fill" : "magnifyingglass")
+                .foregroundStyle(scope == .upgrades && trimmed.isEmpty ? Color.green : Color.secondary)
+
+            if !trimmed.isEmpty {
+                Text("No packages matching “\(trimmed)” in \(scope.rawValue).")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if scope == .upgrades {
+                Text("All \(vm.brewInstalledCount) installed packages are up to date.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if scope == .formulae || scope == .casks {
+                Text("Type a package name above to search Homebrew \(scope.rawValue.lowercased()).")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Type a package name to search Homebrew, or switch scopes above.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func brewDownloaderRow(_ pkg: BrewPackageItem) -> some View {
+        let isThisOperating = activePackageID == pkg.id
+
+        return HStack(spacing: 10) {
+            Image(systemName: pkg.isCask ? "app.dashed" : "terminal")
+                .font(.system(size: 13.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(pkg.name)
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+
+                    if !pkg.displayVersion.isEmpty {
+                        Text(pkg.displayVersion)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Text(pkg.isCask ? "Cask" : "Formula")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5.5)
+                        .padding(.vertical, 1)
+                        .background(Color.primary.opacity(0.055), in: Capsule())
+
+                    if pkg.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                if !pkg.description.isEmpty {
+                    Text(pkg.description)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            if isThisOperating {
+                ProgressView()
+                    .controlSize(.small)
+            } else if pkg.isInstalled && pkg.isOutdated {
+                Button("Upgrade") {
+                    performPackageAction(pkg)
+                }
+                .buttonStyle(.upkeepPrimary)
+                .tint(.orange)
+                .controlSize(.small)
+                .disabled(isOperating)
+            } else if pkg.isInstalled {
+                Button("Uninstall") {
+                    performPackageAction(pkg)
+                }
+                .buttonStyle(.upkeepSecondary)
+                .controlSize(.small)
+                .disabled(isOperating)
+            } else {
+                Button("Install") {
+                    performPackageAction(pkg)
+                }
+                .buttonStyle(.upkeepPrimary)
+                .controlSize(.small)
+                .disabled(isOperating)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func runSearch() {
+        searchTask?.cancel()
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentScope = scope
+
+        searchTask = Task {
+            if trimmed.isEmpty {
+                if currentScope == .formulae || currentScope == .casks {
+                    self.packages = []
+                    self.isSearching = false
+                    return
+                }
+                let local = (try? await BrewService.shared.loadInstalledAndOutdated()) ?? []
+                guard !Task.isCancelled else { return }
+                switch currentScope {
+                case .upgrades:
+                    self.packages = local.filter(\.isOutdated)
+                case .installed, .all:
+                    self.packages = local
+                case .formulae, .casks:
+                    self.packages = []
+                }
+                self.isSearching = false
+                return
+            }
+
+            if currentScope == .installed || currentScope == .upgrades {
+                let local = await BrewService.shared.fuzzySearchLocal(query: trimmed, filterCasks: nil)
+                guard !Task.isCancelled else { return }
+                self.packages = currentScope == .upgrades ? local.filter(\.isOutdated) : local
+                self.isSearching = false
+                return
+            }
+
+            let isWarm = await BrewService.shared.hasWarmRemoteIndex()
+            if !isWarm {
+                self.isSearching = true
+            }
+            try? await Task.sleep(for: .milliseconds(isWarm ? 20 : 180))
+            guard !Task.isCancelled else { return }
+
+            if let hits = try? await BrewService.shared.searchRemote(query: trimmed, filterCasks: currentScope.caskFilter),
+               !Task.isCancelled {
+                self.packages = hits
+            }
+            self.isSearching = false
+        }
+    }
+
+    private func performPackageAction(_ pkg: BrewPackageItem) {
+        guard !isOperating else { return }
+        activePackageID = pkg.id
+        vm.brewErrorText = nil
+
+        Task {
+            do {
+                if pkg.isInstalled && pkg.isOutdated {
+                    _ = try await BrewService.shared.upgrade(name: pkg.name)
+                } else if pkg.isInstalled {
+                    _ = try await BrewService.shared.uninstall(name: pkg.name, isCask: pkg.isCask)
+                } else {
+                    _ = try await BrewService.shared.install(name: pkg.name, isCask: pkg.isCask)
+                }
+                vm.refreshOverview(force: true)
+                runSearch()
+            } catch {
+                vm.brewErrorText = error.localizedDescription
+            }
+            activePackageID = nil
+        }
     }
 }
 
@@ -912,13 +1176,13 @@ private struct CleanerWorkspacePane: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 12) {
-                HStack(spacing: 14) {
-                    UpkeepSectionIcon(section: .cleaner, size: 34)
+                HStack(spacing: 12) {
+                    UpkeepSectionIcon(section: .cleaner, size: 28)
 
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 8) {
-                            Text(vm.cleanPreview?.isDryRun == false ? "Cleanup Complete" : "Dry-Run Preview")
-                                .font(.system(size: 14, weight: .semibold))
+                            Text("Cleaner")
+                                .font(.system(size: 18, weight: .semibold))
                                 .foregroundStyle(.primary)
 
                             if let summary = vm.cleanPreview {
@@ -989,11 +1253,12 @@ private struct CleanerWorkspacePane: View {
                     }
                 }
             }
-            .padding(.horizontal, 22)
-            .padding(.vertical, 14)
+            .padding(.horizontal, 24)
+            .padding(.top, 12)
+            .padding(.bottom, 14)
             .upkeepSearchTarget("cleaner.dryRun")
 
-            Divider().opacity(0.22)
+            Divider().opacity(0.18)
 
             if !MoleService.isInstalled() {
                 ContentUnavailableView {
@@ -1079,7 +1344,7 @@ private struct CleanerWorkspacePane: View {
                                 cleanerRow(line, index: idx)
                             }
                         }
-                        .padding(.horizontal, 18)
+                        .padding(.horizontal, 20)
                         .padding(.vertical, 12)
                     }
                     .upkeepSoftTopScrollEdge()
@@ -1103,8 +1368,8 @@ private struct CleanerWorkspacePane: View {
     private var headerSubtitle: String {
         if let summary = vm.cleanPreview {
             return summary.isDryRun
-                ? "\(summary.itemCount) candidate items found · No files deleted yet"
-                : "\(summary.totalReclaimed) reclaimed safely"
+                ? "Dry-run preview · \(summary.itemCount) candidate items · No files deleted yet"
+                : "Cleanup complete · \(summary.totalReclaimed) reclaimed safely"
         }
         return "Inspects system and app caches safely before deleting"
     }
@@ -1156,6 +1421,18 @@ private struct UninstallerWorkspacePane: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 10) {
+                HStack(spacing: 11) {
+                    UpkeepSectionIcon(section: .uninstaller, size: 26)
+                    Text("Uninstaller")
+                        .font(.system(size: 18, weight: .semibold))
+                    Spacer()
+                    if !vm.installedApps.isEmpty {
+                        Text("\(vm.filteredApps.count) of \(vm.installedApps.count) apps")
+                            .font(.footnote.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
                 HStack(spacing: 10) {
                     MenuBarSearchField(
                         text: $vm.appQuery,
@@ -1175,21 +1452,6 @@ private struct UninstallerWorkspacePane: View {
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .frame(width: 120)
-                }
-
-                HStack(spacing: 12) {
-                    Text("Click Remove on any app to preview exact ~/Library leftovers and Homebrew cask status before trashing.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-
-                    Spacer()
-
-                    if !vm.installedApps.isEmpty {
-                        Text("\(vm.filteredApps.count) of \(vm.installedApps.count) apps")
-                            .font(.footnote.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                    }
                 }
 
                 if let status = vm.uninstallStatus {
@@ -1241,11 +1503,12 @@ private struct UninstallerWorkspacePane: View {
                     }
                 }
             }
-            .padding(.horizontal, 22)
-            .padding(.vertical, 14)
+            .padding(.horizontal, 24)
+            .padding(.top, 12)
+            .padding(.bottom, 14)
             .upkeepSearchTarget("uninstaller.apps")
 
-            Divider().opacity(0.22)
+            Divider().opacity(0.18)
 
             if vm.isLoadingApps {
                 VStack(spacing: 10) {
@@ -1305,7 +1568,7 @@ private struct UninstallerWorkspacePane: View {
                             )
                         }
                     }
-                    .padding(.horizontal, 18)
+                    .padding(.horizontal, 20)
                     .padding(.vertical, 12)
                 }
                 .upkeepSoftTopScrollEdge()
@@ -1615,7 +1878,7 @@ private struct UninstallReviewSheet: View {
     }
 }
 
-// MARK: - 5. Updates & System (DockDoor SupportSettingsView + Handy AboutSettings Pattern)
+// MARK: - 5. Updates & System (Canapé Hero Card + Minimalist DockDoor / Handy Rows)
 
 private struct UpdatesSettingsPane: View {
     @Bindable var updater: UpdateManager
@@ -1628,6 +1891,43 @@ private struct UpdatesSettingsPane: View {
 
     var body: some View {
         UpkeepSettingsFormView {
+            Section {
+                UpkeepPaneHeader(section: .updates)
+            }
+
+            // Canapé-style clean app identity & update status hero card
+            Section {
+                HStack(spacing: 14) {
+                    UpkeepAppIconView(size: 42)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 8) {
+                            Text("Upkeep")
+                                .font(.system(size: 14.5, weight: .semibold))
+                            Text("v\(updater.currentVersion)")
+                                .font(.system(size: 12, design: .rounded))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(lastCheckDescription)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    updateStatusBadge
+
+                    Button("Check Now") {
+                        Task { await updater.checkForUpdates() }
+                    }
+                    .buttonStyle(.upkeepSecondary)
+                    .controlSize(.regular)
+                    .disabled(updater.isChecking || updater.isInstalling)
+                }
+                .padding(.vertical, 4)
+                .upkeepSearchTarget("updates.releases")
+            }
+
             if let error = updater.errorMessage {
                 Section {
                     UpkeepSettingsCallout(
@@ -1642,79 +1942,8 @@ private struct UpdatesSettingsPane: View {
                 }
             }
 
-            UpkeepSettingsSection(
-                "Upkeep Releases",
-                footer: "Automatic update checks run quietly every 6 hours when a GitHub repository is configured."
-            ) {
-                HStack(spacing: 12) {
-                    UpkeepSettingsIcon(systemName: "checkmark.seal.fill", color: .green, size: 26)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Current Version")
-                            .font(.system(size: 13, weight: .medium))
-                        Text("Upkeep v\(updater.currentVersion)")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-
-                    updateStatusBadge
-                }
-                .padding(.vertical, 2)
-                .upkeepSearchTarget("updates.releases")
-
-                HStack(spacing: 12) {
-                    UpkeepSettingsIcon(systemName: "arrow.triangle.2.circlepath", color: .orange, size: 26)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Check for Updates")
-                            .font(.system(size: 13, weight: .medium))
-                        Text(lastCheckDescription)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-
-                    Button("Check Now") {
-                        Task { await updater.checkForUpdates() }
-                    }
-                    .buttonStyle(.upkeepSecondary)
-                    .controlSize(.small)
-                    .disabled(updater.isChecking || updater.isInstalling)
-                }
-                .padding(.vertical, 2)
-
-                Toggle(isOn: $updater.autoCheckUpdates) {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "clock.arrow.2.circlepath", color: .purple)
-                        Text("Automatically check for updates")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                }
-
-                LabeledContent {
-                    TextField("owner/Upkeep", text: $updater.githubRepo)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 220)
-                } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "chevron.left.forwardslash.chevron.right", color: .blue)
-                        Text("GitHub Repository")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                }
-
-                if updater.githubRepo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    UpkeepSettingsCallout(
-                        tone: .info,
-                        icon: "info.circle.fill",
-                        message: "Enter a public GitHub repository (for example, `manavo-o/Upkeep`) to enable automatic app release checks."
-                    )
-                }
-
-                if let release = updater.availableRelease {
+            if let release = updater.availableRelease {
+                Section {
                     UpkeepSettingsCallout(
                         tone: .success,
                         icon: "arrow.down.circle.fill",
@@ -1724,6 +1953,23 @@ private struct UpdatesSettingsPane: View {
                     ) {
                         Task { await updater.installAvailableUpdate() }
                     }
+                }
+            }
+
+            UpkeepSettingsSection(
+                "Releases",
+                footer: "Automatic update checks run quietly every 6 hours when a GitHub repository is configured."
+            ) {
+                Toggle(isOn: $updater.autoCheckUpdates) {
+                    UpkeepSettingLabel("Automatically check for updates")
+                }
+
+                LabeledContent {
+                    TextField("owner/Upkeep", text: $updater.githubRepo)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 220)
+                } label: {
+                    UpkeepSettingLabel("GitHub Repository")
                 }
 
                 if let status = updater.statusMessage {
@@ -1745,16 +1991,10 @@ private struct UpdatesSettingsPane: View {
                     .controlSize(.small)
                     .disabled(updater.isInstalling)
                 } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "terminal.fill", color: .indigo)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Mole & Homebrew")
-                                .font(.system(size: 13, weight: .medium))
-                            Text("Runs `mo update` and `brew update` in parallel")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
+                    UpkeepSettingLabel(
+                        "Mole & Homebrew",
+                        subtitle: "Runs `mo update` and `brew update` in parallel."
+                    )
                 }
                 .upkeepSearchTarget("updates.cli")
             }
@@ -1793,13 +2033,11 @@ private struct UpdatesSettingsPane: View {
 
             UpkeepSettingsSection("Preferences & Application") {
                 Toggle(isOn: $showDescriptions) {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "text.alignleft", color: .teal)
-                        Text("Show setting descriptions")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel(
+                        "Show setting descriptions",
+                        subtitle: "Display brief explanations underneath settings rows across Upkeep."
+                    )
                 }
-                .upkeepAnnotation("Display brief explanations underneath settings rows across Upkeep.")
                 .upkeepSearchTarget("updates.preferences")
 
                 LabeledContent {
@@ -1809,11 +2047,7 @@ private struct UpdatesSettingsPane: View {
                     .buttonStyle(.upkeepSecondary)
                     .controlSize(.small)
                 } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "arrow.counterclockwise", color: .orange)
-                        Text("Reset Preferences to Defaults")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel("Reset Preferences to Defaults")
                 }
 
                 LabeledContent {
@@ -1831,11 +2065,7 @@ private struct UpdatesSettingsPane: View {
                         .controlSize(.small)
                     }
                 } label: {
-                    HStack(spacing: 10) {
-                        UpkeepSettingsIcon(systemName: "power", color: .red)
-                        Text("Application Lifecycle")
-                            .font(.system(size: 13, weight: .medium))
-                    }
+                    UpkeepSettingLabel("Application Lifecycle")
                 }
             }
         }
@@ -1858,7 +2088,7 @@ private struct UpdatesSettingsPane: View {
     private var lastCheckDescription: String {
         if let lastCheck = updater.lastCheckedAt {
             let formatted = lastCheck.formatted(date: .abbreviated, time: .shortened)
-            return "Last checked: \(formatted)"
+            return "Last checked \(formatted)"
         }
         return "No recent checks"
     }
@@ -1869,17 +2099,25 @@ private struct UpdatesSettingsPane: View {
             ProgressView()
                 .controlSize(.small)
         } else if let release = updater.availableRelease {
-            Label("v\(release.version) available", systemImage: "arrow.down.circle.fill")
-                .font(.system(size: 12, weight: .medium))
+            Text("v\(release.version)")
+                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
                 .foregroundStyle(.blue)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.blue.opacity(0.14), in: Capsule())
         } else if updater.errorMessage != nil {
-            Label("Check Failed", systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 12, weight: .medium))
+            Text("Error")
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.orange)
         } else {
-            Label("Up to Date", systemImage: "checkmark.circle.fill")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.green)
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 7, height: 7)
+                Text("Up to Date")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

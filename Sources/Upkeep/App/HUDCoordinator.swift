@@ -6,10 +6,10 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
     public static let shared = HUDCoordinator()
 
     public let trayViewModel = TrayViewModel()
+    public let homebrewModel = HomebrewHUDModel()
 
     private var mainWindowController: NSWindowController?
     private var homebrewPanel: LiquidGlassPanel?
-    private let homebrewModel = HomebrewHUDModel()
     private var homebrewGlobalClickMonitor: Any?
     private var homebrewLocalClickMonitor: Any?
     private var cleaningPanel: LiquidGlassPanel?
@@ -17,6 +17,13 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
 
     private override init() {
         super.init()
+        homebrewModel.onCatalogChanged = { [weak self] in
+            self?.trayViewModel.refreshOverview(force: true)
+        }
+        homebrewModel.onOpenInSettings = { [weak self] in
+            self?.hideHomebrewHUD()
+            self?.showMainWindow(section: .homebrew)
+        }
         CleaningModeManager.shared.setStateHandler { [weak self] isLocked in
             if isLocked {
                 self?.showCleaningHUD()
@@ -44,16 +51,18 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             let hostingController = NSHostingController(rootView: rootView)
 
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
+                contentRect: NSRect(x: 0, y: 0, width: 880, height: 610),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
             )
-            window.minSize = NSSize(width: 780, height: 520)
+            window.minSize = NSSize(width: 740, height: 500)
             window.contentViewController = hostingController
             window.isReleasedWhenClosed = false
             window.delegate = self
             window.title = ""
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
             window.toolbarStyle = .unified
 
             let toolbar = NSToolbar(identifier: "UpkeepMainToolbar")
@@ -106,7 +115,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         NSApp.terminate(nil)
     }
 
-    // MARK: - Sidebar Width Enforcement (DockDoor pattern — prevents label truncation)
+    // MARK: - Sidebar Width Enforcement (DockDoor / Canapé clean proportions)
 
     private func enforceSidebarWidth(on window: NSWindow?) {
         guard let window else { return }
@@ -132,9 +141,9 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             sidebarItem.isCollapsed = false
             sidebarItem.canCollapse = false
             sidebarItem.holdingPriority = .defaultHigh
-            sidebarItem.minimumThickness = 232
-            sidebarItem.maximumThickness = 232
-            splitView.setPosition(232, ofDividerAt: 0)
+            sidebarItem.minimumThickness = 216
+            sidebarItem.maximumThickness = 216
+            splitView.setPosition(216, ofDividerAt: 0)
         }
     }
 
@@ -209,11 +218,15 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         NSApp.windowsMenu = windowMenu
     }
 
-    // MARK: - Homebrew Floating HUD (Click-Outside Dismissal)
+    // MARK: - Homebrew Floating HUD (Click-Outside Dismissal + Settings Handoff)
 
-    public func showHomebrewHUD(initialQuery: String? = nil) {
-        if let query = initialQuery, !query.isEmpty {
+    public func showHomebrewHUD(initialQuery: String? = nil, initialTab: BrewHUDTab? = nil) {
+        if let query = initialQuery {
             homebrewModel.query = query
+            homebrewModel.activeTab = initialTab
+        } else if let initialTab {
+            homebrewModel.query = ""
+            homebrewModel.activeTab = initialTab
         } else {
             homebrewModel.query = ""
             homebrewModel.activeTab = nil
@@ -225,7 +238,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         }
         if homebrewPanel == nil {
             let panel = LiquidGlassPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 712, height: 480),
+                contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
                 level: .floating,
                 useWindowGlass: false
             ) {
@@ -239,7 +252,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         updateHomebrewPanelHeight(isCategoryMenu: homebrewModel.isShowingCategoryMenu)
         homebrewPanel?.presentCenteredAtHUDHeight()
         installHomebrewClickOutsideMonitors()
-        if let query = initialQuery, !query.isEmpty {
+        if (initialQuery != nil && !(initialQuery?.isEmpty ?? true)) || initialTab != nil {
             homebrewModel.onQueryChanged()
         }
     }
@@ -294,7 +307,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
 
     public func updateHomebrewPanelHeight(isCategoryMenu: Bool) {
         guard let panel = homebrewPanel else { return }
-        let targetHeight: CGFloat = isCategoryMenu ? 340 : 480
+        let targetHeight: CGFloat = isCategoryMenu ? 344 : 520
         var frame = panel.frame
         if frame.height != targetHeight {
             let dy = frame.height - targetHeight

@@ -29,7 +29,9 @@ pub struct BrewPackage {
 struct IndexedPackage {
     pkg: BrewPackage,
     api_version: String,
-    haystack: Utf32String,
+    name_lower: String,
+    name_haystack: Utf32String,
+    desc_haystack: Utf32String,
 }
 
 impl IndexedPackage {
@@ -39,14 +41,16 @@ impl IndexedPackage {
     }
 
     fn with_api_version(pkg: BrewPackage, api_version: String) -> Self {
-        let mut raw = String::with_capacity(pkg.name.len() + 1 + pkg.description.len());
-        raw.push_str(&pkg.name);
-        if !pkg.description.is_empty() {
-            raw.push(' ');
-            raw.push_str(&pkg.description);
+        let name_lower = pkg.name.to_ascii_lowercase();
+        let name_haystack = Utf32String::from(pkg.name.as_str());
+        let desc_haystack = Utf32String::from(pkg.description.as_str());
+        Self {
+            pkg,
+            api_version,
+            name_lower,
+            name_haystack,
+            desc_haystack,
         }
-        let haystack = Utf32String::from(raw);
-        Self { pkg, api_version, haystack }
     }
 }
 
@@ -943,6 +947,70 @@ pub extern "C" fn upkeep_brew_index_installed_json(ptr: *const BrewSearchIndex) 
     result.unwrap_or_else(|_| string_to_cstr("[]".to_string()))
 }
 
+#[inline]
+fn score_indexed_package(
+    item: &IndexedPackage,
+    query_lower: &str,
+    pattern: &Pattern,
+    matcher: &mut Matcher,
+) -> Option<u32> {
+    let installed_bonus: u32 = if item.pkg.is_installed { 180 } else { 0 };
+
+    // Tier 1: Exact name match
+    if item.name_lower == query_lower {
+        return Some(200_000 + installed_bonus);
+    }
+
+    // Tier 2: Prefix name match (prefer shorter, closer names)
+    if item.name_lower.starts_with(query_lower) {
+        let extra = (item.name_lower.len().saturating_sub(query_lower.len()) as u32).min(4_000);
+        return Some(120_000 - extra * 10 + installed_bonus);
+    }
+
+    // Tier 3: Substring name match (prefer earlier position & word boundary)
+    if let Some(pos) = item.name_lower.find(query_lower) {
+        let boundary_bonus: u32 = if pos > 0 {
+            let prev = item.name_lower.as_bytes()[pos - 1];
+            if prev == b'-' || prev == b'_' || prev == b'@' || prev == b'/' || prev == b'.' {
+                5_000
+            } else {
+                0
+            }
+        } else {
+            5_000
+        };
+        let pos_penalty = (pos as u32).min(500) * 40;
+        let len_penalty = (item.name_lower.len().saturating_sub(query_lower.len()) as u32).min(500) * 15;
+        return Some(75_000 + boundary_bonus - pos_penalty - len_penalty + installed_bonus);
+    }
+
+    // Tier 4: Fuzzy name match (nucleo on package name only)
+    if let Some(name_score) = pattern.score(item.name_haystack.slice(..), matcher) {
+        let len_penalty = (item.name_lower.len() as u32).min(200) * 10;
+        return Some(25_000u32.saturating_add(name_score).saturating_sub(len_penalty) + installed_bonus);
+    }
+
+    // Tier 5: Description match — require exact substring match for short queries (< 4 chars)
+    // or strong word/substring presence so scattered letters never pollute top results
+    if !item.pkg.description.is_empty() {
+        let desc_bytes = item.pkg.description.as_bytes();
+        let q_bytes = query_lower.as_bytes();
+        if contains_ascii_case_insensitive(desc_bytes, q_bytes) {
+            let desc_score = pattern.score(item.desc_haystack.slice(..), matcher).unwrap_or(100);
+            return Some(8_000u32.saturating_add(desc_score) + installed_bonus);
+        }
+        if query_lower.len() >= 4 {
+            if let Some(desc_score) = pattern.score(item.desc_haystack.slice(..), matcher) {
+                if desc_score >= (query_lower.len() as u32) * 28 {
+                    return Some(desc_score.min(4_000) + installed_bonus);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn parallel_score_indices(
     items: &[IndexedPackage],
     query: &str,
@@ -955,7 +1023,8 @@ fn parallel_score_indices(
         _ => true,
     };
 
-    if query.trim().is_empty() {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
         return items
             .iter()
             .enumerate()
@@ -965,7 +1034,8 @@ fn parallel_score_indices(
             .collect();
     }
 
-    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let query_lower = trimmed.to_ascii_lowercase();
+    let pattern = Pattern::parse(trimmed, CaseMatching::Smart, Normalization::Smart);
 
     // Avoid Rayon thread-pool wakeup overhead for small local catalogs (< 1024 items).
     let mut scored: Vec<(u32, u32)> = if items.len() < 1024 {
@@ -977,7 +1047,7 @@ fn parallel_score_indices(
                 .enumerate()
                 .filter(|(_, item)| matches_filter(&item.pkg))
                 .filter_map(|(idx, item)| {
-                    let score = pattern.score(item.haystack.slice(..), matcher)?;
+                    let score = score_indexed_package(item, &query_lower, &pattern, matcher)?;
                     Some((score, idx as u32))
                 })
                 .collect()
@@ -990,7 +1060,7 @@ fn parallel_score_indices(
             .map_init(
                 || Matcher::new(Config::DEFAULT),
                 |matcher, (idx, item)| {
-                    let score = pattern.score(item.haystack.slice(..), matcher)?;
+                    let score = score_indexed_package(item, &query_lower, &pattern, matcher)?;
                     Some((score, idx as u32))
                 },
             )
@@ -1002,7 +1072,11 @@ fn parallel_score_indices(
         scored.select_nth_unstable_by(limit, |a, b| b.0.cmp(&a.0));
         scored.truncate(limit);
     }
-    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_unstable_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            cmp_ignore_ascii_case(&items[a.1 as usize].pkg.name, &items[b.1 as usize].pkg.name)
+        })
+    });
     scored
 }
 

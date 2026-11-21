@@ -9,7 +9,7 @@ public enum BrewHUDTab: Int, CaseIterable, Identifiable {
 
     public var id: Int { rawValue }
 
-    var title: String {
+    public var title: String {
         switch self {
         case .installed: return "Installed"
         case .formulae: return "Formulae"
@@ -18,7 +18,7 @@ public enum BrewHUDTab: Int, CaseIterable, Identifiable {
         }
     }
 
-    var icon: String {
+    public var icon: String {
         switch self {
         case .installed: return "shippingbox"
         case .formulae: return "terminal"
@@ -27,7 +27,7 @@ public enum BrewHUDTab: Int, CaseIterable, Identifiable {
         }
     }
 
-    var shortcutLabel: String { "⌘\(rawValue)" }
+    public var shortcutLabel: String { "⌘\(rawValue)" }
 }
 
 @MainActor
@@ -41,9 +41,18 @@ public final class HomebrewHUDModel {
     public var showActionMenu: Bool = false
     public var statusBanner: String?
     public var errorBanner: String?
+    public var activeOperationPackageID: String?
+    public var copiedPackageID: String?
+
+    public var onCatalogChanged: (() -> Void)?
+    public var onOpenInSettings: (() -> Void)?
 
     private var searchTask: Task<Void, Never>?
     private var loadTask: Task<Void, Never>?
+
+    public var isOperating: Bool {
+        activeOperationPackageID != nil
+    }
 
     public var isShowingCategoryMenu: Bool {
         query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && activeTab == nil
@@ -101,18 +110,26 @@ public final class HomebrewHUDModel {
         }
 
         searchTask = Task {
-            let local = await BrewService.shared.fuzzySearchLocal(query: currentQuery, filterCasks: caskFilter)
-            guard !Task.isCancelled else { return }
-            if !local.isEmpty {
-                self.packages = filterForTab(local)
-                self.selectedID = self.packages.first?.id
+            // Only seed from local installed packages when searching Installed/Upgrades or before remote index is warm
+            let isWarm = await BrewService.shared.hasWarmRemoteIndex()
+            if !isWarm || activeTab == .installed || activeTab == .upgrades {
+                let local = await BrewService.shared.fuzzySearchLocal(query: currentQuery, filterCasks: caskFilter)
+                guard !Task.isCancelled else { return }
+                if !local.isEmpty {
+                    self.packages = filterForTab(local)
+                    self.selectedID = self.packages.first?.id
+                }
             }
 
-            // Skip artificial 220ms lag when the remote catalog is already warm in memory (~1-3ms search)
-            let isWarm = await BrewService.shared.hasWarmRemoteIndex()
-            let debounceMs = isWarm ? 25 : 220
+            // Skip artificial lag when the remote catalog is already warm in memory (~1-3ms search)
+            let debounceMs = isWarm ? 20 : 200
             try? await Task.sleep(for: .milliseconds(debounceMs))
             guard !Task.isCancelled else { return }
+
+            if activeTab == .installed || activeTab == .upgrades {
+                self.isLoading = false
+                return
+            }
 
             if !isWarm {
                 self.isLoading = true
@@ -146,36 +163,39 @@ public final class HomebrewHUDModel {
     }
 
     public func performPrimaryAction(for item: BrewPackageItem) {
+        guard !isOperating else { return }
         showActionMenu = false
         if item.isInstalled && item.isOutdated {
-            runAsync(label: "Upgrading \(item.name)…", success: "Upgraded \(item.name)") {
+            runAsync(packageID: item.id, label: "Upgrading \(item.name)…", success: "Upgraded \(item.name)") {
                 _ = try await BrewService.shared.upgrade(name: item.name)
             }
         } else if item.isInstalled {
             uninstall(item)
         } else {
-            runAsync(label: "Installing \(item.name)…", success: "Installed \(item.name)") {
+            runAsync(packageID: item.id, label: "Installing \(item.name)…", success: "Installed \(item.name)") {
                 _ = try await BrewService.shared.install(name: item.name, isCask: item.isCask)
             }
         }
     }
 
     public func uninstall(_ item: BrewPackageItem) {
+        guard !isOperating else { return }
         showActionMenu = false
-        runAsync(label: "Uninstalling \(item.name)…", success: "Uninstalled \(item.name)") {
+        runAsync(packageID: item.id, label: "Uninstalling \(item.name)…", success: "Uninstalled \(item.name)") {
             _ = try await BrewService.shared.uninstall(name: item.name, isCask: item.isCask)
         }
     }
 
     public func togglePin(_ item: BrewPackageItem) {
+        guard !isOperating else { return }
         showActionMenu = false
         guard !item.isCask else { return }
         if item.isPinned {
-            runAsync(label: "Unpinning \(item.name)…", success: "Unpinned \(item.name)") {
+            runAsync(packageID: item.id, label: "Unpinning \(item.name)…", success: "Unpinned \(item.name)") {
                 _ = try await BrewService.shared.unpin(name: item.name)
             }
         } else {
-            runAsync(label: "Pinning \(item.name)…", success: "Pinned \(item.name)") {
+            runAsync(packageID: item.id, label: "Pinning \(item.name)…", success: "Pinned \(item.name)") {
                 _ = try await BrewService.shared.pin(name: item.name)
             }
         }
@@ -187,6 +207,13 @@ public final class HomebrewHUDModel {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(cmd, forType: .string)
         statusBanner = "Copied `\(cmd)`"
+        copiedPackageID = item.id
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            if self.copiedPackageID == item.id {
+                self.copiedPackageID = nil
+            }
+        }
     }
 
     public func openHomepage(_ item: BrewPackageItem) {
@@ -197,7 +224,9 @@ public final class HomebrewHUDModel {
     }
 
     public func runBrewDoctor() {
+        guard !isOperating else { return }
         showActionMenu = false
+        activeOperationPackageID = "__doctor__"
         statusBanner = "Running `brew doctor`…"
         errorBanner = nil
         Task {
@@ -209,22 +238,39 @@ public final class HomebrewHUDModel {
                 self.errorBanner = error.localizedDescription
                 self.statusBanner = nil
             }
+            self.activeOperationPackageID = nil
         }
     }
 
-    private func runAsync(label: String, success: String, operation: @escaping () async throws -> Void) {
+    private func runAsync(
+        packageID: String,
+        label: String,
+        success: String,
+        operation: @escaping () async throws -> Void
+    ) {
+        activeOperationPackageID = packageID
         statusBanner = label
         errorBanner = nil
         Task {
             do {
                 try await operation()
                 self.statusBanner = success
-                let refreshed = try await BrewService.shared.loadInstalledAndOutdated()
-                self.packages = filterForTab(refreshed)
+                self.onCatalogChanged?()
+                let trimmed = self.query.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    let refreshed = try await BrewService.shared.loadInstalledAndOutdated(forceRefresh: true)
+                    self.packages = filterForTab(refreshed)
+                } else {
+                    _ = try? await BrewService.shared.loadInstalledAndOutdated(forceRefresh: true)
+                    if let remote = try? await BrewService.shared.searchRemote(query: trimmed, filterCasks: caskFilter) {
+                        self.packages = filterForTab(remote)
+                    }
+                }
             } catch {
                 self.errorBanner = error.localizedDescription
                 self.statusBanner = nil
             }
+            self.activeOperationPackageID = nil
         }
     }
 
@@ -248,9 +294,11 @@ public final class HomebrewHUDModel {
 
 /// macOS 27 Golden Gate Liquid Glass Homebrew HUD:
 /// Top 60pt interactive Liquid Glass capsule + detached 20pt-radius Liquid Glass tray
-/// with global ⌘1–⌘4 scope shortcuts, 60/40 split detail preview, and ⌘K Action Menu.
+/// with tiered Rust search, global ⌘1–⌘4 scope shortcuts, larger macOS 27 glass action buttons,
+/// and seamless handoff to the Settings Homebrew manager.
 public struct HomebrewHUDView: View {
     @Bindable var model: HomebrewHUDModel
+    @Bindable var logStore = BrewLogStore.shared
     let onDismiss: () -> Void
     @FocusState private var isSearchFocused: Bool
 
@@ -270,7 +318,7 @@ public struct HomebrewHUDView: View {
             }
         }
         .padding(24)
-        .frame(width: 688)
+        .frame(width: 736)
         .background {
             // Global shortcuts active across both category menu and search results
             Group {
@@ -283,6 +331,9 @@ public struct HomebrewHUDView: View {
                         model.showActionMenu.toggle()
                     }
                 }.keyboardShortcut("k", modifiers: .command)
+                Button("") {
+                    model.onOpenInSettings?()
+                }.keyboardShortcut(",", modifiers: .command)
             }
             .opacity(0)
             .allowsHitTesting(false)
@@ -345,9 +396,12 @@ public struct HomebrewHUDView: View {
                             .font(.system(size: 12, weight: .medium))
                         Text(tab.title)
                             .font(.system(size: 13, weight: .medium))
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
                     .background(.quaternary, in: Capsule())
                 }
                 .buttonStyle(.plain)
@@ -441,16 +495,16 @@ public struct HomebrewHUDView: View {
                         } description: {
                             Text("Start typing a name or keyword to search Homebrew \(tab.title.lowercased()).")
                         }
-                        .frame(height: 220)
+                        .frame(height: 240)
                     } else {
                         ContentUnavailableView(
                             model.isLoading ? "Searching Homebrew…" : "No Matching Packages",
                             systemImage: "shippingbox"
                         )
-                        .frame(height: 220)
+                        .frame(height: 240)
                     }
                 } else {
-                    // 60/40 Split List + Package Detail Preview Pane
+                    // 58/42 Split List + Roomy Detail Pane with macOS 27 Large Glass Buttons
                     HStack(spacing: 0) {
                         ScrollView {
                             LazyVStack(spacing: 2) {
@@ -461,13 +515,13 @@ public struct HomebrewHUDView: View {
                             .padding(.horizontal, 10)
                             .padding(.vertical, 10)
                         }
-                        .frame(width: 390, height: 300)
+                        .frame(width: 400, height: 336)
 
                         Divider().opacity(0.25)
 
                         if let pkg = model.selectedPackage {
                             detailPane(for: pkg)
-                                .frame(width: 250, height: 300)
+                                .frame(width: 288, height: 336)
                         } else {
                             VStack(spacing: 8) {
                                 Image(systemName: "shippingbox")
@@ -477,15 +531,25 @@ public struct HomebrewHUDView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            .frame(width: 250, height: 300)
+                            .frame(width: 288, height: 336)
                         }
                     }
                 }
 
-                // Bottom Action & Status Strip with ⌘K Popover Anchor
+                // Bottom Action & Live Transfer Strip with ⌘K Popover Anchor
                 Divider().opacity(0.2)
                 HStack(spacing: 10) {
-                    if let status = model.statusBanner {
+                    if logStore.isRunning, let live = logStore.liveStatusLine {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text(live)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                    } else if let status = model.statusBanner {
                         Text(status)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -499,6 +563,22 @@ public struct HomebrewHUDView: View {
                     Spacer()
 
                     Button {
+                        model.onOpenInSettings?()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "macwindow")
+                            Text("Settings")
+                        }
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(.quaternary.opacity(0.7), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open Homebrew in Upkeep Settings (⌘,)")
+
+                    Button {
                         model.showActionMenu.toggle()
                     } label: {
                         HStack(spacing: 4) {
@@ -507,8 +587,8 @@ public struct HomebrewHUDView: View {
                                 .foregroundStyle(.tertiary)
                         }
                         .font(.caption.weight(.medium))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
                         .background(.quaternary, in: Capsule())
                     }
                     .buttonStyle(.plain)
@@ -517,47 +597,80 @@ public struct HomebrewHUDView: View {
                     }
                 }
                 .padding(.horizontal, 18)
-                .padding(.vertical, 8)
+                .padding(.vertical, 9)
             }
         }
         .upkeepGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func detailPane(for pkg: BrewPackageItem) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: pkg.isCask ? "app.dashed" : "terminal")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.tint)
-                Text(pkg.name)
-                    .font(.system(size: 15, weight: .semibold))
-                    .lineLimit(1)
+        let isThisOperating = model.activeOperationPackageID == pkg.id
+        let isCopied = model.copiedPackageID == pkg.id
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                UpkeepSettingsIcon(
+                    systemName: pkg.isCask ? "app.dashed" : "terminal",
+                    color: pkg.isOutdated ? .orange : MenuBarTheme.Colors.homebrew,
+                    size: 30
+                )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pkg.name)
+                        .font(.system(size: 16, weight: .semibold))
+                        .lineLimit(1)
+
+                    HStack(spacing: 6) {
+                        Text(pkg.isCask ? "Cask" : "Formula")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+
+                        if !pkg.displayVersion.isEmpty {
+                            Text("·")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            Text(pkg.displayVersion)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
             }
 
-            HStack(spacing: 6) {
-                Text(pkg.isCask ? "Cask" : "Formula")
-                    .font(.caption2.weight(.medium))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(.quaternary, in: Capsule())
+            if pkg.isInstalled || pkg.isPinned || pkg.isOutdated {
+                HStack(spacing: 6) {
+                    if pkg.isOutdated {
+                        Label("Update Available", systemImage: "arrow.up.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.orange.opacity(0.16), in: Capsule())
+                    } else if pkg.isInstalled {
+                        Label("Installed", systemImage: "checkmark.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.green)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.green.opacity(0.15), in: Capsule())
+                    }
 
-                if !pkg.version.isEmpty {
-                    Text(pkg.version)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-
-                if pkg.isPinned {
-                    Label("Pinned", systemImage: "pin.fill")
-                        .labelStyle(.titleAndIcon)
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
+                    if pkg.isPinned {
+                        Label("Pinned", systemImage: "pin.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.orange.opacity(0.14), in: Capsule())
+                    }
                 }
             }
 
             Text(pkg.description.isEmpty ? "No description available." : pkg.description)
-                .font(.caption)
+                .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
+                .lineLimit(4)
                 .fixedSize(horizontal: false, vertical: true)
 
             if !pkg.homepage.isEmpty {
@@ -566,7 +679,7 @@ public struct HomebrewHUDView: View {
                 } label: {
                     Label(pkg.homepage, systemImage: "safari")
                         .labelStyle(.titleAndIcon)
-                        .font(.caption2)
+                        .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
@@ -574,24 +687,82 @@ public struct HomebrewHUDView: View {
                 .foregroundStyle(.tint)
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
-            HStack(spacing: 8) {
-                Button(pkg.isInstalled ? (pkg.isOutdated ? "Upgrade" : "Uninstall") : "Install") {
+            // Large macOS 27 Liquid Glass Action Buttons
+            VStack(spacing: 8) {
+                Button {
                     model.performPrimaryAction(for: pkg)
+                } label: {
+                    HStack(spacing: 7) {
+                        if isThisOperating {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: primaryActionIcon(for: pkg))
+                                .font(.system(size: 13.5, weight: .semibold))
+                        }
+                        Text(primaryActionLabel(for: pkg, isOperating: isThisOperating))
+                            .font(.system(size: 13.5, weight: .semibold))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 2)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                .buttonStyle(.upkeepPrimary)
+                .tint(primaryActionTint(for: pkg))
+                .controlSize(.large)
+                .disabled(model.isOperating)
 
-                Button("Copy CLI") {
-                    model.copyInstallCommand(pkg)
+                HStack(spacing: 8) {
+                    Button {
+                        model.copyInstallCommand(pkg)
+                    } label: {
+                        Label(isCopied ? "Copied" : "Copy CLI", systemImage: isCopied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.upkeepSecondary)
+                    .controlSize(.large)
+
+                    if !pkg.homepage.isEmpty {
+                        Button {
+                            model.openHomepage(pkg)
+                        } label: {
+                            Image(systemName: "safari")
+                                .font(.system(size: 13.5, weight: .medium))
+                        }
+                        .buttonStyle(.upkeepSecondary)
+                        .controlSize(.large)
+                        .help("Open Homepage")
+                    }
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
         }
-        .padding(16)
+        .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func primaryActionLabel(for pkg: BrewPackageItem, isOperating: Bool) -> String {
+        if isOperating {
+            if pkg.isInstalled && pkg.isOutdated { return "Upgrading…" }
+            if pkg.isInstalled { return "Uninstalling…" }
+            return "Installing…"
+        }
+        if pkg.isInstalled && pkg.isOutdated { return "Upgrade" }
+        if pkg.isInstalled { return "Uninstall" }
+        return "Install"
+    }
+
+    private func primaryActionIcon(for pkg: BrewPackageItem) -> String {
+        if pkg.isInstalled && pkg.isOutdated { return "arrow.up.circle.fill" }
+        if pkg.isInstalled { return "trash" }
+        return "arrow.down.circle.fill"
+    }
+
+    private func primaryActionTint(for pkg: BrewPackageItem) -> Color {
+        if pkg.isInstalled && pkg.isOutdated { return .orange }
+        if pkg.isInstalled { return .red }
+        return .accentColor
     }
 
     @ViewBuilder
@@ -599,9 +770,10 @@ public struct HomebrewHUDView: View {
         if let pkg = model.selectedPackage {
             VStack(alignment: .leading, spacing: 2) {
                 actionMenuRow(
-                    pkg.isInstalled ? (pkg.isOutdated ? "Upgrade \(pkg.name)" : "Reinstall / Uninstall") : "Install \(pkg.name)",
-                    icon: pkg.isInstalled ? "arrow.up.circle" : "arrow.down.circle",
-                    shortcut: "↩"
+                    pkg.isInstalled ? (pkg.isOutdated ? "Upgrade \(pkg.name)" : "Uninstall \(pkg.name)") : "Install \(pkg.name)",
+                    icon: pkg.isInstalled ? (pkg.isOutdated ? "arrow.up.circle" : "trash") : "arrow.down.circle",
+                    shortcut: "↩",
+                    destructive: pkg.isInstalled && !pkg.isOutdated
                 ) {
                     model.performPrimaryAction(for: pkg)
                 }
@@ -616,7 +788,7 @@ public struct HomebrewHUDView: View {
                     }
                 }
 
-                if pkg.isInstalled {
+                if pkg.isInstalled && pkg.isOutdated {
                     actionMenuRow("Uninstall \(pkg.name)", icon: "trash", shortcut: "⌘⌫", destructive: true) {
                         model.uninstall(pkg)
                     }
@@ -634,12 +806,16 @@ public struct HomebrewHUDView: View {
                     }
                 }
 
+                actionMenuRow("Open in Upkeep Settings", icon: "macwindow", shortcut: "⌘,") {
+                    model.onOpenInSettings?()
+                }
+
                 actionMenuRow("Run Brew Doctor", icon: "stethoscope", shortcut: "⌘D") {
                     model.runBrewDoctor()
                 }
             }
             .padding(8)
-            .frame(width: 240)
+            .frame(width: 248)
         }
     }
 
@@ -671,24 +847,28 @@ public struct HomebrewHUDView: View {
 
     private func packageRow(_ pkg: BrewPackageItem) -> some View {
         let isSelected = model.selectedID == pkg.id
+        let isOperatingHere = model.activeOperationPackageID == pkg.id
+
         return Button {
             model.selectedID = pkg.id
         } label: {
             HStack(spacing: 12) {
                 Image(systemName: pkg.isCask ? "app.dashed" : "terminal")
-                    .font(.system(size: 15, weight: .regular))
+                    .font(.system(size: 14.5, weight: .regular))
                     .frame(width: 22)
                     .foregroundStyle(isSelected ? .primary : .secondary)
 
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(pkg.name)
-                            .font(.system(size: 14, weight: .medium))
+                            .font(.system(size: 13.5, weight: .medium))
                             .lineLimit(1)
-                        Text(pkg.version)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        if !pkg.displayVersion.isEmpty {
+                            Text(pkg.displayVersion)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
                     if !pkg.description.isEmpty {
                         Text(pkg.description)
@@ -700,7 +880,12 @@ public struct HomebrewHUDView: View {
 
                 Spacer()
 
-                statusBadge(for: pkg)
+                if isOperatingHere {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    statusBadge(for: pkg)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -717,17 +902,18 @@ public struct HomebrewHUDView: View {
     private func statusBadge(for pkg: BrewPackageItem) -> some View {
         if pkg.isOutdated {
             Text("Update")
-                .font(.caption2.weight(.medium))
-                .padding(.horizontal, 7)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 8)
                 .padding(.vertical, 3)
-                .background(.orange.opacity(0.22), in: Capsule())
+                .background(.orange.opacity(0.18), in: Capsule())
         } else if pkg.isInstalled {
             Text("Installed")
-                .font(.caption2)
+                .font(.caption2.weight(.medium))
                 .foregroundStyle(.tertiary)
         } else {
             Text("Install")
-                .font(.caption2)
+                .font(.caption2.weight(.medium))
                 .foregroundStyle(.secondary)
         }
     }

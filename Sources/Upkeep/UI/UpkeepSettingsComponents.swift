@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// MARK: - macOS 27 Native Settings Components (Inspired by Apple System Settings, DockDoor & Handy)
+// MARK: - macOS 27 Native Settings Components (Inspired by Canapé, DockDoor, Handy & Apple System Settings)
 
 /// Preference key for toggling inline setting descriptions across Upkeep (DockDoor pattern).
 public enum UpkeepSettingsPreferences {
@@ -66,41 +66,85 @@ public extension PrimitiveButtonStyle where Self == UpkeepPrimaryButtonStyle {
     }
 }
 
-// MARK: - Native Grouped Settings Form Container (with Search Scroll-To Support)
+// MARK: - Native Centered Grouped Settings Form Container (DockDoor / Handy / Canapé Column Rhythm)
 
 public struct UpkeepSettingsFormView<Content: View>: View {
     @Environment(\.upkeepScrollTarget) private var scrollTarget
+    let maxColumnWidth: CGFloat
     let content: Content
 
-    public init(@ViewBuilder content: () -> Content) {
+    public init(maxColumnWidth: CGFloat = 620, @ViewBuilder content: () -> Content) {
+        self.maxColumnWidth = maxColumnWidth
         self.content = content()
     }
 
     public var body: some View {
-        ScrollViewReader { proxy in
-            Form {
-                content
-            }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-            .upkeepSoftTopScrollEdge()
-            .onChange(of: scrollTarget) { _, target in
-                guard let target else { return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                    withAnimation(.easeInOut(duration: 0.28)) {
-                        proxy.scrollTo(target, anchor: .center)
+        GeometryReader { geo in
+            let sideMargin = max(12, (geo.size.width - maxColumnWidth) / 2)
+            ScrollViewReader { proxy in
+                Form {
+                    content
+                }
+                .formStyle(.grouped)
+                .scrollContentBackground(.hidden)
+                .contentMargins(.horizontal, sideMargin, for: .scrollContent)
+                .contentMargins(.top, 8, for: .scrollContent)
+                .contentMargins(.bottom, 24, for: .scrollContent)
+                .upkeepSoftTopScrollEdge()
+                .onChange(of: scrollTarget) { _, target in
+                    guard let target else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            proxy.scrollTo(target, anchor: .center)
+                        }
                     }
                 }
-            }
-            .onAppear {
-                guard let target = scrollTarget else { return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    withAnimation(.easeInOut(duration: 0.28)) {
-                        proxy.scrollTo(target, anchor: .center)
+                .onAppear {
+                    guard let target = scrollTarget else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            proxy.scrollTo(target, anchor: .center)
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+// MARK: - Canapé-Style Minimalist Pane Header (Icon + Title, Zero Heavy Divider Chrome)
+
+public struct UpkeepPaneHeader: View {
+    let section: TraySection
+    let trailing: AnyView?
+
+    public init(section: TraySection) {
+        self.section = section
+        self.trailing = nil
+    }
+
+    public init<Trailing: View>(section: TraySection, @ViewBuilder trailing: () -> Trailing) {
+        self.section = section
+        self.trailing = AnyView(trailing())
+    }
+
+    public var body: some View {
+        HStack(spacing: 11) {
+            UpkeepSectionIcon(section: section, size: 26)
+
+            Text(section.rawValue)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.primary)
+
+            Spacer(minLength: 8)
+
+            if let trailing {
+                trailing
+            }
+        }
+        .padding(.bottom, 2)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 4, leading: 2, bottom: 4, trailing: 2))
     }
 }
 
@@ -122,6 +166,8 @@ public struct UpkeepSettingsSection<Content: View>: View {
             content
         } header: {
             Text(title)
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.secondary)
         } footer: {
             if let footer {
                 Text(footer)
@@ -132,7 +178,37 @@ public struct UpkeepSettingsSection<Content: View>: View {
     }
 }
 
-// MARK: - Row Icon Badge (DockDoor / System Settings Pattern)
+// MARK: - Handy-Style Inline Info Popover Button
+
+public struct UpkeepInfoButton: View {
+    let text: String
+    @State private var isPresented = false
+
+    public init(_ text: String) {
+        self.text = text
+    }
+
+    public var body: some View {
+        Button {
+            isPresented.toggle()
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.system(size: 12))
+                .foregroundStyle(.tertiary)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            Text(text)
+                .font(.footnote)
+                .multilineTextAlignment(.leading)
+                .padding(12)
+                .frame(width: 280, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - Row Icon Badge (Reserved for Hero Cards, Banners & Search Results)
 
 public struct UpkeepSettingsIcon: View {
     let systemName: String
@@ -159,17 +235,54 @@ public struct UpkeepSettingsIcon: View {
     }
 }
 
-// MARK: - Inline Setting Description & Info Popover (DockDoor + Handy Pattern)
+// MARK: - Clean Setting Label (Minimalist DockDoor / Handy Typography — No Per-Row Icon Clutter)
+
+public struct UpkeepSettingLabel: View {
+    let title: String
+    let subtitle: String?
+    let info: String?
+
+    @AppStorage(UpkeepSettingsPreferences.showDescriptionsKey) private var showDescriptions = true
+
+    public init(_ title: String, subtitle: String? = nil, info: String? = nil) {
+        self.title = title
+        self.subtitle = subtitle
+        self.info = info
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 5) {
+                Text(title)
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(.primary)
+
+                if let info {
+                    UpkeepInfoButton(info)
+                }
+            }
+
+            if showDescriptions, let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+// MARK: - Inline Setting Description & Info Popover (Backward-Compatible Modifier)
 
 public struct UpkeepSettingsAnnotationModifier: ViewModifier {
     let summary: String
     let more: String?
 
     @AppStorage(UpkeepSettingsPreferences.showDescriptionsKey) private var showDescriptions = true
-    @State private var isShowingMore = false
 
     public func body(content: Content) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             content
 
             if showDescriptions || more != nil {
@@ -183,22 +296,7 @@ public struct UpkeepSettingsAnnotationModifier: ViewModifier {
                     }
 
                     if let more {
-                        Button {
-                            isShowingMore.toggle()
-                        } label: {
-                            Image(systemName: "info.circle")
-                                .font(.footnote)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .buttonStyle(.plain)
-                        .popover(isPresented: $isShowingMore, arrowEdge: .bottom) {
-                            Text(more)
-                                .font(.footnote)
-                                .multilineTextAlignment(.leading)
-                                .padding(12)
-                                .frame(width: 280, alignment: .leading)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
+                        UpkeepInfoButton(more)
                     }
                 }
             }
@@ -212,7 +310,7 @@ public extension View {
     }
 }
 
-// MARK: - Callout Banner (Warning / Info / Active Status — DockDoor Pattern)
+// MARK: - Callout Banner (Warning / Info / Active Status — DockDoor / Canapé Pattern)
 
 public struct UpkeepSettingsCallout: View {
     public enum Tone {
@@ -283,14 +381,14 @@ public struct UpkeepSettingsCallout: View {
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
                     .buttonStyle(.upkeepSecondary)
-                    .controlSize(.small)
+                    .controlSize(.regular)
             }
         }
         .padding(.vertical, 2)
     }
 }
 
-// MARK: - Permission / Environment Row (DockDoor SupportSettingsView Pattern)
+// MARK: - Minimalist Environment / Permission Status Row
 
 public struct UpkeepStatusRow: View {
     let title: String
@@ -324,26 +422,19 @@ public struct UpkeepStatusRow: View {
 
     public var body: some View {
         HStack(spacing: 12) {
-            UpkeepSettingsIcon(systemName: icon, color: isGranted ? .green : .orange, size: 26)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 13, weight: .medium))
-                Text(description)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
+            UpkeepSettingLabel(title, subtitle: description)
 
             Spacer(minLength: 8)
 
             HStack(spacing: 8) {
-                Label(
-                    isGranted ? grantedLabel : missingLabel,
-                    systemImage: isGranted ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
-                )
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(isGranted ? Color.green : Color.orange)
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(isGranted ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Text(isGranted ? grantedLabel : missingLabel)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(isGranted ? .secondary : Color.orange)
+                }
 
                 if !isGranted, let actionTitle, let action {
                     Button(actionTitle, action: action)
@@ -356,7 +447,7 @@ public struct UpkeepStatusRow: View {
     }
 }
 
-// MARK: - Subtle Reset-to-Default Button (DockDoor Pattern)
+// MARK: - Subtle Reset-to-Default Button (DockDoor / Handy Pattern)
 
 public struct UpkeepResetButton: View {
     let isModified: Bool
