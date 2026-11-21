@@ -24,6 +24,11 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
                 self?.hideCleaningHUD()
             }
         }
+        // Pre-warm Homebrew's 15k-package Rust index quietly in the background 2s after launch
+        Task(priority: .background) {
+            try? await Task.sleep(for: .seconds(2))
+            await BrewService.shared.prewarmIfNeeded()
+        }
     }
 
     // MARK: - Dedicated macOS 27 Native Window (Upkeep)

@@ -113,6 +113,16 @@ public enum UpkeepEngine {
             return Int(loadedCount)
         }
 
+        /// Refreshes local Cellar/Caskroom/pinned state in-place (~5ms) without re-parsing API JSON.
+        @discardableResult
+        public func refreshLocal(prefix: String = "/opt/homebrew") -> Int {
+            guard let ptr else { return 0 }
+            let count: UInt32 = prefix.withCString { pPtr in
+                upkeep_brew_index_refresh_local(ptr, pPtr)
+            }
+            return Int(count)
+        }
+
         /// Returns installed packages (with outdated/pinned/description metadata) from the merged Rust index.
         public func installedPackages() -> [BrewPackageItem] {
             guard let ptr, let rawPtr = upkeep_brew_index_installed_json(ptr) else { return [] }
@@ -535,7 +545,7 @@ public enum UpkeepEngine {
         #endif
     }
 
-    /// Parallel Rust Uninstaller inspector (~/Library leftovers + APFS sizes + Caskroom match).
+    /// Parallel Rust Uninstaller inspector (Mole-parity leftovers + APFS sizes + Caskroom match).
     public static func inspectAppForUninstallRust(
         app: MoleInstalledApp,
         brewPrefix: String = "/opt/homebrew"
@@ -547,10 +557,15 @@ public enum UpkeepEngine {
                 let display_path: String
                 let category: String
                 let size_bytes: UInt64
+                let is_system: Bool?
+                let default_selected: Bool?
+                let holdback_reason: String?
             }
             struct WirePayload: Decodable {
                 let leftovers: [WireLeftover]
                 let homebrew_cask_token: String?
+                let has_sibling_app: Bool?
+                let official_uninstaller_vendor: String?
             }
 
             let rawPtr: UnsafeMutablePointer<CChar>? = app.name.withCString { namePtr in
@@ -573,13 +588,69 @@ public enum UpkeepEngine {
                     path: $0.path,
                     displayPath: $0.display_path,
                     category: $0.category,
-                    sizeBytes: Int64($0.size_bytes)
+                    sizeBytes: Int64($0.size_bytes),
+                    isSystem: $0.is_system ?? false,
+                    defaultSelected: $0.default_selected ?? true,
+                    holdbackReason: $0.holdback_reason
                 )
             }
             return UninstallInspection(
                 app: app,
                 leftovers: leftovers,
-                homebrewCaskToken: decoded.homebrew_cask_token
+                homebrewCaskToken: decoded.homebrew_cask_token,
+                hasSiblingApp: decoded.has_sibling_app ?? false,
+                officialUninstallerVendor: decoded.official_uninstaller_vendor
+            )
+        }.value
+        #else
+        return nil
+        #endif
+    }
+
+    /// Fast parallel native macOS user cache scanner (~50-150ms via Rust getattrlistbulk + Rayon).
+    public static func scanCachesNative() async -> MoleCleanSummary? {
+        #if USE_RUST_UPKEEP_CORE
+        return await Task.detached(priority: .userInitiated) {
+            struct WireCacheItem: Decodable {
+                let category: String
+                let name: String
+                let path: String
+                let size_bytes: UInt64
+            }
+            struct WireCachePayload: Decodable {
+                let total_bytes: UInt64
+                let items: [WireCacheItem]
+            }
+            guard let rawPtr = upkeep_scan_caches_json() else { return nil }
+            defer { upkeep_string_free(rawPtr) }
+            let json = String(cString: rawPtr)
+            guard let payload = try? JSONDecoder().decode(WireCachePayload.self, from: Data(json.utf8)),
+                  !payload.items.isEmpty else {
+                return nil
+            }
+
+            var grouped: [String: [WireCacheItem]] = [:]
+            let order = ["Developer Tools", "User App Caches", "User Logs"]
+            for item in payload.items {
+                grouped[item.category, default: []].append(item)
+            }
+
+            var lines: [String] = []
+            for cat in order {
+                guard let entries = grouped[cat], !entries.isEmpty else { continue }
+                lines.append("➤ \(cat)")
+                for entry in entries.prefix(50) {
+                    let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(entry.size_bytes), countStyle: .file)
+                    lines.append("○ \(entry.name) · \(sizeStr)")
+                }
+            }
+
+            let totalStr = ByteCountFormatter.string(fromByteCount: Int64(payload.total_bytes), countStyle: .file)
+            return MoleCleanSummary(
+                totalReclaimed: totalStr,
+                itemCount: payload.items.count,
+                lines: lines,
+                isDryRun: true
             )
         }.value
         #else

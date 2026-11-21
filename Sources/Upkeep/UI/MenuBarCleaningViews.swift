@@ -644,7 +644,14 @@ public struct AppIconView: View {
             let targetPath = path
             let icon: NSImage? = await Task.detached(priority: .userInitiated) {
                 guard FileManager.default.fileExists(atPath: targetPath) else { return nil }
-                return NSWorkspace.shared.icon(forFile: targetPath)
+                let rawIcon = NSWorkspace.shared.icon(forFile: targetPath)
+                // Downscale to 84x84pt (2x retina for 42pt max) to avoid caching 1024x1024 bitmaps
+                let thumbSize = NSSize(width: 84, height: 84)
+                let thumb = NSImage(size: thumbSize, flipped: false) { rect in
+                    rawIcon.draw(in: rect)
+                    return true
+                }
+                return thumb
             }.value
             if let icon {
                 Self.iconCache.setObject(icon, forKey: key)

@@ -61,12 +61,26 @@ public struct UninstallLeftoverItem: Identifiable, Sendable, Hashable {
     public let displayPath: String
     public let category: String
     public let sizeBytes: Int64
+    public let isSystem: Bool
+    public let defaultSelected: Bool
+    public let holdbackReason: String?
 
-    public init(path: String, displayPath: String, category: String, sizeBytes: Int64) {
+    public init(
+        path: String,
+        displayPath: String,
+        category: String,
+        sizeBytes: Int64,
+        isSystem: Bool = false,
+        defaultSelected: Bool = true,
+        holdbackReason: String? = nil
+    ) {
         self.path = path
         self.displayPath = displayPath
         self.category = category
         self.sizeBytes = sizeBytes
+        self.isSystem = isSystem
+        self.defaultSelected = defaultSelected
+        self.holdbackReason = holdbackReason
     }
 
     public var formattedSize: String {
@@ -79,11 +93,21 @@ public struct UninstallInspection: Sendable, Equatable {
     public let app: MoleInstalledApp
     public let leftovers: [UninstallLeftoverItem]
     public let homebrewCaskToken: String?
+    public let hasSiblingApp: Bool
+    public let officialUninstallerVendor: String?
 
-    public init(app: MoleInstalledApp, leftovers: [UninstallLeftoverItem], homebrewCaskToken: String?) {
+    public init(
+        app: MoleInstalledApp,
+        leftovers: [UninstallLeftoverItem],
+        homebrewCaskToken: String?,
+        hasSiblingApp: Bool = false,
+        officialUninstallerVendor: String? = nil
+    ) {
         self.app = app
         self.leftovers = leftovers
         self.homebrewCaskToken = homebrewCaskToken
+        self.hasSiblingApp = hasSiblingApp
+        self.officialUninstallerVendor = officialUninstallerVendor
     }
 
     public var leftoversTotalBytes: Int64 {
@@ -112,16 +136,29 @@ public actor MoleService {
         UpkeepEngine.parseMoleCleanOutput(raw, isDryRun: isDryRun)
     }
 
-    public func dryRunClean() async throws -> MoleCleanSummary {
-        let result = try await CLIExecutor.run(binary: "mo", arguments: ["clean", "--dry-run"])
+    /// Fast native Rust cache scan (~50-150ms via getattrlistbulk) with Mole fallback.
+    public func fastScanCaches() async -> MoleCleanSummary? {
+        await UpkeepEngine.scanCachesNative()
+    }
+
+    public func dryRunClean(onLine: (@Sendable (String) -> Void)? = nil) async throws -> MoleCleanSummary {
+        let result = try await CLIExecutor.runStreaming(
+            binary: "mo",
+            arguments: ["clean", "--dry-run"],
+            onLine: onLine
+        )
         guard result.succeeded else {
             throw CLIError.executionFailed(command: "mo clean --dry-run", exitCode: result.exitCode, stderr: result.stderr)
         }
         return Self.parseCleanOutput(result.stdout, isDryRun: true)
     }
 
-    public func runClean() async throws -> MoleCleanSummary {
-        let result = try await CLIExecutor.run(binary: "mo", arguments: ["clean"])
+    public func runClean(onLine: (@Sendable (String) -> Void)? = nil) async throws -> MoleCleanSummary {
+        let result = try await CLIExecutor.runStreaming(
+            binary: "mo",
+            arguments: ["clean"],
+            onLine: onLine
+        )
         guard result.succeeded else {
             throw CLIError.executionFailed(command: "mo clean", exitCode: result.exitCode, stderr: result.stderr)
         }
@@ -289,7 +326,8 @@ public actor MoleService {
     public func uninstallReviewedApp(
         _ app: MoleInstalledApp,
         selectedLeftoverPaths: Set<String>,
-        homebrewCaskToken: String?
+        homebrewCaskToken: String?,
+        hasSiblingApp: Bool = false
     ) async throws -> String {
         let fm = FileManager.default
 
@@ -302,9 +340,19 @@ public actor MoleService {
             try? await Task.sleep(for: .milliseconds(250))
         }
 
+        // Unload any selected user LaunchAgents cleanly via launchctl bootout before trashing
+        let uid = getuid()
+        for path in selectedLeftoverPaths
+        where path.contains("/Library/LaunchAgents/") && !path.hasPrefix("/Library/") && path.hasSuffix(".plist") && fm.fileExists(atPath: path) {
+            _ = try? await CLIExecutor.run(
+                binary: "launchctl",
+                arguments: ["bootout", "gui/\(uid)", path]
+            )
+        }
+
         var usedHomebrew = false
         if let token = homebrewCaskToken, !token.isEmpty, BrewService.isInstalled() {
-            _ = try await BrewService.shared.uninstall(name: token, isCask: true)
+            _ = try await BrewService.shared.uninstall(name: token, isCask: true, zap: !hasSiblingApp)
             usedHomebrew = true
         } else {
             let appURL = URL(fileURLWithPath: app.path)
@@ -323,6 +371,10 @@ public actor MoleService {
 
         var trashedLeftovers = 0
         for path in selectedLeftoverPaths where fm.fileExists(atPath: path) {
+            // Skip system-level read-only paths from unprivileged Trash calls
+            if path.hasPrefix("/Library/") || path.hasPrefix("/private/") || path.hasPrefix("/Users/Shared/") {
+                continue
+            }
             if (try? fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)) != nil {
                 trashedLeftovers += 1
             }

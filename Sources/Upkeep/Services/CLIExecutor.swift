@@ -113,6 +113,21 @@ public enum CLIExecutor {
         arguments: [String],
         environment: [String: String] = [:]
     ) async throws -> CLIResult {
+        try await runStreaming(
+            binary: binary,
+            arguments: arguments,
+            environment: environment,
+            onLine: nil
+        )
+    }
+
+    /// Executes a CLI process while streaming ANSI-stripped stdout/stderr lines live as they arrive.
+    public static func runStreaming(
+        binary: String,
+        arguments: [String],
+        environment: [String: String] = [:],
+        onLine: (@Sendable (String) -> Void)?
+    ) async throws -> CLIResult {
         guard let executablePath = resolveBinary(binary) else {
             throw CLIError.binaryNotFound(binary)
         }
@@ -156,6 +171,54 @@ public enum CLIExecutor {
             }
         }
 
+        final class LineStreamBuffer: @unchecked Sendable {
+            private let lock = NSLock()
+            private var pending = Data()
+            private let onLine: (@Sendable (String) -> Void)?
+
+            init(onLine: (@Sendable (String) -> Void)?) {
+                self.onLine = onLine
+            }
+
+            func feed(_ chunk: Data) {
+                guard let onLine, !chunk.isEmpty else { return }
+                var emitted: [String] = []
+                lock.lock()
+                pending.append(chunk)
+                while let nl = pending.firstIndex(of: 0x0A) {
+                    let lineData = pending[pending.startIndex..<nl]
+                    pending.removeSubrange(pending.startIndex...nl)
+                    if let raw = String(data: lineData, encoding: .utf8) {
+                        let clean = UpkeepEngine.stripANSI(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !clean.isEmpty {
+                            emitted.append(clean)
+                        }
+                    }
+                }
+                lock.unlock()
+                for line in emitted {
+                    onLine(line)
+                }
+            }
+
+            func flush() {
+                guard let onLine else { return }
+                lock.lock()
+                let rem = pending
+                pending.removeAll()
+                lock.unlock()
+                if !rem.isEmpty, let raw = String(data: rem, encoding: .utf8) {
+                    let clean = UpkeepEngine.stripANSI(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !clean.isEmpty {
+                        onLine(clean)
+                    }
+                }
+            }
+        }
+
+        let outStream = LineStreamBuffer(onLine: onLine)
+        let errStream = LineStreamBuffer(onLine: onLine)
+
         // Drain stdout & stderr continuously while the process runs to prevent 64KB pipe buffer deadlocks.
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
@@ -163,6 +226,7 @@ public enum CLIExecutor {
                 handle.readabilityHandler = nil
             } else {
                 outAcc.append(chunk)
+                outStream.feed(chunk)
             }
         }
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
@@ -171,6 +235,7 @@ public enum CLIExecutor {
                 handle.readabilityHandler = nil
             } else {
                 errAcc.append(chunk)
+                errStream.feed(chunk)
             }
         }
 
@@ -186,6 +251,10 @@ public enum CLIExecutor {
                     let remainingErr = (try? stderrPipe.fileHandleForReading.readToEnd()) ?? Data()
                     outAcc.append(remainingOut)
                     errAcc.append(remainingErr)
+                    outStream.feed(remainingOut)
+                    errStream.feed(remainingErr)
+                    outStream.flush()
+                    errStream.flush()
 
                     let outStr = String(data: outAcc.takeData(), encoding: .utf8) ?? ""
                     let errStr = String(data: errAcc.takeData(), encoding: .utf8) ?? ""

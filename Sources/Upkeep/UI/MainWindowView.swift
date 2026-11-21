@@ -1379,8 +1379,55 @@ private struct UninstallReviewSheet: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let inspection = vm.uninstallInspection {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let vendor = inspection.officialUninstallerVendor {
+                        HStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .font(.system(size: 16))
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Official \(vendor) Uninstaller Recommended")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text("Security, MDM, and VPN apps often install system extensions or daemons that are safest to remove with \(vendor)'s official uninstaller.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(10)
+                        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(Color.orange.opacity(0.30), lineWidth: 0.75)
+                        }
+                    }
+
+                    if inspection.hasSiblingApp {
+                        HStack(spacing: 10) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.system(size: 15))
+                                .foregroundStyle(.blue)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Sibling App Detected — Shared Data Protected")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text("Another channel or copy of this app is installed. Shared app-name folders and Homebrew --zap are skipped.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(10)
+                        .background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(Color.blue.opacity(0.25), lineWidth: 0.75)
+                        }
+                    }
+
                     if let token = inspection.homebrewCaskToken {
+                        let caskCmd = inspection.hasSiblingApp
+                            ? "brew uninstall --cask \(token)"
+                            : "brew uninstall --cask --zap \(token)"
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 10) {
                                 UpkeepSettingsIcon(systemName: "shippingbox.fill", color: MenuBarTheme.Colors.homebrew, size: 24)
@@ -1394,7 +1441,7 @@ private struct UninstallReviewSheet: View {
                                 Spacer()
                             }
 
-                            Toggle("Uninstall via `brew uninstall --cask \(token)` (recommended)", isOn: $useHomebrewCask)
+                            Toggle("Uninstall via `\(caskCmd)` (recommended)", isOn: $useHomebrewCask)
                                 .toggleStyle(.checkbox)
                                 .font(.footnote)
                         }
@@ -1407,15 +1454,15 @@ private struct UninstallReviewSheet: View {
                     }
 
                     HStack {
-                        Text("Related Files in ~/Library (\(inspection.leftovers.count))")
+                        Text("Related Files (\(inspection.leftovers.count))")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.secondary)
 
                         Spacer()
 
-                        if !inspection.leftovers.isEmpty {
+                        if inspection.leftovers.contains(where: { !$0.isSystem }) {
                             Button("Select All") {
-                                selectedLeftovers = Set(inspection.leftovers.map(\.path))
+                                selectedLeftovers = Set(inspection.leftovers.filter { !$0.isSystem }.map(\.path))
                             }
                             .buttonStyle(.plain)
                             .font(.footnote.weight(.medium))
@@ -1436,7 +1483,7 @@ private struct UninstallReviewSheet: View {
                         HStack(spacing: 10) {
                             Image(systemName: "checkmark.circle")
                                 .foregroundStyle(.secondary)
-                            Text("No leftover files found in ~/Library — only the app bundle will be removed.")
+                            Text("No leftover files found — only the app bundle will be removed.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
@@ -1448,41 +1495,75 @@ private struct UninstallReviewSheet: View {
                             LazyVStack(spacing: 4) {
                                 ForEach(inspection.leftovers) { item in
                                     let isChecked = selectedLeftovers.contains(item.path)
-                                    Button {
-                                        if isChecked {
-                                            selectedLeftovers.remove(item.path)
-                                        } else {
-                                            selectedLeftovers.insert(item.path)
-                                        }
-                                    } label: {
-                                        HStack(spacing: 10) {
-                                            Image(systemName: isChecked ? "checkmark.square.fill" : "square")
-                                                .foregroundStyle(isChecked ? Color.accentColor : Color.secondary)
-                                                .font(.system(size: 14))
+                                    HStack(spacing: 8) {
+                                        Button {
+                                            guard !item.isSystem else { return }
+                                            if isChecked {
+                                                selectedLeftovers.remove(item.path)
+                                            } else {
+                                                selectedLeftovers.insert(item.path)
+                                            }
+                                        } label: {
+                                            HStack(spacing: 10) {
+                                                Image(systemName: item.isSystem ? "lock.fill" : (isChecked ? "checkmark.square.fill" : "square"))
+                                                    .foregroundStyle(item.isSystem ? Color.secondary.opacity(0.6) : (isChecked ? Color.accentColor : Color.secondary))
+                                                    .font(.system(size: item.isSystem ? 12 : 14))
+                                                    .frame(width: 16)
 
-                                            VStack(alignment: .leading, spacing: 1) {
-                                                Text(item.displayPath)
-                                                    .font(.system(size: 11.5, design: .monospaced))
-                                                    .foregroundStyle(.primary)
-                                                    .lineLimit(1)
-                                                    .truncationMode(.middle)
-                                                Text(item.category)
-                                                    .font(.caption2)
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(item.displayPath)
+                                                        .font(.system(size: 11.5, design: .monospaced))
+                                                        .foregroundStyle(item.isSystem ? .secondary : .primary)
+                                                        .lineLimit(1)
+                                                        .truncationMode(.middle)
+
+                                                    HStack(spacing: 6) {
+                                                        Text(item.category)
+                                                            .font(.caption2)
+                                                            .foregroundStyle(.secondary)
+
+                                                        if item.isSystem {
+                                                            Text("System · Admin")
+                                                                .font(.system(size: 9.5, weight: .semibold))
+                                                                .foregroundStyle(.secondary)
+                                                                .padding(.horizontal, 5)
+                                                                .padding(.vertical, 1)
+                                                                .background(Color.primary.opacity(0.08), in: Capsule())
+                                                        } else if !item.defaultSelected {
+                                                            Text("Held back · \(item.holdbackReason ?? "Personal data")")
+                                                                .font(.system(size: 9.5, weight: .semibold))
+                                                                .foregroundStyle(.orange)
+                                                                .padding(.horizontal, 5)
+                                                                .padding(.vertical, 1)
+                                                                .background(Color.orange.opacity(0.14), in: Capsule())
+                                                        }
+                                                    }
+                                                }
+
+                                                Spacer(minLength: 6)
+
+                                                Text(item.formattedSize)
+                                                    .font(.system(size: 11, design: .rounded).monospacedDigit())
                                                     .foregroundStyle(.secondary)
                                             }
-
-                                            Spacer(minLength: 8)
-
-                                            Text(item.formattedSize)
-                                                .font(.system(size: 11, design: .rounded).monospacedDigit())
-                                                .foregroundStyle(.secondary)
+                                            .contentShape(Rectangle())
                                         }
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 6)
-                                        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                                        .contentShape(Rectangle())
+                                        .buttonStyle(.plain)
+
+                                        Button {
+                                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)])
+                                        } label: {
+                                            Image(systemName: "folder")
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 22, height: 22)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Reveal in Finder")
                                     }
-                                    .buttonStyle(.plain)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                                 }
                             }
                         }
@@ -1491,7 +1572,7 @@ private struct UninstallReviewSheet: View {
                 .padding(20)
                 .onAppear {
                     if !didSeedSelection {
-                        selectedLeftovers = Set(inspection.leftovers.map(\.path))
+                        selectedLeftovers = Set(inspection.leftovers.filter(\.defaultSelected).map(\.path))
                         didSeedSelection = true
                     }
                 }

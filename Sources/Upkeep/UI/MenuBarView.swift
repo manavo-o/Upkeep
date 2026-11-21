@@ -181,10 +181,21 @@ public final class TrayViewModel {
         confirmClean = false
         cleanError = nil
         Task {
-            do {
-                self.cleanPreview = try await MoleService.shared.dryRunClean()
-            } catch {
-                self.cleanError = error.localizedDescription
+            // Phase 1: instant (~50-150ms) native Rust APFS cache scan so Cleaner never blocks on a blank spinner
+            if let fastPreview = await MoleService.shared.fastScanCaches() {
+                self.cleanPreview = fastPreview
+                self.isScanningClean = false
+                if !MoleService.isInstalled() { return }
+            }
+            // Phase 2: refine with Mole dry-run when installed
+            if MoleService.isInstalled() {
+                do {
+                    self.cleanPreview = try await MoleService.shared.dryRunClean()
+                } catch {
+                    if self.cleanPreview == nil {
+                        self.cleanError = error.localizedDescription
+                    }
+                }
             }
             self.isScanningClean = false
         }
@@ -265,7 +276,8 @@ public final class TrayViewModel {
                 let message = try await MoleService.shared.uninstallReviewedApp(
                     app,
                     selectedLeftoverPaths: selectedLeftoverPaths,
-                    homebrewCaskToken: caskToken
+                    homebrewCaskToken: caskToken,
+                    hasSiblingApp: inspection.hasSiblingApp
                 )
                 self.uninstallStatus = message
                 self.installedApps.removeAll { $0.id == app.id }

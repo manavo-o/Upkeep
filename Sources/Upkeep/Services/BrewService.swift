@@ -44,6 +44,33 @@ public final class BrewLogStore {
         }
     }
 
+    public func beginLive(command: String) {
+        self.lastLog = BrewOperationLog(
+            command: command,
+            output: "Running `\(command)`…",
+            succeeded: true,
+            exitCode: 0,
+            timestamp: Date()
+        )
+    }
+
+    public func appendLiveLine(_ line: String) {
+        guard let current = lastLog else { return }
+        let nextOutput: String
+        if current.output.hasPrefix("Running `") && current.output.hasSuffix("…") {
+            nextOutput = line
+        } else {
+            nextOutput = current.output + "\n" + line
+        }
+        self.lastLog = BrewOperationLog(
+            command: current.command,
+            output: nextOutput,
+            succeeded: current.succeeded,
+            exitCode: current.exitCode,
+            timestamp: current.timestamp
+        )
+    }
+
     public func record(command: String, stdout: String, stderr: String, exitCode: Int32) {
         let cleanOut = CLIExecutor.stripANSI(stdout).trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanErr = CLIExecutor.stripANSI(stderr).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -271,8 +298,12 @@ public actor BrewService {
 
         let task = Task<[BrewPackageItem], Error> {
             #if USE_RUST_UPKEEP_CORE
-            // Fast path: zero Ruby subprocess spawns when Rust API + local Cellar/Caskroom merge succeeds (~15-40ms).
+            // Fast path: zero Ruby subprocess spawns when Rust API + local Cellar/Caskroom merge succeeds.
             if await self.ensureRemoteCatalogLoaded() {
+                if forceRefresh {
+                    // 5ms in-place Cellar/Caskroom rescan without re-parsing formula.json/cask.json
+                    self.rustRemoteIndex.refreshLocal()
+                }
                 let fastInstalled = self.rustRemoteIndex.installedPackages()
                 if !fastInstalled.isEmpty {
                     return fastInstalled
@@ -438,6 +469,12 @@ public actor BrewService {
         }
 
         return try? Data(contentsOf: dataURL)
+    }
+
+    /// Pre-warms the 15k-package Rust Homebrew index quietly in the background after app launch.
+    public func prewarmIfNeeded() async {
+        guard Self.isInstalled() else { return }
+        _ = await ensureRemoteCatalogLoaded()
     }
 
     /// Returns true when the remote Homebrew catalog is already warm in memory (zero debounce needed).
@@ -648,13 +685,27 @@ public actor BrewService {
         #endif
     }
 
+    private func runBrewStreaming(arguments: [String], commandLabel: String) async throws -> CLIResult {
+        await BrewLogStore.shared.beginLive(command: commandLabel)
+        let res = try await CLIExecutor.runStreaming(
+            binary: "brew",
+            arguments: arguments,
+            environment: Self.brewEnv
+        ) { line in
+            Task { @MainActor in
+                BrewLogStore.shared.appendLiveLine(line)
+            }
+        }
+        await BrewLogStore.shared.record(command: commandLabel, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        return res
+    }
+
     public func install(name: String, isCask: Bool) async throws -> String {
         var args = ["install"]
         if isCask { args.append("--cask") }
         args.append(name)
         let cmd = "brew " + args.joined(separator: " ")
-        let res = try await CLIExecutor.run(binary: "brew", arguments: args, environment: Self.brewEnv)
-        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        let res = try await runBrewStreaming(arguments: args, commandLabel: cmd)
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
@@ -662,13 +713,15 @@ public actor BrewService {
         return CLIExecutor.stripANSI(res.stdout)
     }
 
-    public func uninstall(name: String, isCask: Bool) async throws -> String {
+    public func uninstall(name: String, isCask: Bool, zap: Bool = false) async throws -> String {
         var args = ["uninstall"]
-        if isCask { args.append("--cask") }
+        if isCask {
+            args.append("--cask")
+            if zap { args.append("--zap") }
+        }
         args.append(name)
         let cmd = "brew " + args.joined(separator: " ")
-        let res = try await CLIExecutor.run(binary: "brew", arguments: args, environment: Self.brewEnv)
-        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        let res = try await runBrewStreaming(arguments: args, commandLabel: cmd)
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
@@ -681,8 +734,7 @@ public actor BrewService {
         var args = ["upgrade"]
         if let name { args.append(name) }
         let cmd = "brew " + args.joined(separator: " ")
-        let res = try await CLIExecutor.run(binary: "brew", arguments: args, environment: Self.brewEnv)
-        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        let res = try await runBrewStreaming(arguments: args, commandLabel: cmd)
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }

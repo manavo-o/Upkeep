@@ -28,11 +28,17 @@ pub struct BrewPackage {
 
 struct IndexedPackage {
     pkg: BrewPackage,
+    api_version: String,
     haystack: Utf32String,
 }
 
 impl IndexedPackage {
     fn new(pkg: BrewPackage) -> Self {
+        let api_version = pkg.version.clone();
+        Self::with_api_version(pkg, api_version)
+    }
+
+    fn with_api_version(pkg: BrewPackage, api_version: String) -> Self {
         let mut raw = String::with_capacity(pkg.name.len() + 1 + pkg.description.len());
         raw.push_str(&pkg.name);
         if !pkg.description.is_empty() {
@@ -40,7 +46,7 @@ impl IndexedPackage {
             raw.push_str(&pkg.description);
         }
         let haystack = Utf32String::from(raw);
-        Self { pkg, haystack }
+        Self { pkg, api_version, haystack }
     }
 }
 
@@ -58,12 +64,31 @@ pub struct LeftoverRecord {
     pub display_path: String,
     pub category: String,
     pub size_bytes: u64,
+    pub is_system: bool,
+    pub default_selected: bool,
+    pub holdback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UninstallInspectionPayload {
     pub leftovers: Vec<LeftoverRecord>,
     pub homebrew_cask_token: Option<String>,
+    pub has_sibling_app: bool,
+    pub official_uninstaller_vendor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheScanItem {
+    pub category: String,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheScanPayload {
+    pub total_bytes: u64,
+    pub items: Vec<CacheScanItem>,
 }
 
 #[repr(C)]
@@ -625,6 +650,7 @@ fn load_api_slices_internal(
             api_stable
         };
 
+        let stored_api_ver = api_full_version.clone();
         let (version, is_installed, is_outdated, is_pinned) = if let Some(loc) = local {
             let outdated = !loc.is_pinned
                 && !loc.version.is_empty()
@@ -640,21 +666,25 @@ fn load_api_slices_internal(
             (api_full_version, false, false, false)
         };
 
-        merged.push(IndexedPackage::new(BrewPackage {
-            name: f.name,
-            description: f.desc.unwrap_or_default(),
-            version,
-            is_cask: false,
-            is_installed,
-            is_outdated,
-            is_pinned,
-            homepage: f.homepage.unwrap_or_default(),
-        }));
+        merged.push(IndexedPackage::with_api_version(
+            BrewPackage {
+                name: f.name,
+                description: f.desc.unwrap_or_default(),
+                version,
+                is_cask: false,
+                is_installed,
+                is_outdated,
+                is_pinned,
+                homepage: f.homepage.unwrap_or_default(),
+            },
+            stored_api_ver,
+        ));
     }
 
     for c in casks_res {
         let local = installed_map.remove(&(c.token.clone(), true));
         let api_version = c.version.unwrap_or_default();
+        let stored_api_ver = api_version.clone();
 
         let (version, is_installed, is_outdated) = if let Some(loc) = local {
             let outdated = !loc.version.is_empty()
@@ -673,16 +703,19 @@ fn load_api_slices_internal(
             (api_version, false, false)
         };
 
-        merged.push(IndexedPackage::new(BrewPackage {
-            name: c.token,
-            description: c.desc.unwrap_or_default(),
-            version,
-            is_cask: true,
-            is_installed,
-            is_outdated,
-            is_pinned: false,
-            homepage: c.homepage.unwrap_or_default(),
-        }));
+        merged.push(IndexedPackage::with_api_version(
+            BrewPackage {
+                name: c.token,
+                description: c.desc.unwrap_or_default(),
+                version,
+                is_cask: true,
+                is_installed,
+                is_outdated,
+                is_pinned: false,
+                homepage: c.homepage.unwrap_or_default(),
+            },
+            stored_api_ver,
+        ));
     }
 
     // Preserve any custom-tap installed packages not present in core API
@@ -746,6 +779,146 @@ pub extern "C" fn upkeep_brew_index_load_api_json(
         load_api_slices_internal(index, f_bytes, c_bytes, prefix)
     });
     result.unwrap_or(0)
+}
+
+/// Refreshes only local Cellar/Caskroom/pinned state in-place (~5ms) without re-parsing API JSON.
+#[no_mangle]
+pub extern "C" fn upkeep_brew_index_refresh_local(
+    ptr: *mut BrewSearchIndex,
+    prefix_utf8: *const c_char,
+) -> u32 {
+    let result = std::panic::catch_unwind(|| {
+        if ptr.is_null() {
+            return 0;
+        }
+        let index = unsafe { &*ptr };
+        let prefix = cstr_to_str(prefix_utf8);
+        let installed = scan_brew_dirs_internal(prefix);
+        let mut installed_map: HashMap<(String, bool), BrewPackage> =
+            HashMap::with_capacity(installed.len());
+        for pkg in installed {
+            installed_map.insert((pkg.name.clone(), pkg.is_cask), pkg);
+        }
+
+        let Ok(mut guard) = index.packages.write() else {
+            return 0;
+        };
+
+        let mut installed_count: u32 = 0;
+        for item in guard.iter_mut() {
+            let key = (item.pkg.name.clone(), item.pkg.is_cask);
+            if let Some(loc) = installed_map.remove(&key) {
+                installed_count += 1;
+                item.pkg.is_installed = true;
+                item.pkg.is_pinned = loc.is_pinned;
+                if !loc.version.is_empty() {
+                    item.pkg.version = loc.version.clone();
+                }
+                if item.pkg.is_cask {
+                    item.pkg.is_outdated = !loc.version.is_empty()
+                        && !item.api_version.is_empty()
+                        && item.api_version != "latest"
+                        && loc.version != "latest"
+                        && item.api_version != loc.version
+                        && cmp_versions_natural(&item.api_version, &loc.version) == Ordering::Greater;
+                } else {
+                    item.pkg.is_outdated = !loc.is_pinned
+                        && !loc.version.is_empty()
+                        && !item.api_version.is_empty()
+                        && cmp_versions_natural(&item.api_version, &loc.version) == Ordering::Greater;
+                }
+            } else {
+                item.pkg.is_installed = false;
+                item.pkg.is_pinned = false;
+                item.pkg.is_outdated = false;
+                if !item.api_version.is_empty() {
+                    item.pkg.version = item.api_version.clone();
+                }
+            }
+        }
+
+        for (_, pkg) in installed_map {
+            installed_count += 1;
+            guard.push(IndexedPackage::new(pkg));
+        }
+        installed_count
+    });
+    result.unwrap_or(0)
+}
+
+/// Fast parallel native macOS user cache scanner using getattrlistbulk + Rayon (~50-150ms).
+#[no_mangle]
+pub extern "C" fn upkeep_scan_caches_json() -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return string_to_cstr("{\"total_bytes\":0,\"items\":[]}".to_string());
+        }
+        let home_path = PathBuf::from(&home);
+        let mut targets: Vec<(&'static str, String, PathBuf)> = Vec::new();
+
+        // 1. User App Caches (top-level entries in ~/Library/Caches, skipping protected Apple caches)
+        let caches_dir = home_path.join("Library/Caches");
+        if let Ok(entries) = fs::read_dir(&caches_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || name.starts_with("com.apple.") || name == "CloudKit" || name == "Homebrew" {
+                    continue;
+                }
+                targets.push(("User App Caches", name, entry.path()));
+            }
+        }
+
+        // 2. Developer & Package Manager Caches
+        let dev_targets: [(&str, &str, PathBuf); 8] = [
+            ("Developer Tools", "Xcode DerivedData", home_path.join("Library/Developer/Xcode/DerivedData")),
+            ("Developer Tools", "Homebrew Download Cache", home_path.join("Library/Caches/Homebrew")),
+            ("Developer Tools", "npm Cache", home_path.join(".npm/_cacache")),
+            ("Developer Tools", "pip Cache", home_path.join(".cache/pip")),
+            ("Developer Tools", "Cargo Registry Cache", home_path.join(".cargo/registry/cache")),
+            ("Developer Tools", "Gradle Cache", home_path.join(".gradle/caches")),
+            ("Developer Tools", "Yarn Cache", home_path.join("Library/Caches/Yarn")),
+            ("Developer Tools", "pnpm Store Cache", home_path.join("Library/Caches/pnpm")),
+        ];
+        for (cat, name, p) in dev_targets {
+            if p.exists() {
+                targets.push((cat, name.to_string(), p));
+            }
+        }
+
+        // 3. User Logs
+        let logs_dir = home_path.join("Library/Logs");
+        if let Ok(entries) = fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with('.') {
+                    targets.push(("User Logs", name, entry.path()));
+                }
+            }
+        }
+
+        let mut items: Vec<CacheScanItem> = targets
+            .into_par_iter()
+            .filter_map(|(cat, name, p)| {
+                let size = calculate_path_size_accurate(&p);
+                if size < 4096 {
+                    return None;
+                }
+                Some(CacheScanItem {
+                    category: cat.to_string(),
+                    name,
+                    path: p.to_string_lossy().into_owned(),
+                    size_bytes: size,
+                })
+            })
+            .collect();
+
+        items.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        let total_bytes: u64 = items.iter().map(|i| i.size_bytes).sum();
+        let payload = CacheScanPayload { total_bytes, items };
+        string_to_cstr(serde_json::to_string(&payload).unwrap_or_else(|_| "{\"total_bytes\":0,\"items\":[]}".into()))
+    });
+    result.unwrap_or_else(|_| string_to_cstr("{\"total_bytes\":0,\"items\":[]}".to_string()))
 }
 
 /// Returns all installed packages from the merged API + local index as JSON (sorted by name).
@@ -1050,14 +1223,373 @@ pub extern "C" fn upkeep_calculate_path_size(path_utf8: *const c_char) -> u64 {
     result.unwrap_or(0)
 }
 
-// MARK: - Parallel Uninstaller Inspector (~/Library Leftovers + Caskroom Matching)
+// MARK: - Parallel Uninstaller Inspector (Mole-Parity Leftovers + Safety Guards + Caskroom)
+
+const COMMON_APP_NAMES: &[&str] = &[
+    "music", "notes", "photos", "finder", "safari", "preview", "calendar",
+    "contacts", "messages", "reminders", "clock", "weather", "stocks", "books",
+    "news", "podcasts", "voice", "files", "store", "system", "helper", "agent",
+    "daemon", "service", "update", "sync", "backup", "cloud", "manager",
+    "monitor", "server", "client", "worker", "runner", "launcher", "driver",
+    "plugin", "extension", "widget", "utility", "app", "mac", "macos", "desktop",
+];
+
+const CHANNEL_SUFFIXES: &[&str] = &[
+    "developer edition",
+    "technology preview",
+    "insiders",
+    "insider",
+    "nightly",
+    "canary",
+    "preview",
+    "release",
+    "stable",
+    "alpha",
+    "beta",
+    "edge",
+    "dev",
+    "lts",
+    "rc",
+];
+
+const OFFICIAL_UNINSTALLER_RULES: &[(&str, &str)] = &[
+    ("com.eset.", "ESET"),
+    ("com.jamf.", "Jamf"),
+    ("com.jamfsoftware.", "Jamf"),
+    ("com.crowdstrike.", "CrowdStrike"),
+    ("com.sentinelone.", "SentinelOne"),
+    ("com.sentinel-labs.", "SentinelOne"),
+    ("com.paloaltonetworks.", "Palo Alto GlobalProtect"),
+    ("com.cisco.anyconnect", "Cisco AnyConnect"),
+    ("com.cisco.secureclient", "Cisco Secure Client"),
+    ("com.alibaba.security.", "Alibaba Cloud Security"),
+    ("com.adobe.gcclient", "Adobe Genuine Service"),
+    ("com.avast.", "Avast"),
+    ("com.avg.hub", "AVG"),
+    ("com.malwarebytes.mbam", "Malwarebytes"),
+    ("com.teamviewer.", "TeamViewer"),
+    ("com.bitdefender.antivirusformac", "Bitdefender"),
+    ("com.intego.virusbarrier", "Intego"),
+    ("com.kaspersky.kav", "Kaspersky"),
+    ("com.symantec.nfm", "Norton"),
+    ("com.trendmicro.", "Trend Micro"),
+];
+
+const HOLDBACK_BROWSER_PREFIXES: &[&str] = &[
+    "google/chrome",
+    "bravesoftware",
+    "microsoft edge",
+    "com.operasoftware.opera",
+    "chromium",
+    "vivaldi",
+    "arc",
+    "firefox",
+    "zen",
+];
+
+const HOLDBACK_DATA_LIBRARY_NAMES: &[&str] = &[
+    "crossover",
+    "virtualbuddy",
+    "openemu",
+    "dolphin",
+    "pcsx2",
+    "retroarch",
+    "prismlauncher",
+    "minecraft",
+    "citra",
+    "cemu",
+    "ryujinx",
+    "ppsspp",
+    "rpcs3",
+    "multimc",
+    "atlauncher",
+    "anki2",
+];
+
+fn is_common_generic_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower.len() < 3 || COMMON_APP_NAMES.contains(&lower.as_str())
+}
+
+fn strip_channel_suffix(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    for suffix in CHANNEL_SUFFIXES {
+        for sep in [" - ", " ", "-", "_"] {
+            let pattern = format!("{}{}", sep, suffix);
+            if lower.ends_with(&pattern) {
+                let base = trimmed[..trimmed.len() - pattern.len()].trim();
+                if base.len() >= 3 {
+                    return Some(base.to_string());
+                }
+            }
+        }
+    }
+
+    // Strip trailing version numbers (e.g. "App 2", "App 2025")
+    if let Some((head, tail)) = trimmed.rsplit_once(' ') {
+        if !tail.is_empty()
+            && tail.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            && head.trim().len() >= 3
+        {
+            return Some(head.trim().to_string());
+        }
+    }
+    None
+}
+
+fn split_camel_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut prev_lower = false;
+    for ch in s.chars() {
+        if ch.is_ascii_uppercase() && prev_lower {
+            out.push(' ');
+        }
+        out.push(ch);
+        prev_lower = ch.is_ascii_lowercase();
+    }
+    out
+}
+
+fn collect_name_variants(name: &str, out: &mut Vec<String>) {
+    let trimmed = name.trim();
+    if is_common_generic_name(trimmed) {
+        return;
+    }
+    let mut push_unique = |s: String| {
+        if !is_common_generic_name(&s) && !out.iter().any(|existing| existing == &s) {
+            out.push(s);
+        }
+    };
+    push_unique(trimmed.to_string());
+    if trimmed.contains(' ') {
+        push_unique(trimmed.replace(' ', ""));
+        push_unique(trimmed.replace(' ', "_"));
+        push_unique(trimmed.replace(' ', "-"));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    push_unique(lower.clone());
+    if lower.contains(' ') {
+        push_unique(lower.replace(' ', ""));
+        push_unique(lower.replace(' ', "-"));
+        push_unique(lower.replace(' ', "_"));
+    }
+}
+
+fn detect_official_uninstaller_vendor(bundle_id: &str) -> Option<String> {
+    let lower = bundle_id.to_ascii_lowercase();
+    for (prefix, vendor) in OFFICIAL_UNINSTALLER_RULES {
+        if lower.starts_with(prefix) {
+            return Some((*vendor).to_string());
+        }
+    }
+    None
+}
+
+fn detect_sibling_app(app_name: &str, bundle_id: &str, app_path: &str) -> bool {
+    let target_canonical = fs::canonicalize(app_path).unwrap_or_else(|_| PathBuf::from(app_path));
+    let target_base = strip_channel_suffix(app_name)
+        .unwrap_or_else(|| app_name.to_string())
+        .to_ascii_lowercase();
+    if is_common_generic_name(&target_base) {
+        return false;
+    }
+
+    let target_bid_lower = bundle_id.to_ascii_lowercase();
+    let target_bid_base =
+        strip_channel_suffix(&target_bid_lower).unwrap_or_else(|| target_bid_lower.clone());
+
+    for other_path in collect_app_paths() {
+        let other_canonical = fs::canonicalize(&other_path).unwrap_or_else(|_| other_path.clone());
+        if other_canonical == target_canonical {
+            continue;
+        }
+        let other_name = other_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let other_base = strip_channel_suffix(&other_name)
+            .unwrap_or_else(|| other_name.clone())
+            .to_ascii_lowercase();
+
+        if other_base == target_base {
+            return true;
+        }
+
+        if !target_bid_base.is_empty() {
+            let other_bid = read_bundle_id(&other_path).to_ascii_lowercase();
+            if !other_bid.is_empty() && other_bid != target_bid_lower {
+                let other_bid_base =
+                    strip_channel_suffix(&other_bid).unwrap_or_else(|| other_bid.clone());
+                if other_bid_base == target_bid_base {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn collect_embedded_bundle_ids(app_path: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let contents = app_path.join("Contents");
+    let subdirs = [
+        "PlugIns",
+        "XPCServices",
+        "Library/LoginItems",
+        "Library/SystemExtensions",
+        "Helpers",
+    ];
+    for rel in subdirs {
+        let dir = contents.join(rel);
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "appex" | "xpc" | "app" | "systemextension") {
+                let bid = read_bundle_id(&p);
+                if !bid.is_empty() && !ids.iter().any(|x| x == &bid) {
+                    ids.push(bid);
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn read_jetbrains_paths_selector(app_path: &Path) -> Option<String> {
+    let plist_path = app_path.join("Contents/Info.plist");
+    let val = plist::Value::from_file(plist_path).ok()?;
+    let dict = val.as_dictionary()?;
+    let jvm = dict.get("JVMOptions")?.as_dictionary()?;
+    let props = jvm.get("Properties")?.as_dictionary()?;
+    props
+        .get("idea.paths.selector")
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_string())
+}
+
+fn is_protected_path(path: &Path, home: &str) -> bool {
+    let path_str = path.to_string_lossy();
+    let lower = path_str.to_ascii_lowercase();
+    let home_lower = home.to_ascii_lowercase();
+
+    // Shared roots that must never be deleted wholesale
+    let protected_exact = [
+        format!("{}/.config", home_lower),
+        format!("{}/.cache", home_lower),
+        format!("{}/.local", home_lower),
+        format!("{}/.local/share", home_lower),
+        format!("{}/library/unity", home_lower),
+        format!("{}/library/application support/epic", home_lower),
+        format!("{}/library/application support/steam", home_lower),
+    ];
+    if protected_exact.iter().any(|p| lower == *p) {
+        return true;
+    }
+
+    // Independent CLI tools (never removed when uninstalling a desktop GUI app)
+    const INDEPENDENT_CLIS: [&str; 4] = ["claude", "opencode", "codex", "gemini"];
+    for cli in INDEPENDENT_CLIS {
+        let protected_cli_paths = [
+            format!("{}/.{}", home_lower, cli),
+            format!("{}/{}", home_lower, cli),
+            format!("{}/.config/{}", home_lower, cli),
+            format!("{}/.local/share/{}", home_lower, cli),
+            format!("{}/.cache/{}", home_lower, cli),
+        ];
+        if protected_cli_paths.iter().any(|p| lower == *p) {
+            return true;
+        }
+    }
+    false
+}
+
+fn evaluate_holdback(path_str: &str, home: &str, is_system: bool) -> (bool, Option<String>) {
+    if is_system {
+        return (false, Some("Requires admin privileges".to_string()));
+    }
+    let lower = path_str.to_ascii_lowercase();
+    let home_lower = home.to_ascii_lowercase();
+    let rel = lower.strip_prefix(&home_lower).unwrap_or(&lower);
+
+    if rel.starts_with("/library/group containers/") {
+        return (false, Some("App Group container".to_string()));
+    }
+    if rel.starts_with("/library/containers/com.isaacmarovitz.whisky")
+        || rel.starts_with("/library/containers/com.utmapp.utm")
+    {
+        return (false, Some("VM / Game library".to_string()));
+    }
+    if let Some(app_sup_rel) = rel.strip_prefix("/library/application support/") {
+        for browser in HOLDBACK_BROWSER_PREFIXES {
+            if app_sup_rel == *browser || app_sup_rel.starts_with(&format!("{}/", browser)) {
+                return (false, Some("Browser profile".to_string()));
+            }
+        }
+        for lib_name in HOLDBACK_DATA_LIBRARY_NAMES {
+            if app_sup_rel == *lib_name || app_sup_rel.starts_with(&format!("{}/", lib_name)) {
+                return (false, Some("VM / Game library".to_string()));
+            }
+        }
+    }
+    (true, None)
+}
+
+fn launch_plist_owned_by_app(plist_path: &Path, bundle_ids: &[String], app_path: &str) -> bool {
+    let Ok(val) = plist::Value::from_file(plist_path) else {
+        return false;
+    };
+    let Some(dict) = val.as_dictionary() else {
+        return false;
+    };
+    if let Some(label) = dict.get("Label").and_then(|v| v.as_string()) {
+        let label_lower = label.to_ascii_lowercase();
+        for bid in bundle_ids {
+            let bid_lower = bid.to_ascii_lowercase();
+            if label_lower == bid_lower || label_lower.starts_with(&format!("{}.", bid_lower)) {
+                return true;
+            }
+        }
+    }
+    if !app_path.is_empty() {
+        let app_prefix = format!("{}/", app_path.trim_end_matches('/'));
+        if let Some(prog) = dict.get("Program").and_then(|v| v.as_string()) {
+            if prog == app_path || prog.starts_with(&app_prefix) {
+                return true;
+            }
+        }
+        if let Some(args) = dict.get("ProgramArguments").and_then(|v| v.as_array()) {
+            if let Some(first) = args.first().and_then(|v| v.as_string()) {
+                if first == app_path || first.starts_with(&app_prefix) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 fn categorize_leftover(path: &str) -> &'static str {
-    if path.contains("/Application Support/") {
+    if path.starts_with("/private/var/db/receipts/") {
+        "System Receipts"
+    } else if path.starts_with("/Library/LaunchDaemons/") {
+        "System Launch Daemons"
+    } else if path.starts_with("/Library/PrivilegedHelperTools/") {
+        "Privileged Helpers"
+    } else if path.starts_with("/Users/Shared/") {
+        "Shared Data"
+    } else if path.starts_with("/Library/") {
+        "System Library"
+    } else if path.contains("/Application Support/") {
         "Application Support"
     } else if path.contains("/Caches/") {
         "Caches"
-    } else if path.contains("/Preferences/") {
+    } else if path.contains("/Preferences/") || path.contains("/SyncedPreferences/") {
         "Preferences"
     } else if path.contains("/Logs/") {
         "Logs"
@@ -1065,12 +1597,27 @@ fn categorize_leftover(path: &str) -> &'static str {
         "Group Containers"
     } else if path.contains("/Containers/") {
         "Containers"
-    } else if path.contains("/Saved Application State/") {
+    } else if path.contains("/Saved Application State/") || path.contains("/Autosave Information/") {
         "Saved State"
     } else if path.contains("/LaunchAgents/") {
         "Launch Agents"
-    } else if path.contains("/HTTPStorages/") || path.contains("/WebKit/") {
+    } else if path.contains("/HTTPStorages/")
+        || path.contains("/WebKit/")
+        || path.contains("/Cookies/")
+    {
         "Web & Network Data"
+    } else if path.contains("/NativeMessagingHosts/") {
+        "Browser Extensions"
+    } else if path.contains("/.config/") || path.contains("/.cache/") || path.contains("/.local/") {
+        "XDG Config & Data"
+    } else if path.contains("/QuickLook/")
+        || path.contains("/Spotlight/")
+        || path.contains("/Internet Plug-Ins/")
+        || path.contains("/PreferencePanes/")
+        || path.contains("/Services/")
+        || path.contains("/Screen Savers/")
+    {
+        "Plug-Ins & Services"
     } else {
         "Library Data"
     }
@@ -1162,8 +1709,9 @@ fn find_installed_cask_parallel(app_name: &str, app_path: &str, prefix: &str) ->
         .find(|token| normalize_token(token) == normalized_app)
 }
 
-/// Parallel inspector for Uninstaller: discovers ~/Library leftovers, computes their APFS sizes
-/// concurrently via `getattrlistbulk`, and matches Homebrew Caskroom in parallel.
+/// Parallel Mole-parity inspector for Uninstaller: discovers user & system leftovers,
+/// applies sibling-app & independent-CLI safety guards, computes APFS sizes concurrently
+/// via `getattrlistbulk`, and matches Homebrew Caskroom in parallel.
 #[no_mangle]
 pub extern "C" fn upkeep_inspect_app_uninstall_json(
     app_name_utf8: *const c_char,
@@ -1178,70 +1726,420 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
         let brew_prefix = cstr_to_str(brew_prefix_utf8);
 
         let home = std::env::var("HOME").unwrap_or_default();
-        let library = PathBuf::from(&home).join("Library");
+        let home_path = PathBuf::from(&home);
+        let library = home_path.join("Library");
+        let app_path_buf = PathBuf::from(app_path);
+
+        let has_sibling_app = detect_sibling_app(app_name, bundle_id, app_path);
+        let official_uninstaller_vendor = detect_official_uninstaller_vendor(bundle_id);
 
         let (leftovers, cask_token) = rayon::join(
             || {
-                let mut candidates: Vec<PathBuf> = Vec::new();
+                let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
                 let mut seen: HashSet<PathBuf> = HashSet::new();
 
-                let mut add_if_exists = |p: PathBuf| {
+                let mut add_if_exists = |p: PathBuf, is_system: bool| {
+                    if is_protected_path(&p, &home) {
+                        return;
+                    }
                     if p.exists() && seen.insert(p.clone()) {
-                        candidates.push(p);
+                        candidates.push((p, is_system));
                     }
                 };
 
-                let mut identifiers: Vec<&str> = Vec::with_capacity(2);
+                // 1. Collect all bundle IDs (primary + embedded .appex/.xpc/LoginItems)
+                let mut bundle_ids: Vec<String> = Vec::new();
                 if !bundle_id.is_empty() {
-                    identifiers.push(bundle_id);
+                    bundle_ids.push(bundle_id.to_string());
                 }
-                if !app_name.is_empty() && app_name != bundle_id {
-                    identifiers.push(app_name);
+                if !app_path.is_empty() {
+                    for emb in collect_embedded_bundle_ids(&app_path_buf) {
+                        if !bundle_ids.iter().any(|x| x == &emb) {
+                            bundle_ids.push(emb);
+                        }
+                    }
                 }
 
-                const SUBDIRS: [&str; 8] = [
+                // 2. Collect naming variants (respecting sibling-app protection)
+                let mut name_keys: Vec<String> = Vec::new();
+                collect_name_variants(app_name, &mut name_keys);
+                if !has_sibling_app {
+                    if let Some(stripped) = strip_channel_suffix(app_name) {
+                        collect_name_variants(&stripped, &mut name_keys);
+                    }
+                    if let Some(leaf) = bundle_id.rsplit('.').next() {
+                        if leaf.len() >= 3 {
+                            collect_name_variants(leaf, &mut name_keys);
+                            let split = split_camel_case(leaf);
+                            if split != leaf {
+                                collect_name_variants(&split, &mut name_keys);
+                            }
+                        }
+                    }
+                }
+
+                // 3. Standard ~/Library subdirectories
+                const SUBDIRS: [&str; 9] = [
                     "Application Support",
                     "Caches",
                     "Logs",
                     "HTTPStorages",
                     "WebKit",
                     "Containers",
-                    "Group Containers",
                     "Application Scripts",
+                    "FileProvider",
+                    "Autosave Information",
                 ];
 
                 for subdir in SUBDIRS {
                     let dir = library.join(subdir);
-                    for id in &identifiers {
-                        add_if_exists(dir.join(id));
+                    for bid in &bundle_ids {
+                        add_if_exists(dir.join(bid), false);
+                    }
+                    for nk in &name_keys {
+                        add_if_exists(dir.join(nk), false);
                     }
                 }
 
-                if !bundle_id.is_empty() {
-                    add_if_exists(
-                        library
-                            .join("Saved Application State")
-                            .join(format!("{}.savedState", bundle_id)),
-                    );
+                // 4. Group Containers (<TeamID>.<bundle_id> and group.<bundle_id> boundary matching)
+                let group_dir = library.join("Group Containers");
+                if let Ok(entries) = fs::read_dir(&group_dir) {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        let fname_lower = fname.to_ascii_lowercase();
+                        let matched = bundle_ids.iter().any(|bid| {
+                            let b = bid.to_ascii_lowercase();
+                            fname_lower == b
+                                || fname_lower == format!("group.{}", b)
+                                || fname_lower.ends_with(&format!(".{}", b))
+                                || fname_lower.ends_with(&format!(".group.{}", b))
+                        });
+                        if matched {
+                            add_if_exists(entry.path(), false);
+                        }
+                    }
+                }
 
-                    let prefs_dir = library.join("Preferences");
-                    add_if_exists(prefs_dir.join(format!("{}.plist", bundle_id)));
-                    let pref_prefix = format!("{}.", bundle_id);
-                    if let Ok(entries) = fs::read_dir(&prefs_dir) {
+                // 5. UUID Sandbox Containers (.com.apple.containermanagerd.metadata.plist)
+                let containers_dir = library.join("Containers");
+                if !bundle_ids.is_empty() {
+                    if let Ok(entries) = fs::read_dir(&containers_dir) {
                         for entry in entries.flatten() {
+                            let p = entry.path();
                             let fname = entry.file_name().to_string_lossy().into_owned();
-                            if fname.starts_with(&pref_prefix) && fname.ends_with(".plist") {
-                                add_if_exists(entry.path());
+                            if bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(&fname)) {
+                                continue;
+                            }
+                            let meta = p.join(".com.apple.containermanagerd.metadata.plist");
+                            if let Ok(val) = plist::Value::from_file(&meta) {
+                                if let Some(id) = val
+                                    .as_dictionary()
+                                    .and_then(|d| d.get("MCMMetadataIdentifier"))
+                                    .and_then(|v| v.as_string())
+                                {
+                                    if bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(id)) {
+                                        add_if_exists(p, false);
+                                    }
+                                }
                             }
                         }
                     }
+                }
 
-                    let agents_dir = library.join("LaunchAgents");
-                    if let Ok(entries) = fs::read_dir(&agents_dir) {
+                // 6. Saved State, Preferences, ByHost, SyncedPreferences, Cookies, HTTPStorages.binarycookies
+                let prefs_dir = library.join("Preferences");
+                let byhost_dir = prefs_dir.join("ByHost");
+                let synced_dir = library.join("SyncedPreferences");
+                let cookies_dir = library.join("Cookies");
+                let http_dir = library.join("HTTPStorages");
+                let sfl_dir = library.join("Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments");
+
+                for bid in &bundle_ids {
+                    add_if_exists(
+                        library
+                            .join("Saved Application State")
+                            .join(format!("{}.savedState", bid)),
+                        false,
+                    );
+                    add_if_exists(prefs_dir.join(format!("{}.plist", bid)), false);
+                    add_if_exists(synced_dir.join(format!("{}.plist", bid)), false);
+                    add_if_exists(cookies_dir.join(format!("{}.binarycookies", bid)), false);
+                    add_if_exists(http_dir.join(format!("{}.binarycookies", bid)), false);
+                    add_if_exists(
+                        library
+                            .join("Caches/com.apple.nsurlsessiond/Downloads")
+                            .join(bid),
+                        false,
+                    );
+                    add_if_exists(library.join("Caches").join(format!("{}.ShipIt", bid)), false);
+                    add_if_exists(
+                        library
+                            .join("Caches/com.plausiblelabs.crashreporter.data")
+                            .join(bid),
+                        false,
+                    );
+                    add_if_exists(library.join("Caches/com.crashlytics.data").join(bid), false);
+                    add_if_exists(library.join("Caches/Bugsnag").join(bid), false);
+
+                    let bid_lower = bid.to_ascii_lowercase();
+                    for ext in ["sfl2", "sfl3", "sfl4"] {
+                        add_if_exists(sfl_dir.join(format!("{}.{}", bid_lower, ext)), false);
+                    }
+                }
+
+                // Prefix-scan Preferences, ByHost, SyncedPreferences
+                for scan_dir in [&prefs_dir, &byhost_dir, &synced_dir] {
+                    if let Ok(entries) = fs::read_dir(scan_dir) {
                         for entry in entries.flatten() {
                             let fname = entry.file_name().to_string_lossy().into_owned();
-                            if fname.starts_with(bundle_id) && fname.ends_with(".plist") {
-                                add_if_exists(entry.path());
+                            if !fname.ends_with(".plist") {
+                                continue;
+                            }
+                            let fname_lower = fname.to_ascii_lowercase();
+                            if bundle_ids.iter().any(|b| {
+                                let bl = b.to_ascii_lowercase();
+                                fname_lower == format!("{}.plist", bl)
+                                    || fname_lower.starts_with(&format!("{}.", bl))
+                            }) {
+                                add_if_exists(entry.path(), false);
+                            }
+                        }
+                    }
+                }
+
+                // 7. ShipIt, CrashReporter, Updaters, Cookies by name
+                for nk in &name_keys {
+                    add_if_exists(library.join("Caches").join(format!("{}.ShipIt", nk)), false);
+                    add_if_exists(
+                        library.join("Caches").join(format!("{}-updater", nk)),
+                        false,
+                    );
+                    add_if_exists(library.join("Caches/KSCrash").join(nk), false);
+                    add_if_exists(library.join("Caches/SentryCrash").join(nk), false);
+                    add_if_exists(cookies_dir.join(format!("{}.binarycookies", nk)), false);
+                }
+
+                let crash_dir = library.join("Application Support/CrashReporter");
+                if let Ok(entries) = fs::read_dir(&crash_dir) {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        if fname.ends_with(".plist") {
+                            let fl = fname.to_ascii_lowercase();
+                            if name_keys
+                                .iter()
+                                .any(|nk| fl.starts_with(&format!("{}_", nk.to_ascii_lowercase())))
+                            {
+                                add_if_exists(entry.path(), false);
+                            }
+                        }
+                    }
+                }
+
+                // 8. NativeMessagingHosts JSON manifests pointing inside app_path
+                if !app_path.is_empty() {
+                    let nmh_dirs = [
+                        library.join("Application Support/Google/Chrome/NativeMessagingHosts"),
+                        library.join("Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+                        library.join("Application Support/Microsoft Edge/NativeMessagingHosts"),
+                        library.join("Application Support/Arc/User Data/NativeMessagingHosts"),
+                        library.join("Application Support/Mozilla/NativeMessagingHosts"),
+                    ];
+                    let app_prefix = format!("{}/", app_path.trim_end_matches('/'));
+                    for nmh_dir in nmh_dirs {
+                        if let Ok(entries) = fs::read_dir(&nmh_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                                    if let Ok(text) = fs::read_to_string(&p) {
+                                        if let Ok(v) =
+                                            serde_json::from_str::<serde_json::Value>(&text)
+                                        {
+                                            if let Some(target) =
+                                                v.get("path").and_then(|x| x.as_str())
+                                            {
+                                                if target == app_path
+                                                    || target.starts_with(&app_prefix)
+                                                {
+                                                    add_if_exists(p, false);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 9. XDG paths (~/.config, ~/.cache, ~/.local/share) & User Plug-Ins
+                if !has_sibling_app {
+                    for xdg_root in [
+                        home_path.join(".config"),
+                        home_path.join(".cache"),
+                        home_path.join(".local/share"),
+                    ] {
+                        for nk in &name_keys {
+                            add_if_exists(xdg_root.join(nk), false);
+                        }
+                    }
+                }
+                for plugin_dir_name in [
+                    "Internet Plug-Ins",
+                    "QuickLook",
+                    "Spotlight",
+                    "Screen Savers",
+                    "PreferencePanes",
+                    "Services",
+                ] {
+                    let dir = library.join(plugin_dir_name);
+                    if let Ok(entries) = fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let fname = entry.file_name().to_string_lossy().into_owned();
+                            let stem = Path::new(&fname)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if name_keys.iter().any(|nk| nk.eq_ignore_ascii_case(&stem))
+                                || bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(&stem))
+                            {
+                                add_if_exists(entry.path(), false);
+                            }
+                        }
+                    }
+                }
+
+                // 10. Vendor-nested folders (<Vendor>/<Product>)
+                let parts: Vec<&str> = bundle_id.split('.').collect();
+                if parts.len() >= 3 {
+                    let vendor = parts[1];
+                    if !is_common_generic_name(vendor) {
+                        for sub in ["Application Support", "Caches", "Logs"] {
+                            let base_dir = library.join(sub);
+                            if let Ok(v_entries) = fs::read_dir(&base_dir) {
+                                for ve in v_entries.flatten() {
+                                    let vname = ve.file_name().to_string_lossy().into_owned();
+                                    if vname.eq_ignore_ascii_case(vendor) && ve.path().is_dir() {
+                                        for nk in &name_keys {
+                                            add_if_exists(ve.path().join(nk), false);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 11. Special-app rules (VS Code, Xcode, JetBrains, Android Studio, Claude Desktop, Docker, Anki, Godot)
+                let bid_lower = bundle_id.to_ascii_lowercase();
+                if bid_lower == "com.microsoft.vscode" {
+                    add_if_exists(library.join("Application Support/Code"), false);
+                    add_if_exists(home_path.join(".vscode"), false);
+                } else if bid_lower == "com.microsoft.vscodeinsiders" {
+                    add_if_exists(library.join("Application Support/Code - Insiders"), false);
+                    add_if_exists(home_path.join(".vscode-insiders"), false);
+                } else if bid_lower == "com.apple.dt.xcode" {
+                    add_if_exists(library.join("Developer/Xcode"), false);
+                } else if bid_lower.starts_with("com.jetbrains.") {
+                    if let Some(sel) = read_jetbrains_paths_selector(&app_path_buf) {
+                        add_if_exists(library.join("Application Support/JetBrains").join(&sel), false);
+                        add_if_exists(library.join("Caches/JetBrains").join(&sel), false);
+                        add_if_exists(library.join("Logs/JetBrains").join(&sel), false);
+                    }
+                } else if bid_lower.starts_with("com.google.android.studio") {
+                    if let Some(sel) = read_jetbrains_paths_selector(&app_path_buf) {
+                        add_if_exists(library.join("Application Support/Google").join(&sel), false);
+                        add_if_exists(library.join("Caches/Google").join(&sel), false);
+                        add_if_exists(library.join("Logs/Google").join(&sel), false);
+                    }
+                } else if bid_lower == "com.anthropic.claudefordesktop" {
+                    add_if_exists(library.join("Application Support/Claude"), false);
+                    add_if_exists(library.join("Application Support/Claude-3p"), false);
+                } else if bid_lower == "com.docker.docker" {
+                    add_if_exists(home_path.join(".docker/buildx"), false);
+                    add_if_exists(home_path.join(".docker/scan"), false);
+                    add_if_exists(library.join("Group Containers/group.com.docker"), false);
+                } else if bid_lower == "net.ankiweb.dtop" || bid_lower == "net.ankisrs.anki" {
+                    add_if_exists(library.join("Application Support/Anki2"), false);
+                } else if bid_lower == "org.godotengine.godot" {
+                    add_if_exists(library.join("Application Support/Godot"), false);
+                    add_if_exists(library.join("Caches/Godot"), false);
+                }
+
+                // 12. User LaunchAgents (filename prefix OR plist Program/ProgramArguments[0]/Label ownership)
+                let agents_dir = library.join("LaunchAgents");
+                if let Ok(entries) = fs::read_dir(&agents_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        if !fname.ends_with(".plist") {
+                            continue;
+                        }
+                        let fname_lower = fname.to_ascii_lowercase();
+                        let name_match = bundle_ids.iter().any(|b| {
+                            let bl = b.to_ascii_lowercase();
+                            fname_lower == format!("{}.plist", bl)
+                                || fname_lower.starts_with(&format!("{}.", bl))
+                        });
+                        if name_match || launch_plist_owned_by_app(&p, &bundle_ids, app_path) {
+                            add_if_exists(p, false);
+                        }
+                    }
+                }
+
+                // 13. System-level remnants (read-only detection, unchecked by default)
+                let sys_lib = Path::new("/Library");
+                for subdir in ["Application Support", "Caches", "Logs"] {
+                    let dir = sys_lib.join(subdir);
+                    for bid in &bundle_ids {
+                        add_if_exists(dir.join(bid), true);
+                    }
+                    if !has_sibling_app {
+                        for nk in &name_keys {
+                            add_if_exists(dir.join(nk), true);
+                        }
+                    }
+                }
+                for bid in &bundle_ids {
+                    add_if_exists(sys_lib.join("Preferences").join(format!("{}.plist", bid)), true);
+                    add_if_exists(sys_lib.join("PrivilegedHelperTools").join(bid), true);
+                }
+                if !has_sibling_app {
+                    for nk in &name_keys {
+                        add_if_exists(Path::new("/Users/Shared").join(nk), true);
+                    }
+                }
+                for sys_launch in [sys_lib.join("LaunchAgents"), sys_lib.join("LaunchDaemons")] {
+                    if let Ok(entries) = fs::read_dir(&sys_launch) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            let fname = entry.file_name().to_string_lossy().into_owned();
+                            if !fname.ends_with(".plist") {
+                                continue;
+                            }
+                            let fl = fname.to_ascii_lowercase();
+                            let name_match = bundle_ids.iter().any(|b| {
+                                let bl = b.to_ascii_lowercase();
+                                fl == format!("{}.plist", bl)
+                                    || fl.starts_with(&format!("{}.", bl))
+                            });
+                            if name_match || launch_plist_owned_by_app(&p, &bundle_ids, app_path) {
+                                add_if_exists(p, true);
+                            }
+                        }
+                    }
+                }
+                if !bundle_ids.is_empty() {
+                    if let Ok(entries) = fs::read_dir("/private/var/db/receipts") {
+                        for entry in entries.flatten() {
+                            let fname = entry.file_name().to_string_lossy().into_owned();
+                            let fl = fname.to_ascii_lowercase();
+                            if (fl.ends_with(".plist") || fl.ends_with(".bom"))
+                                && bundle_ids.iter().any(|b| {
+                                    let bl = b.to_ascii_lowercase();
+                                    fl.starts_with(&format!("{}.", bl))
+                                })
+                            {
+                                add_if_exists(entry.path(), true);
                             }
                         }
                     }
@@ -1249,7 +2147,7 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
 
                 let mut records: Vec<LeftoverRecord> = candidates
                     .into_par_iter()
-                    .map(|p| {
+                    .map(|(p, is_system)| {
                         let path_str = p.to_string_lossy().into_owned();
                         let display_path = if !home.is_empty() && path_str.starts_with(&home) {
                             format!("~{}", &path_str[home.len()..])
@@ -1258,16 +2156,27 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                         };
                         let category = categorize_leftover(&path_str).to_string();
                         let size_bytes = calculate_path_size_accurate(&p);
+                        let (default_selected, holdback_reason) =
+                            evaluate_holdback(&path_str, &home, is_system);
                         LeftoverRecord {
                             path: path_str,
                             display_path,
                             category,
                             size_bytes,
+                            is_system,
+                            default_selected,
+                            holdback_reason,
                         }
                     })
                     .collect();
 
-                records.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+                // Sort user items first (selected first, then held-back), system items last; within each group largest first
+                records.sort_unstable_by(|a, b| {
+                    a.is_system
+                        .cmp(&b.is_system)
+                        .then_with(|| b.default_selected.cmp(&a.default_selected))
+                        .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+                });
                 records
             },
             || find_installed_cask_parallel(app_name, app_path, brew_prefix),
@@ -1276,6 +2185,8 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
         let payload = UninstallInspectionPayload {
             leftovers,
             homebrew_cask_token: cask_token,
+            has_sibling_app,
+            official_uninstaller_vendor,
         };
         string_to_cstr(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into()))
     });

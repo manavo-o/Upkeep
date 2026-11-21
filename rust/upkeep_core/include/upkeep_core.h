@@ -55,8 +55,19 @@ uint32_t upkeep_brew_index_load_api_json(
     const char *prefix_utf8
 );
 
+/// Refreshes only local Cellar/Caskroom/pinned state in-place (~5ms) without re-parsing API JSON.
+/// Returns the number of installed packages found.
+uint32_t upkeep_brew_index_refresh_local(
+    BrewSearchIndex *ptr,
+    const char *prefix_utf8
+);
+
 /// Returns all installed packages from the merged API + local index as JSON (sorted by name).
 char *upkeep_brew_index_installed_json(const BrewSearchIndex *ptr);
+
+/// Fast parallel native macOS user cache scanner using getattrlistbulk + Rayon (~50-150ms).
+/// Returns a newly allocated JSON payload with total_bytes and sorted cache items.
+char *upkeep_scan_caches_json(void);
 
 /// Searches the index with parallel nucleo fuzzy matching. Returns a newly allocated JSON string.
 /// Filter mode: -1 = all, 0 = formulae only, 1 = casks only.
