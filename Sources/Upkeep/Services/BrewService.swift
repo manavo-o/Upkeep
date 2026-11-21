@@ -30,9 +30,17 @@ public final class BrewLogStore {
     }()
 
     private init() {
-        if let data = try? Data(contentsOf: Self.fileURL),
-           let decoded = try? JSONDecoder().decode(BrewOperationLog.self, from: data) {
-            self.lastLog = decoded
+        let url = Self.fileURL
+        Task.detached(priority: .utility) {
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode(BrewOperationLog.self, from: data) else {
+                return
+            }
+            await MainActor.run {
+                if BrewLogStore.shared.lastLog == nil {
+                    BrewLogStore.shared.lastLog = decoded
+                }
+            }
         }
     }
 
@@ -62,14 +70,20 @@ public final class BrewLogStore {
 
     public func clear() {
         self.lastLog = nil
-        try? FileManager.default.removeItem(at: Self.fileURL)
+        let url = Self.fileURL
+        Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     private func persist(_ entry: BrewOperationLog) {
-        let dir = Self.fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(entry) {
-            try? data.write(to: Self.fileURL, options: .atomic)
+        let url = Self.fileURL
+        Task.detached(priority: .utility) {
+            let dir = url.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            if let data = try? JSONEncoder().encode(entry) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 }
@@ -256,6 +270,16 @@ public actor BrewService {
         }
 
         let task = Task<[BrewPackageItem], Error> {
+            #if USE_RUST_UPKEEP_CORE
+            // Fast path: zero Ruby subprocess spawns when Rust API + local Cellar/Caskroom merge succeeds (~15-40ms).
+            if await self.ensureRemoteCatalogLoaded() {
+                let fastInstalled = self.rustRemoteIndex.installedPackages()
+                if !fastInstalled.isEmpty {
+                    return fastInstalled
+                }
+            }
+            #endif
+
             async let installedTask = CLIExecutor.run(
                 binary: "brew",
                 arguments: ["info", "--json=v2", "--installed"],
@@ -416,18 +440,43 @@ public actor BrewService {
         return try? Data(contentsOf: dataURL)
     }
 
-    private func ensureRemoteCatalogLoaded() async -> [BrewPackageItem] {
+    /// Returns true when the remote Homebrew catalog is already warm in memory (zero debounce needed).
+    public func hasWarmRemoteIndex() -> Bool {
+        #if USE_RUST_UPKEEP_CORE
+        if rustRemoteIndex.count > 0 { return true }
+        #endif
+        return !remoteCatalog.isEmpty
+    }
+
+    private func ensureRemoteCatalogLoaded() async -> Bool {
+        #if USE_RUST_UPKEEP_CORE
+        if rustRemoteIndex.count > 0,
+           let last = lastRemoteCatalogFetch,
+           Date().timeIntervalSince(last) < 6 * 3600 {
+            return true
+        }
+        #else
         if !remoteCatalog.isEmpty,
            let last = lastRemoteCatalogFetch,
            Date().timeIntervalSince(last) < 6 * 3600 {
-            return remoteCatalog
+            return true
         }
+        #endif
 
         if let inFlight = inFlightRemoteCatalogTask {
-            return await inFlight.value
+            let items = await inFlight.value
+            #if USE_RUST_UPKEEP_CORE
+            return rustRemoteIndex.count > 0 || !items.isEmpty
+            #else
+            return !items.isEmpty
+            #endif
         }
 
         let localMap = catalogLookup
+        #if USE_RUST_UPKEEP_CORE
+        let rustIndex = self.rustRemoteIndex
+        #endif
+
         let task = Task<[BrewPackageItem], Never> {
             async let formulaeData = Self.fetchOrLoadCachedJSON(
                 urlString: "https://formulae.brew.sh/api/formula.json",
@@ -439,6 +488,15 @@ public actor BrewService {
             )
 
             let (fData, cData) = await (formulaeData, casksData)
+
+            #if USE_RUST_UPKEEP_CORE
+            // Zero-copy raw-byte ingestion directly into Rust (skips Swift decoding 15k structs + re-encoding!)
+            let loadedCount = rustIndex.loadAPI(formulaeData: fData, casksData: cData)
+            if loadedCount > 0 {
+                return []
+            }
+            #endif
+
             var merged: [BrewPackageItem] = []
             merged.reserveCapacity(16_000)
             let decoder = JSONDecoder()
@@ -483,14 +541,20 @@ public actor BrewService {
         inFlightRemoteCatalogTask = task
         let loaded = await task.value
         inFlightRemoteCatalogTask = nil
+
+        #if USE_RUST_UPKEEP_CORE
+        if rustRemoteIndex.count > 0 {
+            lastRemoteCatalogFetch = Date()
+            return true
+        }
+        #endif
+
         if !loaded.isEmpty {
             remoteCatalog = loaded
             lastRemoteCatalogFetch = Date()
-            #if USE_RUST_UPKEEP_CORE
-            rustRemoteIndex.load(items: loaded)
-            #endif
+            return true
         }
-        return loaded
+        return false
     }
 
     public func searchRemote(query: String, filterCasks: Bool? = nil) async throws -> [BrewPackageItem] {
@@ -498,13 +562,13 @@ public actor BrewService {
         guard !trimmed.isEmpty else { return fuzzySearchLocal(query: "", filterCasks: filterCasks) }
 
         // Fast path: search cached Homebrew JSON API in-memory (Rust nucleo when linked, zero-alloc Swift otherwise)
-        let apiCatalog = await ensureRemoteCatalogLoaded()
-        if !apiCatalog.isEmpty {
+        let hasRemote = await ensureRemoteCatalogLoaded()
+        if hasRemote {
             #if USE_RUST_UPKEEP_CORE
-            let rustHits = rustRemoteIndex.search(query: trimmed, filterCasks: filterCasks, limit: 80)
+            let rustHits = rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 80)
             if !rustHits.isEmpty { return rustHits }
             #else
-            let hits = scorePool(apiCatalog, query: trimmed, filterCasks: filterCasks, limit: 80)
+            let hits = scorePool(remoteCatalog, query: trimmed, filterCasks: filterCasks, limit: 80)
             if !hits.isEmpty { return hits }
             #endif
         }
@@ -633,7 +697,21 @@ public actor BrewService {
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
-        _ = try? await loadInstalledAndOutdated(forceRefresh: true)
+        // Update in-memory immediately instead of spawning two Ruby brew processes
+        let updated = catalog.map { item -> BrewPackageItem in
+            guard item.name == name && !item.isCask else { return item }
+            return BrewPackageItem(
+                name: item.name,
+                description: item.description,
+                version: item.version,
+                isCask: false,
+                isInstalled: item.isInstalled,
+                isOutdated: false,
+                isPinned: true,
+                homepage: item.homepage
+            )
+        }
+        updateLocalCatalog(updated)
         return CLIExecutor.stripANSI(res.stdout)
     }
 
@@ -644,7 +722,20 @@ public actor BrewService {
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
-        _ = try? await loadInstalledAndOutdated(forceRefresh: true)
+        let updated = catalog.map { item -> BrewPackageItem in
+            guard item.name == name && !item.isCask else { return item }
+            return BrewPackageItem(
+                name: item.name,
+                description: item.description,
+                version: item.version,
+                isCask: false,
+                isInstalled: item.isInstalled,
+                isOutdated: item.isOutdated,
+                isPinned: false,
+                homepage: item.homepage
+            )
+        }
+        updateLocalCatalog(updated)
         return CLIExecutor.stripANSI(res.stdout)
     }
 

@@ -80,8 +80,9 @@ public final class HomebrewHUDModel {
         let currentQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if currentQuery.isEmpty {
-            Task {
+            searchTask = Task {
                 let local = await BrewService.shared.fuzzySearchLocal(query: "", filterCasks: caskFilter)
+                guard !Task.isCancelled else { return }
                 self.packages = filterForTab(local)
                 self.selectedID = self.packages.first?.id
             }
@@ -90,15 +91,21 @@ public final class HomebrewHUDModel {
 
         searchTask = Task {
             let local = await BrewService.shared.fuzzySearchLocal(query: currentQuery, filterCasks: caskFilter)
+            guard !Task.isCancelled else { return }
             if !local.isEmpty {
                 self.packages = filterForTab(local)
                 self.selectedID = self.packages.first?.id
             }
 
-            try? await Task.sleep(for: .milliseconds(220))
+            // Skip artificial 220ms lag when the remote catalog is already warm in memory (~1-3ms search)
+            let isWarm = await BrewService.shared.hasWarmRemoteIndex()
+            let debounceMs = isWarm ? 25 : 220
+            try? await Task.sleep(for: .milliseconds(debounceMs))
             guard !Task.isCancelled else { return }
 
-            self.isLoading = true
+            if !isWarm {
+                self.isLoading = true
+            }
             if let remote = try? await BrewService.shared.searchRemote(query: currentQuery, filterCasks: caskFilter), !Task.isCancelled {
                 self.packages = filterForTab(remote)
                 self.selectedID = self.packages.first?.id

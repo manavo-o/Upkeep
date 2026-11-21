@@ -58,7 +58,6 @@ public struct MainWindowView: View {
         .onAppear {
             vm.selectedAwakeMode = keepAwake.mode
             cleaning.refreshPermissionStatus()
-            vm.refreshOverview()
             updater.checkIfDue()
             handleSectionAppear(vm.activeSection)
         }
@@ -1150,26 +1149,9 @@ private struct CleanerWorkspacePane: View {
 
 // MARK: - 4. Uninstaller (Unified macOS 27 Workspace + Leftover & Homebrew Cask Review)
 
-private enum UninstallerSort: String, CaseIterable, Identifiable {
-    case name = "Name"
-    case size = "Size"
-
-    var id: String { rawValue }
-}
-
 private struct UninstallerWorkspacePane: View {
     @Bindable var vm: TrayViewModel
-    @State private var sortOrder: UninstallerSort = .name
     @State private var copiedError = false
-
-    private var sortedApps: [MoleInstalledApp] {
-        switch sortOrder {
-        case .name:
-            return vm.filteredApps
-        case .size:
-            return vm.filteredApps.sorted { ($0.size ?? 0) > ($1.size ?? 0) }
-        }
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1185,8 +1167,8 @@ private struct UninstallerWorkspacePane: View {
                         }
                     )
 
-                    Picker("Sort", selection: $sortOrder) {
-                        ForEach(UninstallerSort.allCases) { order in
+                    Picker("Sort", selection: $vm.appSortOrder) {
+                        ForEach(TrayViewModel.AppSortOrder.allCases) { order in
                             Text(order.rawValue).tag(order)
                         }
                     }
@@ -1313,7 +1295,7 @@ private struct UninstallerWorkspacePane: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 4) {
-                        ForEach(sortedApps.prefix(200)) { app in
+                        ForEach(vm.filteredApps.prefix(200)) { app in
                             UninstallerAppRow(
                                 app: app,
                                 isPending: vm.pendingUninstallApp?.id == app.id,

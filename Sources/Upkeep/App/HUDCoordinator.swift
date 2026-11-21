@@ -33,7 +33,8 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             trayViewModel.activeSection = section
         }
 
-        if mainWindowController == nil {
+        let isNewWindow = mainWindowController == nil
+        if isNewWindow {
             let rootView = MainWindowView(vm: trayViewModel, coordinator: self)
             let hostingController = NSHostingController(rootView: rootView)
 
@@ -67,8 +68,10 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         NSApp.activate(ignoringOtherApps: true)
         enforceSidebarWidth(on: mainWindowController?.window)
 
-        trayViewModel.refreshOverview()
-        CleaningModeManager.shared.refreshPermissionStatus()
+        if !isNewWindow {
+            trayViewModel.refreshOverview()
+            CleaningModeManager.shared.refreshPermissionStatus()
+        }
 
         if triggerUpdateCheck {
             Task {

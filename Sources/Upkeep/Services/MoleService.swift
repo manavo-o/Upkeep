@@ -244,24 +244,44 @@ public actor MoleService {
     }
 
     /// Inspects an installed app before removal: discovers exact `~/Library` leftover files with sizes
-    /// and cross-checks Homebrew's Caskroom to see if the app is cask-managed.
+    /// and cross-checks Homebrew's Caskroom in parallel (Rust `getattrlistbulk` + Rayon when linked).
     public func inspectAppForUninstall(_ app: MoleInstalledApp) async -> UninstallInspection {
-        let urls = Self.discoverLeftoverURLs(for: app)
+        if let rustInspection = await UpkeepEngine.inspectAppForUninstallRust(app: app) {
+            return rustInspection
+        }
+
+        async let caskTokenTask: String? = Task.detached(priority: .userInitiated) {
+            BrewService.isInstalled()
+                ? BrewService.findInstalledCask(forAppName: app.name, appPath: app.path)
+                : nil
+        }.value
+
+        let urls = await Task.detached(priority: .userInitiated) {
+            Self.discoverLeftoverURLs(for: app)
+        }.value
+
         let homePath = FileManager.default.homeDirectoryForCurrentUser.path
-        let leftovers: [UninstallLeftoverItem] = urls.map { url in
-            let path = url.path
-            let display = path.hasPrefix(homePath)
-                ? "~" + path.dropFirst(homePath.count)
-                : path
-            let category = Self.categorizeLeftover(path: path)
-            let size = Self.directoryOrFileSize(at: url)
-            return UninstallLeftoverItem(path: path, displayPath: display, category: category, sizeBytes: size)
-        }.sorted { $0.sizeBytes > $1.sizeBytes }
+        let leftovers: [UninstallLeftoverItem] = await withTaskGroup(of: UninstallLeftoverItem.self) { group in
+            for url in urls {
+                group.addTask {
+                    let path = url.path
+                    let display = path.hasPrefix(homePath)
+                        ? "~" + path.dropFirst(homePath.count)
+                        : path
+                    let category = Self.categorizeLeftover(path: path)
+                    let size = UpkeepEngine.calculatePathSize(atPath: path)
+                    return UninstallLeftoverItem(path: path, displayPath: display, category: category, sizeBytes: size)
+                }
+            }
+            var items: [UninstallLeftoverItem] = []
+            items.reserveCapacity(urls.count)
+            for await item in group {
+                items.append(item)
+            }
+            return items.sorted { $0.sizeBytes > $1.sizeBytes }
+        }
 
-        let caskToken = BrewService.isInstalled()
-            ? BrewService.findInstalledCask(forAppName: app.name, appPath: app.path)
-            : nil
-
+        let caskToken = await caskTokenTask
         return UninstallInspection(app: app, leftovers: leftovers, homebrewCaskToken: caskToken)
     }
 

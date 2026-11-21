@@ -67,11 +67,20 @@ public final class TrayViewModel {
     public var isCleaning: Bool = false
     public var cleanError: String?
 
+    public enum AppSortOrder: String, CaseIterable, Identifiable, Sendable {
+        case name = "Name"
+        case size = "Size"
+        public var id: String { rawValue }
+    }
+
     // Mole Uninstaller state
     public var installedApps: [MoleInstalledApp] = [] {
         didSet { recomputeFilteredApps() }
     }
     public var appQuery: String = "" {
+        didSet { recomputeFilteredApps() }
+    }
+    public var appSortOrder: AppSortOrder = .name {
         didSet { recomputeFilteredApps() }
     }
     public private(set) var filteredApps: [MoleInstalledApp] = []
@@ -96,17 +105,22 @@ public final class TrayViewModel {
 
     private func recomputeFilteredApps() {
         let q = appQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else {
-            filteredApps = installedApps
-            return
+        var base: [MoleInstalledApp]
+        if q.isEmpty {
+            base = installedApps
+        } else {
+            base = installedApps
+                .compactMap { app -> (MoleInstalledApp, Int)? in
+                    guard let score = SwiftFuzzyMatcher.score(query: q, candidate: app.name) else { return nil }
+                    return (app, score)
+                }
+                .sorted { $0.1 > $1.1 }
+                .map(\.0)
         }
-        filteredApps = installedApps
-            .compactMap { app -> (MoleInstalledApp, Int)? in
-                guard let score = SwiftFuzzyMatcher.score(query: q, candidate: app.name) else { return nil }
-                return (app, score)
-            }
-            .sorted { $0.1 > $1.1 }
-            .map(\.0)
+        if appSortOrder == .size {
+            base.sort { ($0.size ?? 0) > ($1.size ?? 0) }
+        }
+        filteredApps = base
     }
 
     public func refreshOverview(force: Bool = false) {
@@ -196,6 +210,15 @@ public final class TrayViewModel {
         isLoadingApps = true
         uninstallError = nil
         Task {
+            // Phase 1: instant app list (<15ms) when empty so UI never blocks on large bundles like Xcode
+            if self.installedApps.isEmpty {
+                let quickApps = await UpkeepEngine.scanInstalledApplicationsMetadata()
+                if !quickApps.isEmpty {
+                    self.installedApps = quickApps
+                    self.isLoadingApps = false
+                }
+            }
+            // Phase 2: populate APFS-accurate bundle sizes in parallel
             do {
                 self.installedApps = try await MoleService.shared.listInstalledApps(forceRefresh: force)
             } catch {

@@ -68,7 +68,7 @@ public final class CleaningModeManager {
         }
     }
 
-    public static func hasAccessibilityPermission(prompt: Bool = false) -> Bool {
+    public nonisolated static func hasAccessibilityPermission(prompt: Bool = false) -> Bool {
         if prompt {
             let key = "AXTrustedCheckOptionPrompt" as CFString
             let options = [key: kCFBooleanTrue] as CFDictionary
@@ -91,11 +91,26 @@ public final class CleaningModeManager {
         return probe != nil
     }
 
+    private var lastPermissionProbeAt: Date = .distantPast
+
     public func refreshPermissionStatus() {
-        let trusted = Self.hasAccessibilityPermission(prompt: false)
-        hasAccessibility = trusted
-        if trusted {
+        if AXIsProcessTrusted() {
+            hasAccessibility = true
             permissionDenied = false
+            return
+        }
+        // Avoid spawning a throwaway CGEvent Mach port on MainActor on every window focus
+        let now = Date()
+        guard now.timeIntervalSince(lastPermissionProbeAt) > 2.0 else { return }
+        lastPermissionProbeAt = now
+        Task.detached(priority: .utility) {
+            let trusted = Self.hasAccessibilityPermission(prompt: false)
+            await MainActor.run {
+                self.hasAccessibility = trusted
+                if trusted {
+                    self.permissionDenied = false
+                }
+            }
         }
     }
 

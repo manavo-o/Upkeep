@@ -268,14 +268,13 @@ public enum CLIExecutor {
                 self.continuation = continuation
             }
 
-            func appendAndCheckTrigger(_ bytes: [UInt8], count: Int, trigger: String?) -> Bool {
+            func appendAndCheckTrigger(_ bytes: [UInt8], count: Int, triggerBytes: Data?) -> Bool {
                 lock.lock()
                 data.append(bytes, count: count)
                 var shouldConfirm = false
-                if !confirmed, let trigger, !trigger.isEmpty {
+                if !confirmed, let triggerBytes, !triggerBytes.isEmpty {
                     let tailSlice = data.suffix(2048)
-                    if let text = String(data: tailSlice, encoding: .utf8),
-                       text.contains(trigger) {
+                    if tailSlice.range(of: triggerBytes) != nil {
                         confirmed = true
                         shouldConfirm = true
                     }
@@ -318,13 +317,14 @@ public enum CLIExecutor {
                     return
                 }
 
+                let triggerBytes = autoConfirmTrigger.map { Data($0.utf8) }
                 // Read PTY master using raw POSIX read() so EIO on slave close exits cleanly
                 DispatchQueue.global(qos: .userInitiated).async {
                     var buffer = [UInt8](repeating: 0, count: 4096)
                     while true {
                         let n = Darwin.read(masterFD, &buffer, buffer.count)
                         if n > 0 {
-                            if state.appendAndCheckTrigger(buffer, count: n, trigger: autoConfirmTrigger) {
+                            if state.appendAndCheckTrigger(buffer, count: n, triggerBytes: triggerBytes) {
                                 let payload = Array(autoConfirmInput.utf8)
                                 DispatchQueue.global(qos: .userInitiated).asyncAfter(
                                     deadline: .now() + .milliseconds(Int(confirmDelayMs))

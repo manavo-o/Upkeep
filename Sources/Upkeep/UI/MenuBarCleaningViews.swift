@@ -185,7 +185,7 @@ public struct MenuBarCleanerTab: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 3) {
+                    LazyVStack(alignment: .leading, spacing: 3) {
                         ForEach(Array(summary.lines.prefix(120).enumerated()), id: \.offset) { idx, line in
                             cleanLineRow(line, index: idx)
                         }
@@ -598,7 +598,7 @@ public struct UninstallerAppRow: View {
     }
 }
 
-/// Native macOS App Icon renderer with NSCache-backed NSWorkspace icon lookup.
+/// Native macOS App Icon renderer with NSCache-backed asynchronous NSWorkspace icon lookup.
 public struct AppIconView: View {
     private static let iconCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
@@ -609,35 +609,47 @@ public struct AppIconView: View {
     let path: String
     var size: CGFloat = 24
 
+    @State private var loadedIcon: NSImage?
+
     public init(path: String, size: CGFloat = 24) {
         self.path = path
         self.size = size
-    }
-
-    private static func cachedIcon(for path: String) -> NSImage? {
-        guard !path.isEmpty else { return nil }
-        let key = path as NSString
-        if let cached = iconCache.object(forKey: key) {
-            return cached
+        if !path.isEmpty {
+            _loadedIcon = State(initialValue: Self.iconCache.object(forKey: path as NSString))
         }
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-        let icon = NSWorkspace.shared.icon(forFile: path)
-        iconCache.setObject(icon, forKey: key)
-        return icon
     }
 
     public var body: some View {
-        if let nsImage = Self.cachedIcon(for: path) {
-            Image(nsImage: nsImage)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
-        } else {
-            Image(systemName: "app.fill")
-                .font(.system(size: size * 0.6))
-                .foregroundStyle(.secondary)
-                .frame(width: size, height: size)
+        Group {
+            if let nsImage = loadedIcon {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            } else {
+                Image(systemName: "app.fill")
+                    .font(.system(size: size * 0.6))
+                    .foregroundStyle(.secondary)
+                    .frame(width: size, height: size)
+            }
+        }
+        .task(id: path) {
+            guard loadedIcon == nil, !path.isEmpty else { return }
+            let key = path as NSString
+            if let cached = Self.iconCache.object(forKey: key) {
+                loadedIcon = cached
+                return
+            }
+            let targetPath = path
+            let icon: NSImage? = await Task.detached(priority: .userInitiated) {
+                guard FileManager.default.fileExists(atPath: targetPath) else { return nil }
+                return NSWorkspace.shared.icon(forFile: targetPath)
+            }.value
+            if let icon {
+                Self.iconCache.setObject(icon, forKey: key)
+                loadedIcon = icon
+            }
         }
     }
 }
