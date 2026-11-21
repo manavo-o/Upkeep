@@ -66,75 +66,113 @@ public extension PrimitiveButtonStyle where Self == UpkeepPrimaryButtonStyle {
     }
 }
 
-// MARK: - Native Centered Grouped Settings Form Container (DockDoor / Handy / Canapé Column Rhythm)
+// MARK: - Native Centered Grouped Settings Form Container (Canapé / DockDoor / Handy Rhythm)
 
-public struct UpkeepSettingsFormView<Content: View>: View {
+public struct UpkeepSettingsFormView<Header: View, Content: View>: View {
     @Environment(\.upkeepScrollTarget) private var scrollTarget
     let maxColumnWidth: CGFloat
+    let hasHeader: Bool
+    let header: Header
     let content: Content
 
-    public init(maxColumnWidth: CGFloat = 620, @ViewBuilder content: () -> Content) {
+    public init(
+        maxColumnWidth: CGFloat = 600,
+        @ViewBuilder header: () -> Header,
+        @ViewBuilder content: () -> Content
+    ) {
         self.maxColumnWidth = maxColumnWidth
+        self.hasHeader = true
+        self.header = header()
         self.content = content()
     }
 
     public var body: some View {
         GeometryReader { geo in
-            let sideMargin = max(12, (geo.size.width - maxColumnWidth) / 2)
-            ScrollViewReader { proxy in
-                Form {
-                    content
+            let sideMargin = max(18, (geo.size.width - maxColumnWidth) / 2)
+            VStack(spacing: 0) {
+                if hasHeader {
+                    header
+                        .padding(.horizontal, sideMargin + 4)
+                        .padding(.top, 14)
+                        .padding(.bottom, 8)
                 }
-                .formStyle(.grouped)
-                .scrollContentBackground(.hidden)
-                .contentMargins(.horizontal, sideMargin, for: .scrollContent)
-                .contentMargins(.top, 8, for: .scrollContent)
-                .contentMargins(.bottom, 24, for: .scrollContent)
-                .upkeepSoftTopScrollEdge()
-                .onChange(of: scrollTarget) { _, target in
-                    guard let target else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                        withAnimation(.easeInOut(duration: 0.28)) {
-                            proxy.scrollTo(target, anchor: .center)
+
+                ScrollViewReader { proxy in
+                    Form {
+                        content
+                    }
+                    .formStyle(.grouped)
+                    .scrollContentBackground(.hidden)
+                    .contentMargins(.horizontal, sideMargin, for: .scrollContent)
+                    .contentMargins(.top, hasHeader ? 2 : 12, for: .scrollContent)
+                    .contentMargins(.bottom, 24, for: .scrollContent)
+                    .upkeepSoftTopScrollEdge()
+                    .onChange(of: scrollTarget) { _, target in
+                        guard let target else { return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                proxy.scrollTo(target, anchor: .center)
+                            }
                         }
                     }
-                }
-                .onAppear {
-                    guard let target = scrollTarget else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                        withAnimation(.easeInOut(duration: 0.28)) {
-                            proxy.scrollTo(target, anchor: .center)
+                    .onAppear {
+                        guard let target = scrollTarget else { return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                proxy.scrollTo(target, anchor: .center)
+                            }
                         }
                     }
                 }
             }
         }
+        .ignoresSafeArea(.container, edges: .top)
     }
 }
 
-// MARK: - Canapé-Style Minimalist Pane Header (Icon + Title, Zero Heavy Divider Chrome)
+public extension UpkeepSettingsFormView where Header == EmptyView {
+    init(maxColumnWidth: CGFloat = 600, @ViewBuilder content: () -> Content) {
+        self.maxColumnWidth = maxColumnWidth
+        self.hasHeader = false
+        self.header = EmptyView()
+        self.content = content()
+    }
+}
+
+// MARK: - Canapé-Style Minimalist Pane Header (Floats Directly on Canvas Aligned with Traffic Lights)
 
 public struct UpkeepPaneHeader: View {
     let section: TraySection
+    let subtitle: String?
     let trailing: AnyView?
 
-    public init(section: TraySection) {
+    public init(section: TraySection, subtitle: String? = nil) {
         self.section = section
+        self.subtitle = subtitle
         self.trailing = nil
     }
 
-    public init<Trailing: View>(section: TraySection, @ViewBuilder trailing: () -> Trailing) {
+    public init<Trailing: View>(section: TraySection, subtitle: String? = nil, @ViewBuilder trailing: () -> Trailing) {
         self.section = section
+        self.subtitle = subtitle
         self.trailing = AnyView(trailing())
     }
 
     public var body: some View {
-        HStack(spacing: 11) {
-            UpkeepSectionIcon(section: section, size: 26)
+        HStack(spacing: 10) {
+            UpkeepSectionIcon(section: section, size: 24)
 
-            Text(section.rawValue)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.primary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(section.rawValue)
+                    .font(.system(size: 16.5, weight: .semibold))
+                    .foregroundStyle(.primary)
+
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             Spacer(minLength: 8)
 
@@ -142,13 +180,10 @@ public struct UpkeepPaneHeader: View {
                 trailing
             }
         }
-        .padding(.bottom, 2)
-        .listRowBackground(Color.clear)
-        .listRowInsets(EdgeInsets(top: 4, leading: 2, bottom: 4, trailing: 2))
     }
 }
 
-// MARK: - Grouped Section with Optional Footnote Footer
+// MARK: - Grouped Section with Left-Aligned Footnote Footer (DockDoor / System Settings Pattern)
 
 public struct UpkeepSettingsSection<Content: View>: View {
     let title: String
@@ -173,6 +208,8 @@ public struct UpkeepSettingsSection<Content: View>: View {
                 Text(footer)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(.leading)
             }
         }
     }

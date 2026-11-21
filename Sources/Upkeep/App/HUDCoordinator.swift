@@ -51,25 +51,20 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             let hostingController = NSHostingController(rootView: rootView)
 
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 880, height: 610),
+                contentRect: NSRect(x: 0, y: 0, width: 780, height: 560),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
             )
-            window.minSize = NSSize(width: 740, height: 500)
+            window.minSize = NSSize(width: 700, height: 480)
             window.contentViewController = hostingController
             window.isReleasedWhenClosed = false
             window.delegate = self
             window.title = ""
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
-            window.toolbarStyle = .unified
-
-            let toolbar = NSToolbar(identifier: "UpkeepMainToolbar")
-            toolbar.delegate = self
-            toolbar.allowsUserCustomization = false
-            toolbar.autosavesConfiguration = false
-            window.toolbar = toolbar
+            window.isMovableByWindowBackground = true
+            window.toolbar = nil
 
             window.center()
             mainWindowController = NSWindowController(window: window)
@@ -141,9 +136,9 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             sidebarItem.isCollapsed = false
             sidebarItem.canCollapse = false
             sidebarItem.holdingPriority = .defaultHigh
-            sidebarItem.minimumThickness = 216
-            sidebarItem.maximumThickness = 216
-            splitView.setPosition(216, ofDividerAt: 0)
+            sidebarItem.minimumThickness = 208
+            sidebarItem.maximumThickness = 208
+            splitView.setPosition(208, ofDividerAt: 0)
         }
     }
 

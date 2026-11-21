@@ -3,11 +3,12 @@ import SwiftUI
 
 /// Dedicated macOS 27 Native Settings & Utility Window for Upkeep.
 /// Modeled on Canapé, DockDoor, Handy, and Apple System Settings:
-/// - Minimalist 216pt sidebar with pinned Liquid Glass Search (`⌘F`), bespoke squircle section badges,
-///   and quiet version footer (no bulky brand header)
-/// - Seamless transparent titlebar + Canapé-style pane headers (`[Icon] Title`)
-/// - Centered 620pt grouped reading columns with zero per-row icon clutter, clean typography,
-///   and inline `(i)` popovers
+/// - Compact 780×560 default window with minimalist 208pt sidebar, pinned Liquid Glass Search (`⌘F`),
+///   bespoke squircle section badges, and crisp version footer
+/// - Frameless Canapé-style pane headers aligned directly with the macOS traffic lights (zero dead
+///   titlebar band or orphaned toolbar icons)
+/// - Centered grouped reading columns with left-aligned footers, zero per-row icon clutter, and
+///   inline `(i)` popovers
 /// - Revamped Homebrew Downloader seamlessly wired to the floating Liquid Glass Search HUD
 public struct MainWindowView: View {
     @Bindable public var vm: TrayViewModel
@@ -31,9 +32,6 @@ public struct MainWindowView: View {
             sidebar
         } detail: {
             detailPane
-                .toolbar {
-                    toolbarContent
-                }
         }
         .background {
             Button("Find") {
@@ -85,10 +83,10 @@ public struct MainWindowView: View {
             HStack(spacing: 6) {
                 Text("Upkeep")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                 Text("v\(updater.currentVersion)")
                     .font(.system(size: 11, design: .rounded))
-                    .foregroundStyle(.quaternary)
+                    .foregroundStyle(.tertiary)
                 Spacer()
                 if updater.hasUpdateAvailable {
                     Button("Update") {
@@ -102,7 +100,7 @@ public struct MainWindowView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
-        .navigationSplitViewColumnWidth(min: 216, ideal: 216, max: 216)
+        .navigationSplitViewColumnWidth(min: 208, ideal: 208, max: 208)
         .toolbar(removing: .sidebarToggle)
     }
 
@@ -186,85 +184,6 @@ public struct MainWindowView: View {
         .padding(.horizontal, 12)
     }
 
-    // MARK: - Minimalist Contextual Toolbar
-
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        ToolbarItemGroup(placement: .primaryAction) {
-            if keepAwake.isActive {
-                CaffeinateToolbarBadge(mode: keepAwake.mode, expiresAt: keepAwake.expiresAt) {
-                    withAnimation(.snappy(duration: 0.2)) {
-                        keepAwake.stop()
-                    }
-                }
-            }
-
-            if searchEngine.isSearching {
-                Button {
-                    searchEngine.query = ""
-                    isSearchFieldFocused = false
-                } label: {
-                    Label("Clear Search", systemImage: "xmark")
-                }
-                .help("Clear search results")
-            } else {
-                switch vm.activeSection {
-                case .controls:
-                    Button {
-                        withAnimation(.snappy(duration: 0.2)) {
-                            if keepAwake.isActive {
-                                keepAwake.stop()
-                            } else {
-                                keepAwake.start(durationMinutes: 60, mode: vm.selectedAwakeMode)
-                            }
-                        }
-                    } label: {
-                        Label(
-                            keepAwake.isActive ? "Stop Caffeinate" : "Keep Awake (1h)",
-                            systemImage: keepAwake.isActive ? "cup.and.saucer.fill" : "cup.and.saucer"
-                        )
-                    }
-                    .help(keepAwake.isActive ? "Turn off Caffeinate" : "Keep Mac awake for 1 hour")
-
-                case .homebrew:
-                    Button {
-                        coordinator.showHomebrewHUD()
-                    } label: {
-                        Label("Search HUD", systemImage: "magnifyingglass")
-                    }
-                    .help("Open floating Homebrew Search HUD")
-
-                case .cleaner:
-                    Button {
-                        vm.runMoleDryRun()
-                    } label: {
-                        Label("Rescan", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(vm.isScanningClean || vm.isCleaning)
-                    .help("Rescan cleanable caches")
-
-                case .uninstaller:
-                    Button {
-                        vm.loadApps(force: true)
-                    } label: {
-                        Label("Reload", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(vm.isLoadingApps)
-                    .help("Reload installed applications")
-
-                case .updates:
-                    Button {
-                        Task { await updater.checkForUpdates() }
-                    } label: {
-                        Label("Check Now", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(updater.isChecking || updater.isInstalling)
-                    .help("Check for Upkeep updates")
-                }
-            }
-        }
-    }
-
     // MARK: - Detail Content Area
 
     @ViewBuilder
@@ -324,7 +243,7 @@ public struct MainWindowView: View {
     }
 }
 
-// MARK: - Isolated Live Caffeinate Toolbar Badge (Zero 1 Hz Parent Re-renders)
+// MARK: - Isolated Live Caffeinate Badge (Zero 1 Hz Parent Re-renders)
 
 private struct CaffeinateToolbarBadge: View {
     let mode: KeepAwakeMode
@@ -365,10 +284,16 @@ private struct PowerAndInputSettingsPane: View {
 
     var body: some View {
         UpkeepSettingsFormView {
-            Section {
-                UpkeepPaneHeader(section: .controls)
+            UpkeepPaneHeader(section: .controls) {
+                if keepAwake.isActive {
+                    CaffeinateToolbarBadge(mode: keepAwake.mode, expiresAt: keepAwake.expiresAt) {
+                        withAnimation(.snappy(duration: 0.2)) {
+                            keepAwake.stop()
+                        }
+                    }
+                }
             }
-
+        } content: {
             if cleaning.permissionDenied || !cleaning.hasAccessibility {
                 Section {
                     UpkeepSettingsCallout(
@@ -532,8 +457,10 @@ private struct PowerAndInputSettingsPane: View {
                     }
                     .pickerStyle(.segmented)
 
-                    UpkeepResetButton(isModified: vm.cleaningDuration != 60) {
-                        vm.cleaningDuration = 60
+                    if vm.cleaningDuration != 60 {
+                        UpkeepResetButton(isModified: true) {
+                            vm.cleaningDuration = 60
+                        }
                     }
                 }
                 .upkeepSearchTarget("power.lockDuration")
@@ -635,42 +562,40 @@ private struct HomebrewSettingsPane: View {
     }
 
     var body: some View {
-        UpkeepSettingsFormView(maxColumnWidth: 660) {
-            Section {
-                UpkeepPaneHeader(section: .homebrew) {
-                    HStack(spacing: 8) {
-                        if vm.brewOutdatedCount > 0 {
-                            Button {
-                                vm.upgradeAllBrew()
-                            } label: {
-                                if vm.isUpgradingBrew {
-                                    ProgressView().controlSize(.small)
-                                } else {
-                                    Label("Upgrade \(vm.brewOutdatedCount)", systemImage: "arrow.up.circle.fill")
-                                }
-                            }
-                            .buttonStyle(.upkeepPrimary)
-                            .tint(.orange)
-                            .controlSize(.regular)
-                            .disabled(isOperating)
-                        }
-
+        UpkeepSettingsFormView(maxColumnWidth: 640) {
+            UpkeepPaneHeader(section: .homebrew) {
+                HStack(spacing: 8) {
+                    if vm.brewOutdatedCount > 0 {
                         Button {
-                            coordinator.showHomebrewHUD(
-                                initialQuery: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : query,
-                                initialTab: scope.hudTab
-                            )
+                            vm.upgradeAllBrew()
                         } label: {
-                            Label("Pop Out HUD", systemImage: "macwindow.on.rectangle")
+                            if vm.isUpgradingBrew {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Label("Upgrade \(vm.brewOutdatedCount)", systemImage: "arrow.up.circle.fill")
+                            }
                         }
-                        .buttonStyle(.upkeepSecondary)
+                        .buttonStyle(.upkeepPrimary)
+                        .tint(.orange)
                         .controlSize(.regular)
-                        .disabled(!BrewService.isInstalled())
-                        .help("Open this search in the floating Liquid Glass HUD")
+                        .disabled(isOperating)
                     }
+
+                    Button {
+                        coordinator.showHomebrewHUD(
+                            initialQuery: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : query,
+                            initialTab: scope.hudTab
+                        )
+                    } label: {
+                        Label("Pop Out HUD", systemImage: "macwindow.on.rectangle")
+                    }
+                    .buttonStyle(.upkeepSecondary)
+                    .controlSize(.regular)
+                    .disabled(!BrewService.isInstalled())
+                    .help("Open this search in the floating Liquid Glass HUD")
                 }
             }
-
+        } content: {
             if !BrewService.isInstalled() {
                 Section {
                     UpkeepSettingsCallout(
@@ -737,27 +662,12 @@ private struct HomebrewSettingsPane: View {
                     footer: "\(vm.brewInstalledCount) installed · \(vm.brewOutdatedCount) outdated. Searches share the same instant Rust index as the floating HUD."
                 ) {
                     VStack(spacing: 10) {
-                        HStack(spacing: 8) {
-                            MenuBarSearchField(
-                                text: $query,
-                                placeholder: searchPlaceholder
-                            )
-                            .onChange(of: query) { _, _ in
-                                runSearch()
-                            }
-
-                            Button {
-                                coordinator.showHomebrewHUD(
-                                    initialQuery: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : query,
-                                    initialTab: scope.hudTab
-                                )
-                            } label: {
-                                Image(systemName: "arrow.up.right.square")
-                                    .font(.system(size: 13, weight: .medium))
-                            }
-                            .buttonStyle(.upkeepSecondary)
-                            .controlSize(.regular)
-                            .help("Continue search in Floating HUD")
+                        MenuBarSearchField(
+                            text: $query,
+                            placeholder: searchPlaceholder
+                        )
+                        .onChange(of: query) { _, _ in
+                            runSearch()
                         }
 
                         Picker("Scope", selection: $scope) {
@@ -943,10 +853,7 @@ private struct HomebrewSettingsPane: View {
         .onChange(of: vm.brewInstalledCount) { _, _ in
             runSearch()
         }
-        .onChange(of: vm.brewOutdatedCount) { _, newOutdated in
-            if newOutdated > 0 && query.isEmpty && scope == .installed {
-                // Keep user's selected scope, just refresh items
-            }
+        .onChange(of: vm.brewOutdatedCount) { _, _ in
             runSearch()
         }
     }
@@ -1140,7 +1047,7 @@ private struct HomebrewSettingsPane: View {
     }
 }
 
-// MARK: - 3. Cleaner (Unified macOS 27 Workspace)
+// MARK: - 3. Cleaner (Centered macOS 27 Workspace Aligned with Traffic Lights)
 
 private enum CleanerFilter: String, CaseIterable, Identifiable {
     case all = "All"
@@ -1174,195 +1081,211 @@ private struct CleanerWorkspacePane: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(spacing: 12) {
-                HStack(spacing: 12) {
-                    UpkeepSectionIcon(section: .cleaner, size: 28)
+        GeometryReader { geo in
+            let sideMargin = max(22, (geo.size.width - 680) / 2)
+            VStack(spacing: 0) {
+                VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        UpkeepSectionIcon(section: .cleaner, size: 24)
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 8) {
-                            Text("Cleaner")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundStyle(.primary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 8) {
+                                Text("Cleaner")
+                                    .font(.system(size: 16.5, weight: .semibold))
+                                    .foregroundStyle(.primary)
 
-                            if let summary = vm.cleanPreview {
-                                Text(summary.totalReclaimed)
-                                    .font(.system(size: 12, weight: .semibold, design: .rounded).monospacedDigit())
-                                    .foregroundStyle(summary.isDryRun ? MenuBarTheme.Colors.moleClean : MenuBarTheme.Colors.success)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 2)
-                                    .background(
-                                        (summary.isDryRun ? MenuBarTheme.Colors.moleClean : MenuBarTheme.Colors.success).opacity(0.14),
-                                        in: Capsule()
-                                    )
+                                if let summary = vm.cleanPreview {
+                                    Text(summary.totalReclaimed)
+                                        .font(.system(size: 11.5, weight: .semibold, design: .rounded).monospacedDigit())
+                                        .foregroundStyle(summary.isDryRun ? MenuBarTheme.Colors.moleClean : MenuBarTheme.Colors.success)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 2)
+                                        .background(
+                                            (summary.isDryRun ? MenuBarTheme.Colors.moleClean : MenuBarTheme.Colors.success).opacity(0.14),
+                                            in: Capsule()
+                                        )
+                                }
                             }
+
+                            Text(headerSubtitle)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                         }
-
-                        Text(headerSubtitle)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-
-                    if let summary = vm.cleanPreview, summary.isDryRun, !summary.lines.isEmpty, !vm.confirmClean {
-                        Button(role: .destructive) {
-                            withAnimation(.snappy) { vm.confirmClean = true }
-                        } label: {
-                            Text("Clean Now")
-                        }
-                        .buttonStyle(.upkeepPrimary)
-                        .tint(.red)
-                        .disabled(vm.isScanningClean || vm.isCleaning)
-                    }
-                }
-
-                if let summary = vm.cleanPreview, summary.isDryRun, vm.confirmClean {
-                    MenuBarDestructiveConfirmBar(
-                        title: "Delete \(summary.totalReclaimed) of cached data?",
-                        confirmLabel: "Clean",
-                        confirmIcon: "trash",
-                        onCancel: {
-                            withAnimation(.snappy) { vm.confirmClean = false }
-                        },
-                        onConfirm: {
-                            vm.executeMoleClean()
-                        }
-                    )
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                }
-
-                if vm.cleanPreview != nil && !(vm.cleanPreview?.lines.isEmpty ?? true) {
-                    HStack {
-                        Picker("Filter", selection: $filter) {
-                            ForEach(CleanerFilter.allCases) { item in
-                                Text(item.rawValue).tag(item)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(maxWidth: 260)
 
                         Spacer()
 
-                        if let summary = vm.cleanPreview {
-                            Text("\(summary.itemCount) items")
-                                .font(.footnote.monospacedDigit())
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.top, 12)
-            .padding(.bottom, 14)
-            .upkeepSearchTarget("cleaner.dryRun")
+                        HStack(spacing: 8) {
+                            Button {
+                                vm.runMoleDryRun()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.upkeepSecondary)
+                            .controlSize(.regular)
+                            .disabled(vm.isScanningClean || vm.isCleaning)
+                            .help("Rescan cleanable caches")
 
-            Divider().opacity(0.18)
-
-            if !MoleService.isInstalled() {
-                ContentUnavailableView {
-                    Label("Mole CLI Not Installed", systemImage: "terminal")
-                } description: {
-                    Text("Upkeep uses Mole (`mo clean`) for safe dry-run cache inspection. Install it via Homebrew to enable Cleaner.")
-                } actions: {
-                    HStack(spacing: 8) {
-                        Button(copiedMoleInstall ? "Copied Command" : "Copy `brew install` Command") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString("brew install tw93/tap/mole", forType: .string)
-                            copiedMoleInstall = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                copiedMoleInstall = false
+                            if let summary = vm.cleanPreview, summary.isDryRun, !summary.lines.isEmpty, !vm.confirmClean {
+                                Button(role: .destructive) {
+                                    withAnimation(.snappy) { vm.confirmClean = true }
+                                } label: {
+                                    Text("Clean Now")
+                                }
+                                .buttonStyle(.upkeepPrimary)
+                                .tint(.red)
+                                .disabled(vm.isScanningClean || vm.isCleaning)
                             }
                         }
-                        .buttonStyle(.upkeepPrimary)
+                    }
 
-                        Button("Retry") { vm.runMoleDryRun() }
-                            .buttonStyle(.upkeepSecondary)
+                    if let summary = vm.cleanPreview, summary.isDryRun, vm.confirmClean {
+                        MenuBarDestructiveConfirmBar(
+                            title: "Delete \(summary.totalReclaimed) of cached data?",
+                            confirmLabel: "Clean",
+                            confirmIcon: "trash",
+                            onCancel: {
+                                withAnimation(.snappy) { vm.confirmClean = false }
+                            },
+                            onConfirm: {
+                                vm.executeMoleClean()
+                            }
+                        )
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                    }
+
+                    if vm.cleanPreview != nil && !(vm.cleanPreview?.lines.isEmpty ?? true) {
+                        HStack {
+                            Picker("Filter", selection: $filter) {
+                                ForEach(CleanerFilter.allCases) { item in
+                                    Text(item.rawValue).tag(item)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(maxWidth: 260)
+
+                            Spacer()
+
+                            if let summary = vm.cleanPreview {
+                                Text("\(summary.itemCount) items")
+                                    .font(.footnote.monospacedDigit())
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if vm.isScanningClean || vm.isCleaning {
-                VStack(spacing: 10) {
-                    ProgressView()
-                    Text(vm.isCleaning ? "Cleaning caches…" : "Scanning caches safely…")
-                        .font(.system(size: 13, weight: .medium))
-                    Text(vm.isCleaning ? "Reclaiming disk space" : "Running `mo clean --dry-run` without deleting files")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let err = vm.cleanError {
-                ContentUnavailableView {
-                    Label("Cache Scan Failed", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(err)
-                } actions: {
-                    HStack(spacing: 8) {
-                        Button("Retry Scan") { vm.runMoleDryRun() }
+                .padding(.horizontal, sideMargin)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
+                .upkeepSearchTarget("cleaner.dryRun")
+
+                Divider().opacity(0.16)
+
+                if !MoleService.isInstalled() {
+                    ContentUnavailableView {
+                        Label("Mole CLI Not Installed", systemImage: "terminal")
+                    } description: {
+                        Text("Upkeep uses Mole (`mo clean`) for safe dry-run cache inspection. Install it via Homebrew to enable Cleaner.")
+                    } actions: {
+                        HStack(spacing: 8) {
+                            Button(copiedMoleInstall ? "Copied Command" : "Copy `brew install` Command") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString("brew install tw93/tap/mole", forType: .string)
+                                copiedMoleInstall = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                    copiedMoleInstall = false
+                                }
+                            }
                             .buttonStyle(.upkeepPrimary)
 
-                        Button(copiedCleanError ? "Copied" : "Copy Error") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(err, forType: .string)
-                            copiedCleanError = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                copiedCleanError = false
-                            }
+                            Button("Retry") { vm.runMoleDryRun() }
+                                .buttonStyle(.upkeepSecondary)
                         }
-                        .buttonStyle(.upkeepSecondary)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let summary = vm.cleanPreview {
-                if summary.lines.isEmpty {
-                    ContentUnavailableView {
-                        Label("System is Clean", systemImage: "checkmark.circle")
-                    } description: {
-                        Text("No reclaimable caches were reported by Mole.")
-                    } actions: {
-                        Button("Rescan") { vm.runMoleDryRun() }
-                            .buttonStyle(.upkeepSecondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if !hasNonHeaderFilteredItems {
-                    ContentUnavailableView {
-                        Label("No \(filter.rawValue) Items", systemImage: "line.3.horizontal.decrease.circle")
-                    } description: {
-                        Text(filter == .cleaned
-                             ? "No files have been deleted yet — this is a dry-run preview."
-                             : "No candidate cache entries match this filter.")
-                    } actions: {
-                        Button("Show All Items") { filter = .all }
-                            .buttonStyle(.upkeepSecondary)
+                } else if vm.isScanningClean || vm.isCleaning {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text(vm.isCleaning ? "Cleaning caches…" : "Scanning caches safely…")
+                            .font(.system(size: 13, weight: .medium))
+                        Text(vm.isCleaning ? "Reclaiming disk space" : "Running `mo clean --dry-run` without deleting files")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let err = vm.cleanError {
+                    ContentUnavailableView {
+                        Label("Cache Scan Failed", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(err)
+                    } actions: {
+                        HStack(spacing: 8) {
+                            Button("Retry Scan") { vm.runMoleDryRun() }
+                                .buttonStyle(.upkeepPrimary)
+
+                            Button(copiedCleanError ? "Copied" : "Copy Error") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(err, forType: .string)
+                                copiedCleanError = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    copiedCleanError = false
+                                }
+                            }
+                            .buttonStyle(.upkeepSecondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let summary = vm.cleanPreview {
+                    if summary.lines.isEmpty {
+                        ContentUnavailableView {
+                            Label("System is Clean", systemImage: "checkmark.circle")
+                        } description: {
+                            Text("No reclaimable caches were reported by Mole.")
+                        } actions: {
+                            Button("Rescan") { vm.runMoleDryRun() }
+                                .buttonStyle(.upkeepSecondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if !hasNonHeaderFilteredItems {
+                        ContentUnavailableView {
+                            Label("No \(filter.rawValue) Items", systemImage: "line.3.horizontal.decrease.circle")
+                        } description: {
+                            Text(filter == .cleaned
+                                 ? "No files have been deleted yet — this is a dry-run preview."
+                                 : "No candidate cache entries match this filter.")
+                        } actions: {
+                            Button("Show All Items") { filter = .all }
+                                .buttonStyle(.upkeepSecondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 2) {
+                                ForEach(Array(filteredLines.prefix(150).enumerated()), id: \.offset) { idx, line in
+                                    cleanerRow(line, index: idx)
+                                }
+                            }
+                            .padding(.horizontal, sideMargin)
+                            .padding(.vertical, 14)
+                        }
+                        .upkeepSoftTopScrollEdge()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(filteredLines.prefix(150).enumerated()), id: \.offset) { idx, line in
-                                cleanerRow(line, index: idx)
-                            }
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 12)
+                    ContentUnavailableView {
+                        Label("Ready to Scan", systemImage: "doc.text.magnifyingglass")
+                    } description: {
+                        Text("Inspect system and app caches safely without deleting any files.")
+                    } actions: {
+                        Button("Start Dry-Run") { vm.runMoleDryRun() }
+                            .buttonStyle(.upkeepPrimary)
                     }
-                    .upkeepSoftTopScrollEdge()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-            } else {
-                ContentUnavailableView {
-                    Label("Ready to Scan", systemImage: "doc.text.magnifyingglass")
-                } description: {
-                    Text("Inspect system and app caches safely without deleting any files.")
-                } actions: {
-                    Button("Start Dry-Run") { vm.runMoleDryRun() }
-                        .buttonStyle(.upkeepPrimary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     private var headerSubtitle: String {
@@ -1412,170 +1335,183 @@ private struct CleanerWorkspacePane: View {
     }
 }
 
-// MARK: - 4. Uninstaller (Unified macOS 27 Workspace + Leftover & Homebrew Cask Review)
+// MARK: - 4. Uninstaller (Centered macOS 27 Workspace + Leftover & Homebrew Cask Review)
 
 private struct UninstallerWorkspacePane: View {
     @Bindable var vm: TrayViewModel
     @State private var copiedError = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(spacing: 10) {
-                HStack(spacing: 11) {
-                    UpkeepSectionIcon(section: .uninstaller, size: 26)
-                    Text("Uninstaller")
-                        .font(.system(size: 18, weight: .semibold))
-                    Spacer()
-                    if !vm.installedApps.isEmpty {
-                        Text("\(vm.filteredApps.count) of \(vm.installedApps.count) apps")
-                            .font(.footnote.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-
-                HStack(spacing: 10) {
-                    MenuBarSearchField(
-                        text: $vm.appQuery,
-                        placeholder: "Filter installed applications…",
-                        onEscape: {
-                            if vm.pendingUninstallApp != nil {
-                                vm.cancelUninstallReview()
-                            }
-                        }
-                    )
-
-                    Picker("Sort", selection: $vm.appSortOrder) {
-                        ForEach(TrayViewModel.AppSortOrder.allCases) { order in
-                            Text(order.rawValue).tag(order)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 120)
-                }
-
-                if let status = vm.uninstallStatus {
-                    HStack(spacing: 6) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(MenuBarTheme.Colors.success)
-                        Text(status)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Dismiss") {
-                            vm.uninstallStatus = nil
-                        }
-                        .buttonStyle(.plain)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.tertiary)
-                    }
-                }
-
-                if let err = vm.uninstallError, !vm.installedApps.isEmpty {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(MenuBarTheme.Colors.destructive)
-                        Text(err)
-                            .font(.footnote)
-                            .foregroundStyle(MenuBarTheme.Colors.destructive)
-                            .lineLimit(2)
-                        Spacer()
-                        Button(copiedError ? "Copied" : "Copy") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(err, forType: .string)
-                            copiedError = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                copiedError = false
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-
-                        Button("Dismiss") {
-                            vm.uninstallError = nil
-                        }
-                        .buttonStyle(.plain)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.top, 12)
-            .padding(.bottom, 14)
-            .upkeepSearchTarget("uninstaller.apps")
-
-            Divider().opacity(0.18)
-
-            if vm.isLoadingApps {
+        GeometryReader { geo in
+            let sideMargin = max(22, (geo.size.width - 680) / 2)
+            VStack(spacing: 0) {
                 VStack(spacing: 10) {
-                    ProgressView()
-                    Text("Scanning installed applications…")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let err = vm.uninstallError, vm.installedApps.isEmpty {
-                ContentUnavailableView {
-                    Label("Unable to Load Applications", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(err)
-                } actions: {
-                    HStack(spacing: 8) {
-                        Button("Retry") { vm.loadApps(force: true) }
-                            .buttonStyle(.upkeepPrimary)
-                        Button("Copy Error") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(err, forType: .string)
+                    HStack(spacing: 10) {
+                        UpkeepSectionIcon(section: .uninstaller, size: 24)
+                        Text("Uninstaller")
+                            .font(.system(size: 16.5, weight: .semibold))
+                        Spacer()
+                        if !vm.installedApps.isEmpty {
+                            Text("\(vm.filteredApps.count) of \(vm.installedApps.count) apps")
+                                .font(.footnote.monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
+                        Button {
+                            vm.loadApps(force: true)
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
                         }
                         .buttonStyle(.upkeepSecondary)
+                        .controlSize(.small)
+                        .disabled(vm.isLoadingApps)
+                        .help("Reload installed applications")
                     }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if vm.installedApps.isEmpty {
-                ContentUnavailableView {
-                    Label("No Applications Found", systemImage: "app.dashed")
-                } description: {
-                    Text("No apps were discovered in /Applications or ~/Applications.")
-                } actions: {
-                    Button("Reload Applications") { vm.loadApps(force: true) }
-                        .buttonStyle(.upkeepPrimary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if vm.filteredApps.isEmpty {
-                ContentUnavailableView {
-                    Label("No Matching Applications", systemImage: "magnifyingglass")
-                } description: {
-                    Text("No installed apps match “\(vm.appQuery)”.")
-                } actions: {
-                    Button("Clear Filter") { vm.appQuery = "" }
-                        .buttonStyle(.upkeepSecondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 4) {
-                        ForEach(vm.filteredApps.prefix(200)) { app in
-                            UninstallerAppRow(
-                                app: app,
-                                isPending: vm.pendingUninstallApp?.id == app.id,
-                                onRemove: {
-                                    vm.inspectForUninstall(app)
+
+                    HStack(spacing: 10) {
+                        MenuBarSearchField(
+                            text: $vm.appQuery,
+                            placeholder: "Filter installed applications…",
+                            onEscape: {
+                                if vm.pendingUninstallApp != nil {
+                                    vm.cancelUninstallReview()
                                 }
-                            )
+                            }
+                        )
+
+                        Picker("Sort", selection: $vm.appSortOrder) {
+                            ForEach(TrayViewModel.AppSortOrder.allCases) { order in
+                                Text(order.rawValue).tag(order)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 120)
+                    }
+
+                    if let status = vm.uninstallStatus {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(MenuBarTheme.Colors.success)
+                            Text(status)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Dismiss") {
+                                vm.uninstallStatus = nil
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.tertiary)
                         }
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
+
+                    if let err = vm.uninstallError, !vm.installedApps.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(MenuBarTheme.Colors.destructive)
+                            Text(err)
+                                .font(.footnote)
+                                .foregroundStyle(MenuBarTheme.Colors.destructive)
+                                .lineLimit(2)
+                            Spacer()
+                            Button(copiedError ? "Copied" : "Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(err, forType: .string)
+                                copiedError = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    copiedError = false
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+
+                            Button("Dismiss") {
+                                vm.uninstallError = nil
+                            }
+                            .buttonStyle(.plain)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        }
+                    }
                 }
-                .upkeepSoftTopScrollEdge()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, sideMargin)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
+                .upkeepSearchTarget("uninstaller.apps")
+
+                Divider().opacity(0.16)
+
+                if vm.isLoadingApps {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Scanning installed applications…")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let err = vm.uninstallError, vm.installedApps.isEmpty {
+                    ContentUnavailableView {
+                        Label("Unable to Load Applications", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(err)
+                    } actions: {
+                        HStack(spacing: 8) {
+                            Button("Retry") { vm.loadApps(force: true) }
+                                .buttonStyle(.upkeepPrimary)
+                            Button("Copy Error") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(err, forType: .string)
+                            }
+                            .buttonStyle(.upkeepSecondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if vm.installedApps.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Applications Found", systemImage: "app.dashed")
+                    } description: {
+                        Text("No apps were discovered in /Applications or ~/Applications.")
+                    } actions: {
+                        Button("Reload Applications") { vm.loadApps(force: true) }
+                            .buttonStyle(.upkeepPrimary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if vm.filteredApps.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Matching Applications", systemImage: "magnifyingglass")
+                    } description: {
+                        Text("No installed apps match “\(vm.appQuery)”.")
+                    } actions: {
+                        Button("Clear Filter") { vm.appQuery = "" }
+                            .buttonStyle(.upkeepSecondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 4) {
+                            ForEach(vm.filteredApps.prefix(200)) { app in
+                                UninstallerAppRow(
+                                    app: app,
+                                    isPending: vm.pendingUninstallApp?.id == app.id,
+                                    onRemove: {
+                                        vm.inspectForUninstall(app)
+                                    }
+                                )
+                            }
+                        }
+                        .padding(.horizontal, sideMargin)
+                        .padding(.vertical, 14)
+                    }
+                    .upkeepSoftTopScrollEdge()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea(.container, edges: .top)
         .sheet(item: $vm.pendingUninstallApp) { app in
             UninstallReviewSheet(app: app, vm: vm)
         }
@@ -1891,10 +1827,8 @@ private struct UpdatesSettingsPane: View {
 
     var body: some View {
         UpkeepSettingsFormView {
-            Section {
-                UpkeepPaneHeader(section: .updates)
-            }
-
+            UpkeepPaneHeader(section: .updates)
+        } content: {
             // Canapé-style clean app identity & update status hero card
             Section {
                 HStack(spacing: 14) {
@@ -1965,7 +1899,8 @@ private struct UpdatesSettingsPane: View {
                 }
 
                 LabeledContent {
-                    TextField("owner/Upkeep", text: $updater.githubRepo)
+                    TextField("", text: $updater.githubRepo, prompt: Text("owner/Upkeep"))
+                        .labelsHidden()
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 220)
                 } label: {
