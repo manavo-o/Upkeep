@@ -28,28 +28,32 @@ public extension View {
 
 // MARK: - Unified macOS 27 Button Styles (.glass / .glassProminent with clean fallbacks)
 
-/// Secondary action button style: native `.glass` on macOS 26/27, `.bordered` on earlier macOS.
+/// Secondary action button style: native `.glass` capsule on macOS 26/27, `.bordered` on earlier macOS.
 public struct UpkeepSecondaryButtonStyle: PrimitiveButtonStyle {
     public func makeBody(configuration: Configuration) -> some View {
         if #available(macOS 26.0, *) {
             Button(configuration)
                 .buttonStyle(.glass)
+                .buttonBorderShape(.capsule)
         } else {
             Button(configuration)
                 .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
         }
     }
 }
 
-/// Primary action button style: native `.glassProminent` on macOS 26/27, `.borderedProminent` on earlier macOS.
+/// Primary action button style: native `.glassProminent` capsule on macOS 26/27, `.borderedProminent` on earlier macOS.
 public struct UpkeepPrimaryButtonStyle: PrimitiveButtonStyle {
     public func makeBody(configuration: Configuration) -> some View {
         if #available(macOS 26.0, *) {
             Button(configuration)
                 .buttonStyle(.glassProminent)
+                .buttonBorderShape(.capsule)
         } else {
             Button(configuration)
                 .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
         }
     }
 }

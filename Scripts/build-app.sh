@@ -27,6 +27,19 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 cp "$BUILD_DIR/$EXECUTABLE_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
+# Workaround for swiftlang/swift-build#1887: SwiftPM's swiftbuild stamps minos (15.0) into
+# LC_BUILD_VERSION.sdk instead of the real macOS SDK version, which disables macOS 26/27
+# Liquid Glass controls (capsule buttons, rounded pickers, glass sidebars) at runtime.
+if command -v vtool >/dev/null 2>&1; then
+    SDK_VER="$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || echo "26.5")"
+    if [[ -n "$SDK_VER" ]]; then
+        echo "Stamping LC_BUILD_VERSION sdk=$SDK_VER (enables native macOS 26/27 Liquid Glass controls)..."
+        vtool -set-build-version macos 15.0 "$SDK_VER" -replace \
+            -output "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
+            "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+    fi
+fi
+
 # Bundle Apple Icon Composer assets
 if [[ -f "$ROOT_DIR/Resources/Icons/AppIcon.icns" ]]; then
     cp "$ROOT_DIR/Resources/Icons/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"

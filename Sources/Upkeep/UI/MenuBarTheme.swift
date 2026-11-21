@@ -493,7 +493,7 @@ public struct MenuBarDestructiveConfirmBar: View {
             Button("Cancel") {
                 withAnimation(.snappy) { onCancel() }
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.upkeepSecondary)
             .controlSize(.small)
 
             Button(role: .destructive) {
@@ -502,7 +502,7 @@ public struct MenuBarDestructiveConfirmBar: View {
                 Label(confirmLabel, systemImage: confirmIcon)
                     .labelStyle(.titleAndIcon)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.upkeepPrimary)
             .tint(.red)
             .controlSize(.small)
         }
