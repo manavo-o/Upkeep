@@ -180,32 +180,59 @@ public enum UpkeepSearchCatalog {
 @MainActor
 @Observable
 public final class UpkeepSearchEngine {
-    public var query: String = ""
-
-    public var isSearching: Bool {
-        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private struct IndexedSearchEntry {
+        let item: UpkeepSearchItem
+        let titleLower: String
+        let sectionLower: String
+        let tabLower: String
+        let keywordsLower: [String]
     }
 
-    public var results: [UpkeepSearchItem] {
+    private static let indexedCatalog: [IndexedSearchEntry] = UpkeepSearchCatalog.allItems.map { item in
+        IndexedSearchEntry(
+            item: item,
+            titleLower: item.title.lowercased(),
+            sectionLower: item.section.lowercased(),
+            tabLower: item.tab.rawValue.lowercased(),
+            keywordsLower: item.keywords.map { $0.lowercased() }
+        )
+    }
+
+    public var query: String = "" {
+        didSet { recomputeResults() }
+    }
+
+    public private(set) var isSearching: Bool = false
+    public private(set) var results: [UpkeepSearchItem] = []
+    public private(set) var groupedResults: [(tab: TraySection, items: [UpkeepSearchItem])] = []
+
+    public init() {}
+
+    private func recomputeResults() {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return [] }
-        return UpkeepSearchCatalog.allItems.filter { item in
-            item.title.lowercased().contains(q)
-                || item.section.lowercased().contains(q)
-                || item.tab.rawValue.lowercased().contains(q)
-                || item.keywords.contains(where: { $0.contains(q) })
+        guard !q.isEmpty else {
+            isSearching = false
+            results = []
+            groupedResults = []
+            return
         }
-    }
 
-    public var groupedResults: [(tab: TraySection, items: [UpkeepSearchItem])] {
-        let matched = results
-        return TraySection.allCases.compactMap { tab in
+        isSearching = true
+        let matched = Self.indexedCatalog.compactMap { entry -> UpkeepSearchItem? in
+            if entry.titleLower.contains(q)
+                || entry.sectionLower.contains(q)
+                || entry.tabLower.contains(q)
+                || entry.keywordsLower.contains(where: { $0.contains(q) }) {
+                return entry.item
+            }
+            return nil
+        }
+        results = matched
+        groupedResults = TraySection.allCases.compactMap { tab in
             let items = matched.filter { $0.tab == tab }
             return items.isEmpty ? nil : (tab, items)
         }
     }
-
-    public init() {}
 }
 
 // MARK: - Search Results View

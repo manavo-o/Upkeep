@@ -15,6 +15,8 @@ fi
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "arm64" ]]; then
   TARGET="aarch64-apple-darwin"
+  # Every Apple Silicon Mac supports apple-m1 (ARMv8.4 LSE atomics, dotprod, NEON, M-series scheduling).
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=apple-m1"
 else
   TARGET="x86_64-apple-darwin"
 fi

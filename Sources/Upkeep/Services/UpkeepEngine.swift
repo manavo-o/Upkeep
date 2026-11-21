@@ -15,6 +15,51 @@ public enum UpkeepEngine {
         #endif
     }
 
+    #if USE_RUST_UPKEEP_CORE
+    /// Decodes a NUL-terminated UTF-8 JSON buffer returned by Rust without intermediate String/Data copies.
+    @inline(__always)
+    fileprivate static func decodeRustJSON<T: Decodable>(
+        _ type: T.Type,
+        from rawPtr: UnsafeMutablePointer<CChar>
+    ) -> T? {
+        let length = strlen(rawPtr)
+        let data = Data(bytesNoCopy: rawPtr, count: length, deallocator: .none)
+        return try? JSONDecoder().decode(type, from: data)
+    }
+
+    /// Parallel Rust scan of Homebrew Cellar, Caskroom, and pinned kegs on disk.
+    public static func scanBrewDirs(prefix: String = "/opt/homebrew") -> [BrewPackageItem]? {
+        struct WireBrewPackage: Decodable {
+            let name: String
+            let description: String
+            let version: String
+            let is_cask: Bool
+            let is_installed: Bool
+            let is_outdated: Bool
+            let is_pinned: Bool
+            let homepage: String
+        }
+        let rawPtr: UnsafeMutablePointer<CChar>? = prefix.withCString { pPtr in
+            upkeep_scan_brew_dirs_json(pPtr)
+        }
+        guard let rawPtr else { return nil }
+        defer { upkeep_string_free(rawPtr) }
+        guard let decoded = decodeRustJSON([WireBrewPackage].self, from: rawPtr) else { return nil }
+        return decoded.map {
+            BrewPackageItem(
+                name: $0.name,
+                description: $0.description,
+                version: $0.version,
+                isCask: $0.is_cask,
+                isInstalled: $0.is_installed,
+                isOutdated: $0.is_outdated,
+                isPinned: $0.is_pinned,
+                homepage: $0.homepage
+            )
+        }
+    }
+    #endif
+
     // MARK: - Persistent Rust Brew Search Index
 
     #if USE_RUST_UPKEEP_CORE
@@ -127,8 +172,7 @@ public enum UpkeepEngine {
         public func installedPackages() -> [BrewPackageItem] {
             guard let ptr, let rawPtr = upkeep_brew_index_installed_json(ptr) else { return [] }
             defer { upkeep_string_free(rawPtr) }
-            let json = String(cString: rawPtr)
-            guard let decoded = try? JSONDecoder().decode([WireBrewPackage].self, from: Data(json.utf8)) else {
+            guard let decoded = UpkeepEngine.decodeRustJSON([WireBrewPackage].self, from: rawPtr) else {
                 return []
             }
             return decoded.map { $0.toItem() }
@@ -143,8 +187,7 @@ public enum UpkeepEngine {
             }
             guard let rawPtr else { return [] }
             defer { upkeep_string_free(rawPtr) }
-            let json = String(cString: rawPtr)
-            guard let decoded = try? JSONDecoder().decode([WireBrewPackage].self, from: Data(json.utf8)) else {
+            guard let decoded = UpkeepEngine.decodeRustJSON([WireBrewPackage].self, from: rawPtr) else {
                 return []
             }
             return decoded.map { $0.toItem() }
@@ -328,8 +371,7 @@ public enum UpkeepEngine {
         let decoded: WireSummary? = raw.withCString { cstr in
             guard let out = upkeep_parse_mole_clean_json(cstr, isDryRun) else { return nil }
             defer { upkeep_string_free(out) }
-            let json = String(cString: out)
-            return try? JSONDecoder().decode(WireSummary.self, from: Data(json.utf8))
+            return decodeRustJSON(WireSummary.self, from: out)
         }
         if let decoded {
             return MoleCleanSummary(
@@ -579,8 +621,7 @@ public enum UpkeepEngine {
             }
             guard let rawPtr else { return nil }
             defer { upkeep_string_free(rawPtr) }
-            let json = String(cString: rawPtr)
-            guard let decoded = try? JSONDecoder().decode(WirePayload.self, from: Data(json.utf8)) else {
+            guard let decoded = decodeRustJSON(WirePayload.self, from: rawPtr) else {
                 return nil
             }
             let leftovers = decoded.leftovers.map {
@@ -623,8 +664,7 @@ public enum UpkeepEngine {
             }
             guard let rawPtr = upkeep_scan_caches_json() else { return nil }
             defer { upkeep_string_free(rawPtr) }
-            let json = String(cString: rawPtr)
-            guard let payload = try? JSONDecoder().decode(WireCachePayload.self, from: Data(json.utf8)),
+            guard let payload = decodeRustJSON(WireCachePayload.self, from: rawPtr),
                   !payload.items.isEmpty else {
                 return nil
             }

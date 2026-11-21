@@ -47,7 +47,15 @@ public final class BrewLogStore {
         }
     }
 
+    private var liveOutputBuffer: String = ""
+    private var pendingLiveLines: [String] = []
+    private var liveFlushTask: Task<Void, Never>?
+
     public func beginLive(command: String) {
+        liveFlushTask?.cancel()
+        liveFlushTask = nil
+        pendingLiveLines.removeAll(keepingCapacity: true)
+        liveOutputBuffer = ""
         self.isRunning = true
         self.activeCommand = command
         self.liveStatusLine = "Starting `\(command)`…"
@@ -61,20 +69,35 @@ public final class BrewLogStore {
     }
 
     public func appendLiveLine(_ line: String) {
-        guard let current = lastLog else { return }
+        guard lastLog != nil else { return }
         let cleanedLine = CLIExecutor.stripANSI(line).trimmingCharacters(in: .whitespacesAndNewlines)
-        if !cleanedLine.isEmpty {
-            self.liveStatusLine = cleanedLine
+        pendingLiveLines.append(cleanedLine.isEmpty ? line : cleanedLine)
+        if liveFlushTask == nil {
+            liveFlushTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(40))
+                guard !Task.isCancelled, let self else { return }
+                self.flushPendingLiveLines()
+            }
         }
-        let nextOutput: String
-        if current.output.hasPrefix("Running `") && current.output.hasSuffix("…") {
-            nextOutput = cleanedLine.isEmpty ? line : cleanedLine
+    }
+
+    private func flushPendingLiveLines() {
+        liveFlushTask = nil
+        guard !pendingLiveLines.isEmpty, let current = lastLog else { return }
+        if let latest = pendingLiveLines.last(where: { !$0.isEmpty }) {
+            self.liveStatusLine = latest
+        }
+        let batch = pendingLiveLines.joined(separator: "\n")
+        pendingLiveLines.removeAll(keepingCapacity: true)
+        if liveOutputBuffer.isEmpty {
+            liveOutputBuffer = batch
         } else {
-            nextOutput = current.output + "\n" + (cleanedLine.isEmpty ? line : cleanedLine)
+            liveOutputBuffer.append("\n")
+            liveOutputBuffer.append(batch)
         }
         self.lastLog = BrewOperationLog(
             command: current.command,
-            output: nextOutput,
+            output: liveOutputBuffer,
             succeeded: current.succeeded,
             exitCode: current.exitCode,
             timestamp: current.timestamp
@@ -82,6 +105,10 @@ public final class BrewLogStore {
     }
 
     public func record(command: String, stdout: String, stderr: String, exitCode: Int32) {
+        liveFlushTask?.cancel()
+        liveFlushTask = nil
+        pendingLiveLines.removeAll()
+        liveOutputBuffer = ""
         self.isRunning = false
         self.activeCommand = nil
         self.liveStatusLine = nil
@@ -220,6 +247,11 @@ public actor BrewService {
 
     /// Fast direct filesystem scan of `/opt/homebrew/Cellar`, `Caskroom`, and `var/homebrew/pinned`.
     public static func scanInstalledDirectories(prefix: String = "/opt/homebrew") -> [BrewPackageItem] {
+        #if USE_RUST_UPKEEP_CORE
+        if let rustItems = UpkeepEngine.scanBrewDirs(prefix: prefix) {
+            return rustItems
+        }
+        #endif
         let fm = FileManager.default
         let resolvedPrefix = fm.fileExists(atPath: prefix) ? prefix : "/usr/local"
         let pinnedDir = (resolvedPrefix as NSString).appendingPathComponent("var/homebrew/pinned")
