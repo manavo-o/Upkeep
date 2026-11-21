@@ -29,14 +29,14 @@ jobs:
 
       - name: Build Upkeep.app
         env:
-          UPKEEP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '1.0.1' }}
+          UPKEEP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '1.1.0' }}
         run: |
           export UPKEEP_VERSION="${UPKEEP_VERSION#v}"
           ./Scripts/build-app.sh
 
       - name: Package Release Archive
         run: |
-          VERSION="${GITHUB_REF_NAME:-v1.0.1}"
+          VERSION="${GITHUB_REF_NAME:-v1.1.0}"
           mkdir -p release
           ditto -c -k --sequesterRsrc --keepParent dist/Upkeep.app "release/Upkeep-${VERSION}.zip"
 
@@ -50,5 +50,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
           files: release/Upkeep-*.zip
