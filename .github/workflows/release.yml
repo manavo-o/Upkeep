@@ -29,14 +29,14 @@ jobs:
 
       - name: Build Upkeep.app
         env:
-          UPKEEP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '1.1.1' }}
+          UPKEEP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '1.1.2' }}
         run: |
           export UPKEEP_VERSION="${UPKEEP_VERSION#v}"
           ./Scripts/build-app.sh
 
       - name: Package Release Archive
         run: |
-          VERSION="${GITHUB_REF_NAME:-v1.1.1}"
+          VERSION="${GITHUB_REF_NAME:-v1.1.2}"
           mkdir -p release
           ditto -c -k --sequesterRsrc --keepParent dist/Upkeep.app "release/Upkeep-${VERSION}.zip"
 

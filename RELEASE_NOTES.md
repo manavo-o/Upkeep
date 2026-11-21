@@ -1,4 +1,10 @@
-## What's New in v1.1.1
+## What's New in v1.1.2
+
+- **Minimalist Native macOS Settings UI**: Redesigned the Settings window with a cleaner `216pt` sidebar, seamless transparent titlebar, centered `620pt` grouped reading columns, Canapé-style pane headers, inline `(i)` popovers, and zero per-row icon clutter.
+- **Tiered Homebrew Search Ranking**: Upgraded the Rust and Swift search engines with 5-tier name-first scoring (Exact > Prefix > Substring > Fuzzy Name > Description) and cleaner cask version display so exact/prefix package names always rank first.
+- **Larger macOS 27 HUD Buttons & Connected Settings Downloader**: Upgraded the floating Homebrew HUD to `.controlSize(.large)` Liquid Glass buttons with live operation spinners, and revamped the Homebrew Settings pane into a live inline search & package downloader sharing the same Rust index and live progress state as the HUD.
+
+### Included from v1.1.1
 
 - **Homebrew Search HUD Fix**: Fixed an issue where opening or switching to the **Casks** (`⌘3`) or **Formulae** (`⌘2`) search tabs without typing a query showed a pre-selected installed package instead of an empty search prompt, and reset HUD state cleanly when reopened.
 
