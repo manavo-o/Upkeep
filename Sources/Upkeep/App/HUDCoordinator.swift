@@ -214,6 +214,14 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
     public func showHomebrewHUD(initialQuery: String? = nil) {
         if let query = initialQuery, !query.isEmpty {
             homebrewModel.query = query
+        } else {
+            homebrewModel.query = ""
+            homebrewModel.activeTab = nil
+            homebrewModel.packages = []
+            homebrewModel.selectedID = nil
+            homebrewModel.statusBanner = nil
+            homebrewModel.errorBanner = nil
+            homebrewModel.showActionMenu = false
         }
         if homebrewPanel == nil {
             let panel = LiquidGlassPanel(
@@ -228,6 +236,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             panel.delegate = self
             homebrewPanel = panel
         }
+        updateHomebrewPanelHeight(isCategoryMenu: homebrewModel.isShowingCategoryMenu)
         homebrewPanel?.presentCenteredAtHUDHeight()
         installHomebrewClickOutsideMonitors()
         if let query = initialQuery, !query.isEmpty {

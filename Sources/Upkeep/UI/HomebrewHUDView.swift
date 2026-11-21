@@ -62,8 +62,13 @@ public final class HomebrewHUDModel {
                 let items = try await BrewService.shared.loadInstalledAndOutdated()
                 guard !Task.isCancelled else { return }
                 if self.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.packages = filterForTab(items)
-                    self.selectedID = self.packages.first?.id
+                    if self.activeTab == .formulae || self.activeTab == .casks {
+                        self.packages = []
+                        self.selectedID = nil
+                    } else {
+                        self.packages = filterForTab(items)
+                        self.selectedID = self.packages.first?.id
+                    }
                 }
                 self.isLoading = false
             } catch {
@@ -80,6 +85,12 @@ public final class HomebrewHUDModel {
         let currentQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if currentQuery.isEmpty {
+            if activeTab == .formulae || activeTab == .casks {
+                self.packages = []
+                self.selectedID = nil
+                self.isLoading = false
+                return
+            }
             searchTask = Task {
                 let local = await BrewService.shared.fuzzySearchLocal(query: "", filterCasks: caskFilter)
                 guard !Task.isCancelled else { return }
@@ -313,6 +324,16 @@ public struct HomebrewHUDView: View {
         }
     }
 
+    private var searchPlaceholder: String {
+        guard let tab = model.activeTab else { return "Search Homebrew" }
+        switch tab {
+        case .formulae, .casks:
+            return "Search \(tab.title)…"
+        case .installed, .upgrades:
+            return "Filter \(tab.title)…"
+        }
+    }
+
     private var searchPill: some View {
         HStack(spacing: 12) {
             if let tab = model.activeTab {
@@ -333,7 +354,7 @@ public struct HomebrewHUDView: View {
             }
 
             TextField(
-                model.activeTab == nil ? "Search Homebrew" : "Filter \(model.activeTab!.title)…",
+                searchPlaceholder,
                 text: $model.query
             )
             .textFieldStyle(.plain)
@@ -412,11 +433,22 @@ public struct HomebrewHUDView: View {
                         .padding(20)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else if model.packages.isEmpty {
-                    ContentUnavailableView(
-                        model.isLoading ? "Searching Homebrew…" : "No Matching Packages",
-                        systemImage: "shippingbox"
-                    )
-                    .frame(height: 220)
+                    if let tab = model.activeTab,
+                       (tab == .formulae || tab == .casks),
+                       model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        ContentUnavailableView {
+                            Label("Search Homebrew \(tab.title)", systemImage: tab.icon)
+                        } description: {
+                            Text("Start typing a name or keyword to search Homebrew \(tab.title.lowercased()).")
+                        }
+                        .frame(height: 220)
+                    } else {
+                        ContentUnavailableView(
+                            model.isLoading ? "Searching Homebrew…" : "No Matching Packages",
+                            systemImage: "shippingbox"
+                        )
+                        .frame(height: 220)
+                    }
                 } else {
                     // 60/40 Split List + Package Detail Preview Pane
                     HStack(spacing: 0) {
