@@ -107,10 +107,10 @@ public struct BrewPackageItem: Identifiable, Sendable, Hashable {
     }
 }
 
-/// Fast fuzzy matcher delegating to SpotlightEngine (Rust nucleo when linked, zero-alloc Swift otherwise).
+/// Fast fuzzy matcher delegating to UpkeepEngine (Rust nucleo when linked, zero-alloc Swift otherwise).
 public enum SwiftFuzzyMatcher {
     public static func score(query: String, candidate: String) -> Int? {
-        SpotlightEngine.scoreFuzzy(query: query, candidate: candidate)
+        UpkeepEngine.scoreFuzzy(query: query, candidate: candidate)
     }
 }
 
@@ -126,9 +126,9 @@ public actor BrewService {
     private var lastRemoteCatalogFetch: Date?
     private var inFlightRemoteCatalogTask: Task<[BrewPackageItem], Never>?
 
-    #if USE_RUST_SPOTLIGHT_CORE
-    private let rustLocalIndex = SpotlightEngine.RustBrewIndex()
-    private let rustRemoteIndex = SpotlightEngine.RustBrewIndex()
+    #if USE_RUST_UPKEEP_CORE
+    private let rustLocalIndex = UpkeepEngine.RustBrewIndex()
+    private let rustRemoteIndex = UpkeepEngine.RustBrewIndex()
     #endif
 
     private static let brewEnv: [String: String] = [
@@ -236,7 +236,7 @@ public actor BrewService {
         }
         catalogLookup = map
         lastLoadedAt = Date()
-        #if USE_RUST_SPOTLIGHT_CORE
+        #if USE_RUST_UPKEEP_CORE
         rustLocalIndex.load(items: items)
         #endif
     }
@@ -486,7 +486,7 @@ public actor BrewService {
         if !loaded.isEmpty {
             remoteCatalog = loaded
             lastRemoteCatalogFetch = Date()
-            #if USE_RUST_SPOTLIGHT_CORE
+            #if USE_RUST_UPKEEP_CORE
             rustRemoteIndex.load(items: loaded)
             #endif
         }
@@ -500,7 +500,7 @@ public actor BrewService {
         // Fast path: search cached Homebrew JSON API in-memory (Rust nucleo when linked, zero-alloc Swift otherwise)
         let apiCatalog = await ensureRemoteCatalogLoaded()
         if !apiCatalog.isEmpty {
-            #if USE_RUST_SPOTLIGHT_CORE
+            #if USE_RUST_UPKEEP_CORE
             let rustHits = rustRemoteIndex.search(query: trimmed, filterCasks: filterCasks, limit: 80)
             if !rustHits.isEmpty { return rustHits }
             #else
@@ -560,10 +560,10 @@ public actor BrewService {
         scored.reserveCapacity(min(256, pool.count))
         for item in pool {
             if let filterCasks, item.isCask != filterCasks { continue }
-            if let nameScore = SpotlightEngine.scoreFuzzy(query: query, candidate: item.name) {
+            if let nameScore = UpkeepEngine.scoreFuzzy(query: query, candidate: item.name) {
                 scored.append((item, nameScore + 500))
             } else if !item.description.isEmpty,
-                      let descScore = SpotlightEngine.scoreFuzzy(query: query, candidate: item.description) {
+                      let descScore = UpkeepEngine.scoreFuzzy(query: query, candidate: item.description) {
                 scored.append((item, descScore))
             }
         }
@@ -577,7 +577,7 @@ public actor BrewService {
             guard let filterCasks else { return catalog }
             return catalog.filter { $0.isCask == filterCasks }
         }
-        #if USE_RUST_SPOTLIGHT_CORE
+        #if USE_RUST_UPKEEP_CORE
         return rustLocalIndex.search(query: trimmed, filterCasks: filterCasks, limit: 120)
         #else
         return scorePool(catalog, query: trimmed, filterCasks: filterCasks, limit: 120)

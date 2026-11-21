@@ -109,7 +109,7 @@ public actor MoleService {
     }
 
     public static func parseCleanOutput(_ raw: String, isDryRun: Bool) -> MoleCleanSummary {
-        SpotlightEngine.parseMoleCleanOutput(raw, isDryRun: isDryRun)
+        UpkeepEngine.parseMoleCleanOutput(raw, isDryRun: isDryRun)
     }
 
     public func dryRunClean() async throws -> MoleCleanSummary {
@@ -142,7 +142,7 @@ public actor MoleService {
         }
 
         // Fast parallel scan across /Applications and ~/Applications computing real bundle sizes
-        let apps = await SpotlightEngine.scanInstalledApplications()
+        let apps = await UpkeepEngine.scanInstalledApplications()
         cachedApps = apps
         lastAppFetch = Date()
         return apps

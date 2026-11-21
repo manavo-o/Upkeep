@@ -86,7 +86,7 @@ public enum CLIExecutor {
     }
 
     public static func stripANSI(_ input: String) -> String {
-        SpotlightEngine.stripANSI(input)
+        UpkeepEngine.stripANSI(input)
     }
 
     private final class PipeAccumulator: @unchecked Sendable {
@@ -347,7 +347,7 @@ public enum CLIExecutor {
                     proc.terminationHandler = nil
                     readDone.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
                         Darwin.close(masterFD)
-                        let cleanOutput = SpotlightEngine.stripANSI(state.takeString())
+                        let cleanOutput = UpkeepEngine.stripANSI(state.takeString())
                         state.resumeOnce(.success(CLIResult(
                             exitCode: proc.terminationStatus,
                             stdout: cleanOutput,

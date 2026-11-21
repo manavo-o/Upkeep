@@ -220,7 +220,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             panel.delegate = self
             homebrewPanel = panel
         }
-        homebrewPanel?.presentCenteredAtSpotlightHeight()
+        homebrewPanel?.presentCenteredAtHUDHeight()
         installHomebrewClickOutsideMonitors()
         if let query = initialQuery, !query.isEmpty {
             homebrewModel.onQueryChanged()

@@ -46,12 +46,8 @@ public final class UpdateManager {
     }
 
     private init() {
-        let infoRepo = (Bundle.main.infoDictionary?["UpkeepUpdateRepo"] as? String)
-            ?? (Bundle.main.infoDictionary?["SpotlightSuiteUpdateRepo"] as? String)
-            ?? ""
-        self.githubRepo = UserDefaults.standard.string(forKey: Self.repoDefaultsKey)
-            ?? UserDefaults.standard.string(forKey: "SpotlightSuiteUpdateRepo")
-            ?? infoRepo
+        let infoRepo = Bundle.main.infoDictionary?["UpkeepUpdateRepo"] as? String ?? ""
+        self.githubRepo = UserDefaults.standard.string(forKey: Self.repoDefaultsKey) ?? infoRepo
         if UserDefaults.standard.object(forKey: Self.autoCheckDefaultsKey) == nil {
             self.autoCheckUpdates = true
         } else {

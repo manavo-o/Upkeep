@@ -48,13 +48,13 @@ pub struct MoleCleanSummary {
 }
 
 #[repr(C)]
-pub struct SpotlightMatch {
+pub struct UpkeepMatch {
     pub index: u32,
     pub score: u32,
 }
 
 #[repr(C)]
-pub struct SpotlightAppRecord {
+pub struct UpkeepAppRecord {
     pub name: [c_char; 256],
     pub bundle_id: [c_char; 256],
     pub path: [c_char; 1024],
@@ -115,7 +115,7 @@ fn write_fixed_cstr(src: &str, dst: &mut [c_char]) {
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_brew_index_new() -> *mut BrewSearchIndex {
+pub extern "C" fn upkeep_brew_index_new() -> *mut BrewSearchIndex {
     let result = std::panic::catch_unwind(|| {
         Box::into_raw(Box::new(BrewSearchIndex {
             packages: RwLock::new(Vec::new()),
@@ -125,14 +125,14 @@ pub extern "C" fn spotlight_brew_index_new() -> *mut BrewSearchIndex {
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_brew_index_free(ptr: *mut BrewSearchIndex) {
+pub extern "C" fn upkeep_brew_index_free(ptr: *mut BrewSearchIndex) {
     if !ptr.is_null() {
         let _ = std::panic::catch_unwind(|| unsafe { drop(Box::from_raw(ptr)) });
     }
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_brew_index_load_json(
+pub extern "C" fn upkeep_brew_index_load_json(
     ptr: *mut BrewSearchIndex,
     json_utf8: *const c_char,
 ) -> u32 {
@@ -156,7 +156,7 @@ pub extern "C" fn spotlight_brew_index_load_json(
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_brew_index_load_api_json(
+pub extern "C" fn upkeep_brew_index_load_api_json(
     ptr: *mut BrewSearchIndex,
     formulae_json_utf8: *const c_char,
     casks_json_utf8: *const c_char,
@@ -289,7 +289,7 @@ fn parallel_score_indices(
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_brew_index_search_json(
+pub extern "C" fn upkeep_brew_index_search_json(
     ptr: *const BrewSearchIndex,
     query_utf8: *const c_char,
     limit: u32,
@@ -315,13 +315,13 @@ pub extern "C" fn spotlight_brew_index_search_json(
     result.unwrap_or_else(|_| string_to_cstr("[]".to_string()))
 }
 
-/// Zero-allocation parallel search: writes matches into caller-allocated SpotlightMatch array.
+/// Zero-allocation parallel search: writes matches into caller-allocated UpkeepMatch array.
 #[no_mangle]
-pub extern "C" fn spotlight_brew_index_search_fast(
+pub extern "C" fn upkeep_brew_index_search_fast(
     ptr: *const BrewSearchIndex,
     query_utf8: *const c_char,
     filter_mode: i32,
-    out_matches: *mut SpotlightMatch,
+    out_matches: *mut UpkeepMatch,
     capacity: u32,
 ) -> u32 {
     let result = std::panic::catch_unwind(|| {
@@ -338,7 +338,7 @@ pub extern "C" fn spotlight_brew_index_search_fast(
         let count = (scored.len() as u32).min(capacity);
         for (i, (score, idx)) in scored.into_iter().take(count as usize).enumerate() {
             unsafe {
-                *out_matches.add(i) = SpotlightMatch { index: idx, score };
+                *out_matches.add(i) = UpkeepMatch { index: idx, score };
             }
         }
         count
@@ -347,7 +347,7 @@ pub extern "C" fn spotlight_brew_index_search_fast(
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_fuzzy_score(
+pub extern "C" fn upkeep_fuzzy_score(
     query_utf8: *const c_char,
     candidate_utf8: *const c_char,
 ) -> i32 {
@@ -408,8 +408,8 @@ fn read_bundle_id(app_path: &Path) -> String {
 
 /// Multi-threaded parallel scanner of /Applications and ~/Applications using Rayon.
 #[no_mangle]
-pub extern "C" fn spotlight_scan_applications(
-    out_apps: *mut SpotlightAppRecord,
+pub extern "C" fn upkeep_scan_applications(
+    out_apps: *mut UpkeepAppRecord,
     capacity: u32,
 ) -> u32 {
     let result = std::panic::catch_unwind(|| {
@@ -550,7 +550,7 @@ fn scan_brew_dirs_internal(prefix: &str) -> Vec<BrewPackage> {
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_scan_brew_dirs_json(prefix_utf8: *const c_char) -> *mut c_char {
+pub extern "C" fn upkeep_scan_brew_dirs_json(prefix_utf8: *const c_char) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         let prefix = cstr_to_str(prefix_utf8);
         let packages = scan_brew_dirs_internal(prefix);
@@ -560,7 +560,7 @@ pub extern "C" fn spotlight_scan_brew_dirs_json(prefix_utf8: *const c_char) -> *
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_strip_ansi(raw_utf8: *const c_char) -> *mut c_char {
+pub extern "C" fn upkeep_strip_ansi(raw_utf8: *const c_char) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         let raw = cstr_to_str(raw_utf8);
         string_to_cstr(strip_ansi_escapes::strip_str(raw))
@@ -569,7 +569,7 @@ pub extern "C" fn spotlight_strip_ansi(raw_utf8: *const c_char) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_is_ascii(raw_utf8: *const c_char, len: u32) -> bool {
+pub extern "C" fn upkeep_is_ascii(raw_utf8: *const c_char, len: u32) -> bool {
     if raw_utf8.is_null() {
         return true;
     }
@@ -578,7 +578,7 @@ pub extern "C" fn spotlight_is_ascii(raw_utf8: *const c_char, len: u32) -> bool 
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_parse_mole_clean_json(
+pub extern "C" fn upkeep_parse_mole_clean_json(
     raw_utf8: *const c_char,
     is_dry_run: bool,
 ) -> *mut c_char {
@@ -661,7 +661,7 @@ pub extern "C" fn spotlight_parse_mole_clean_json(
 }
 
 #[no_mangle]
-pub extern "C" fn spotlight_string_free(s: *mut c_char) {
+pub extern "C" fn upkeep_string_free(s: *mut c_char) {
     if !s.is_null() {
         let _ = std::panic::catch_unwind(|| unsafe { drop(CString::from_raw(s)) });
     }

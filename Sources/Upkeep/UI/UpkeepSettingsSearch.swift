@@ -94,7 +94,7 @@ public enum UpkeepSearchCatalog {
             section: "Packages",
             tab: .homebrew,
             icon: "magnifyingglass",
-            keywords: ["brew", "search", "hud", "spotlight", "formulae", "casks"]
+            keywords: ["brew", "search", "hud", "floating", "formulae", "casks"]
         ),
         UpkeepSearchItem(
             id: "brew.outdated",

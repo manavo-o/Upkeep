@@ -228,7 +228,7 @@ public final class HomebrewHUDModel {
     }
 }
 
-/// macOS 27 Golden Gate Spotlight-matched Homebrew HUD:
+/// macOS 27 Golden Gate Liquid Glass Homebrew HUD:
 /// Top 60pt interactive Liquid Glass capsule + detached 20pt-radius Liquid Glass tray
 /// with global ⌘1–⌘4 scope shortcuts, 60/40 split detail preview, and ⌘K Action Menu.
 public struct HomebrewHUDView: View {
@@ -362,7 +362,7 @@ public struct HomebrewHUDView: View {
         }
         .padding(.horizontal, 26)
         .frame(height: 60)
-        .spotlightGlass(in: Capsule(), interactive: true)
+        .upkeepGlass(in: Capsule(), interactive: true)
     }
 
     private var resultsTray: some View {
@@ -481,7 +481,7 @@ public struct HomebrewHUDView: View {
                 .padding(.vertical, 8)
             }
         }
-        .spotlightGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .upkeepGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func detailPane(for pkg: BrewPackageItem) -> some View {

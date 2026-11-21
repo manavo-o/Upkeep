@@ -4,7 +4,7 @@ import PackageDescription
 
 let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let rustLibDir = packageDir.appendingPathComponent("Frameworks/lib").path
-let rustLibPath = packageDir.appendingPathComponent("Frameworks/lib/libspotlight_core.a").path
+let rustLibPath = packageDir.appendingPathComponent("Frameworks/lib/libupkeep_core.a").path
 let hasRustCore = FileManager.default.fileExists(atPath: rustLibPath)
 
 var coreDependencies: [Target.Dependency] = []
@@ -19,13 +19,13 @@ var extraTargets: [Target] = []
 if hasRustCore {
     extraTargets.append(
         .systemLibrary(
-            name: "CSpotlightCore",
+            name: "CUpkeepCore",
             path: "Frameworks/include"
         )
     )
-    coreDependencies.append("CSpotlightCore")
-    coreSwiftSettings.append(.define("USE_RUST_SPOTLIGHT_CORE"))
-    coreLinkerSettings.append(.unsafeFlags(["-L\(rustLibDir)", "-lspotlight_core"]))
+    coreDependencies.append("CUpkeepCore")
+    coreSwiftSettings.append(.define("USE_RUST_UPKEEP_CORE"))
+    coreLinkerSettings.append(.unsafeFlags(["-L\(rustLibDir)", "-lupkeep_core"]))
 }
 
 let package = Package(

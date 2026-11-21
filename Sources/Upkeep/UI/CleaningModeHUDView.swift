@@ -60,7 +60,7 @@ public struct CleaningModeHUDView: View {
             }
             .padding(.horizontal, 22)
             .frame(width: 460, height: 64)
-            .spotlightGlass(in: Capsule())
+            .upkeepGlass(in: Capsule())
 
             // Detached unlock hint tray (20pt Golden Gate radius)
             HStack(spacing: 10) {
@@ -79,7 +79,7 @@ public struct CleaningModeHUDView: View {
             }
             .padding(.horizontal, 20)
             .frame(width: 460, height: 44)
-            .spotlightGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .upkeepGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         }
         .padding(24)
     }

@@ -56,7 +56,7 @@ struct UpkeepSelfTest {
         }
 
         // 3. Fast Parallel Application Scanner with real bundle sizes
-        let apps = await SpotlightEngine.scanInstalledApplications()
+        let apps = await UpkeepEngine.scanInstalledApplications()
         check("Parallel application scan discovers installed apps", !apps.isEmpty, "\(apps.count) apps discovered")
         let appsWithSizes = apps.filter { ($0.size ?? 0) > 0 }
         check("Application sizes calculated concurrently", !appsWithSizes.isEmpty, "\(appsWithSizes.count)/\(apps.count) apps have computed sizes (e.g. \(appsWithSizes.first?.name ?? ""): \(appsWithSizes.first?.formattedSize ?? ""))")

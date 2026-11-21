@@ -1,14 +1,14 @@
 import Foundation
-#if USE_RUST_SPOTLIGHT_CORE
-import CSpotlightCore
+#if USE_RUST_UPKEEP_CORE
+import CUpkeepCore
 #endif
 
-/// Unified high-performance dual-engine: bridges to the Rust `spotlight_core` C-ABI
-/// when linked (`USE_RUST_SPOTLIGHT_CORE`), with fast zero-allocation Swift fallbacks.
-public enum SpotlightEngine {
+/// Unified high-performance dual-engine: bridges to the Rust `upkeep_core` C-ABI
+/// when linked (`USE_RUST_UPKEEP_CORE`), with fast zero-allocation Swift fallbacks.
+public enum UpkeepEngine {
 
     public static var isUsingRustCore: Bool {
-        #if USE_RUST_SPOTLIGHT_CORE
+        #if USE_RUST_UPKEEP_CORE
         return true
         #else
         return false
@@ -17,19 +17,19 @@ public enum SpotlightEngine {
 
     // MARK: - Persistent Rust Brew Search Index
 
-    #if USE_RUST_SPOTLIGHT_CORE
+    #if USE_RUST_UPKEEP_CORE
     public final class RustBrewIndex: @unchecked Sendable {
         private let lock = NSLock()
         private let ptr: OpaquePointer?
         private var items: [BrewPackageItem] = []
 
         public init() {
-            self.ptr = spotlight_brew_index_new()
+            self.ptr = upkeep_brew_index_new()
         }
 
         deinit {
             if let ptr {
-                spotlight_brew_index_free(ptr)
+                upkeep_brew_index_free(ptr)
             }
         }
 
@@ -63,7 +63,7 @@ public enum SpotlightEngine {
             lock.lock()
             self.items = items
             _ = jsonStr.withCString { cstr in
-                spotlight_brew_index_load_json(ptr, cstr)
+                upkeep_brew_index_load_json(ptr, cstr)
             }
             lock.unlock()
         }
@@ -71,12 +71,12 @@ public enum SpotlightEngine {
         public func search(query: String, filterCasks: Bool?, limit: Int = 120) -> [BrewPackageItem] {
             guard let ptr else { return [] }
             let filterMode: Int32 = filterCasks == nil ? -1 : (filterCasks! ? 1 : 0)
-            var matches = [SpotlightMatch](repeating: SpotlightMatch(index: 0, score: 0), count: max(1, limit))
+            var matches = [UpkeepMatch](repeating: UpkeepMatch(index: 0, score: 0), count: max(1, limit))
 
             lock.lock()
             let count = query.withCString { qPtr in
                 matches.withUnsafeMutableBufferPointer { buf in
-                    spotlight_brew_index_search_fast(ptr, qPtr, filterMode, buf.baseAddress, UInt32(buf.count))
+                    upkeep_brew_index_search_fast(ptr, qPtr, filterMode, buf.baseAddress, UInt32(buf.count))
                 }
             }
             var results: [BrewPackageItem] = []
@@ -104,10 +104,10 @@ public enum SpotlightEngine {
     public static func scoreFuzzy(query: String, candidate: String) -> Int? {
         if query.isEmpty { return 0 }
 
-        #if USE_RUST_SPOTLIGHT_CORE
+        #if USE_RUST_UPKEEP_CORE
         let s = query.withCString { qPtr in
             candidate.withCString { cPtr in
-                spotlight_fuzzy_score(qPtr, cPtr)
+                upkeep_fuzzy_score(qPtr, cPtr)
             }
         }
         return s >= 0 ? Int(s) : nil
@@ -194,10 +194,10 @@ public enum SpotlightEngine {
     // MARK: - Fast Byte-Stream ANSI Escape Stripper
 
     public static func stripANSI(_ input: String) -> String {
-        #if USE_RUST_SPOTLIGHT_CORE
+        #if USE_RUST_UPKEEP_CORE
         return input.withCString { cstr in
-            guard let out = spotlight_strip_ansi(cstr) else { return input }
-            defer { spotlight_string_free(out) }
+            guard let out = upkeep_strip_ansi(cstr) else { return input }
+            defer { upkeep_string_free(out) }
             return String(cString: out)
         }
         #else
@@ -229,7 +229,7 @@ public enum SpotlightEngine {
     // MARK: - Mole Clean Parser (Dual Delimiters: '·' and '|')
 
     public static func parseMoleCleanOutput(_ raw: String, isDryRun: Bool) -> MoleCleanSummary {
-        #if USE_RUST_SPOTLIGHT_CORE
+        #if USE_RUST_UPKEEP_CORE
         struct WireSummary: Decodable {
             let total_reclaimed: String
             let item_count: Int
@@ -237,8 +237,8 @@ public enum SpotlightEngine {
             let is_dry_run: Bool
         }
         let decoded: WireSummary? = raw.withCString { cstr in
-            guard let out = spotlight_parse_mole_clean_json(cstr, isDryRun) else { return nil }
-            defer { spotlight_string_free(out) }
+            guard let out = upkeep_parse_mole_clean_json(cstr, isDryRun) else { return nil }
+            defer { upkeep_string_free(out) }
             let json = String(cString: out)
             return try? JSONDecoder().decode(WireSummary.self, from: Data(json.utf8))
         }
@@ -307,12 +307,12 @@ public enum SpotlightEngine {
     // MARK: - Parallel Application Scanner with Accurate APFS Bundle Sizes
 
     public static func scanInstalledApplications() async -> [MoleInstalledApp] {
-        #if USE_RUST_SPOTLIGHT_CORE
+        #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
             let capacity = 1024
-            var records = [SpotlightAppRecord](repeating: SpotlightAppRecord(), count: capacity)
+            var records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
             let count = records.withUnsafeMutableBufferPointer { buf in
-                spotlight_scan_applications(buf.baseAddress, UInt32(buf.count))
+                upkeep_scan_applications(buf.baseAddress, UInt32(buf.count))
             }
             var apps: [MoleInstalledApp] = []
             apps.reserveCapacity(Int(count))

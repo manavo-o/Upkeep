@@ -1,4 +1,0 @@
-module CSpotlightCore [system] {
-    header "spotlight_core.h"
-    export *
-}

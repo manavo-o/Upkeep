@@ -11,7 +11,7 @@
 DerivedData/
 
 # Rust build outputs
-rust/spotlight_core/target/
+rust/upkeep_core/target/
 
 # Generated binaries & app bundle
 Frameworks/lib/

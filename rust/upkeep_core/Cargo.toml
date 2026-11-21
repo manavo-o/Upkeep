@@ -1,12 +1,12 @@
 [package]
-name = "spotlight_core"
+name = "upkeep_core"
 version = "0.3.0"
 edition = "2021"
 description = "C-ABI Rust engine: parallel nucleo fuzzy matcher, fast Cellar/Caskroom + Homebrew API indexer, APFS-accurate parallel app scanner, and Mole ANSI parser"
 
 [lib]
 crate-type = ["staticlib", "cdylib"]
-name = "spotlight_core"
+name = "upkeep_core"
 
 [dependencies]
 nucleo-matcher = "0.3"

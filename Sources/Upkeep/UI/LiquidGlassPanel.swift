@@ -60,7 +60,7 @@ public final class LiquidGlassPanel: NSPanel {
     public override var canBecomeKey: Bool { true }
     public override var canBecomeMain: Bool { false }
 
-    public func presentCenteredAtSpotlightHeight() {
+    public func presentCenteredAtHUDHeight() {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
             center()
             makeKeyAndOrderFront(nil)
@@ -76,7 +76,7 @@ public final class LiquidGlassPanel: NSPanel {
 }
 
 /// Applies native macOS 27 Golden Gate Liquid Glass with standard specular edge highlights.
-public struct SpotlightGlassSurface<S: InsettableShape>: ViewModifier {
+public struct UpkeepGlassSurface<S: InsettableShape>: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
     let shape: S
@@ -228,12 +228,12 @@ public struct TrayTileSurface: ViewModifier {
 }
 
 public extension View {
-    func spotlightGlass<S: InsettableShape>(
+    func upkeepGlass<S: InsettableShape>(
         in shape: S,
         interactive: Bool = false,
         tint: Color? = nil
     ) -> some View {
-        modifier(SpotlightGlassSurface(shape: shape, interactive: interactive, tintColor: tint))
+        modifier(UpkeepGlassSurface(shape: shape, interactive: interactive, tintColor: tint))
     }
 
     func trayTile(

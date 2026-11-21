@@ -13,7 +13,7 @@ echo "Building $APP_NAME (Swift 6 release)..."
 cd "$ROOT_DIR"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 if command -v cargo >/dev/null 2>&1 && [[ -x "$ROOT_DIR/Scripts/build-rust-cabi.sh" ]]; then
-    echo "Building Rust spotlight_core static library..."
+    echo "Building Rust upkeep_core static library..."
     "$ROOT_DIR/Scripts/build-rust-cabi.sh"
 fi
 if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" && ! -f "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib" ]]; then
@@ -82,7 +82,7 @@ plutil -lint "$APP_BUNDLE/Contents/Info.plist"
 
 ensure_signing_identity() {
     local existing
-    existing="$(security find-identity -v -p codesigning 2>/dev/null | grep -E "Apple Development|$DEV_CERT_NAME|SpotlightSuite Local Signing" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+    existing="$(security find-identity -v -p codesigning 2>/dev/null | grep -E "Apple Development|$DEV_CERT_NAME" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
     if [[ -n "$existing" ]]; then
         echo "$existing"
         return 0
@@ -111,13 +111,13 @@ EOF
 
     openssl pkcs12 -export -legacy -out "$tmp_dir/cert.p12" \
         -inkey "$tmp_dir/key.pem" -in "$tmp_dir/cert.pem" \
-        -passout pass:spotlight >/dev/null 2>&1 || \
+        -passout pass:upkeep >/dev/null 2>&1 || \
     openssl pkcs12 -export -out "$tmp_dir/cert.p12" \
         -inkey "$tmp_dir/key.pem" -in "$tmp_dir/cert.pem" \
-        -passout pass:spotlight >/dev/null 2>&1
+        -passout pass:upkeep >/dev/null 2>&1
 
     local keychain="$HOME/Library/Keychains/login.keychain-db"
-    security import "$tmp_dir/cert.p12" -k "$keychain" -P spotlight -T /usr/bin/codesign >/dev/null 2>&1 || true
+    security import "$tmp_dir/cert.p12" -k "$keychain" -P upkeep -T /usr/bin/codesign >/dev/null 2>&1 || true
     security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain" "$tmp_dir/cert.pem" >/dev/null 2>&1 || true
     rm -rf "$tmp_dir"
 

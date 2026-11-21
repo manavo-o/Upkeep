@@ -1,6 +1,6 @@
 # Upkeep
 
-Native macOS 27 menu-bar utility built with Swift 6, SwiftUI, AppKit, and an optional Rust C-ABI core (`spotlight_core`).
+Native macOS 27 menu-bar utility built with Swift 6, SwiftUI, AppKit, and an optional Rust C-ABI core (`upkeep_core`).
 
 ## Features
 

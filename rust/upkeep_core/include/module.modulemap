@@ -1,0 +1,4 @@
+module CUpkeepCore [system] {
+    header "upkeep_core.h"
+    export *
+}
