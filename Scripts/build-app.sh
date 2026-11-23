@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EXECUTABLE_NAME="Upkeep"
 APP_NAME="Upkeep"
 BUNDLE_ID="com.local.Upkeep"
-APP_VERSION="${UPKEEP_VERSION:-1.4.0}"
+APP_VERSION="${UPKEEP_VERSION:-1.4.1}"
 BUILD_DIR="$ROOT_DIR/.build/release"
 APP_BUNDLE="$ROOT_DIR/dist/$APP_NAME.app"
 DEV_CERT_NAME="Upkeep Local Signing"
@@ -77,7 +77,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>CFBundleShortVersionString</key>
     <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>9</string>
+    <string>10</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSUIElement</key>

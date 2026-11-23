@@ -179,7 +179,10 @@ public final class KeepAwakeManager {
             }
         }
         timer.tolerance = 0.1
-        RunLoop.main.add(timer, forMode: .common)
+        // Intentionally use `.default` (not `.common`) so ticks pause during NSMenu `.eventTracking`.
+        // This keeps the countdown accurate whenever the menu is opened without rebuilding/closing
+        // hovered submenus inside `MenuBarExtraStyle(.menu)`.
+        RunLoop.main.add(timer, forMode: .default)
         displayTimer = timer
     }
 
