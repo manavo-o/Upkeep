@@ -548,7 +548,6 @@ public struct MenuBarView: View {
     private func monospacedMenuTitle(_ raw: String) -> AttributedString {
         var str = AttributedString(raw)
         let menuFontSize = NSFont.menuFont(ofSize: 0).pointSize
-        str.appKit.font = NSFont.monospacedDigitSystemFont(ofSize: menuFontSize, weight: .regular)
         str.swiftUI.font = .system(size: menuFontSize).monospacedDigit()
         return str
     }
