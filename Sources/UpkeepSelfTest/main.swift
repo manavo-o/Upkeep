@@ -19,7 +19,7 @@ struct UpkeepSelfTest {
     }
 
     static func main() async {
-        print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.3.0) ===")
+        print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.4.0) ===")
         print("  Engine: \(UpkeepEngine.isUsingRustCore ? "Rust upkeep_core C-ABI" : "Swift fallback")")
 
         // 1. CLIExecutor & ANSI tests

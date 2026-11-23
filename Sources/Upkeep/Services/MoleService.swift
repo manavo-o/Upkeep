@@ -578,7 +578,45 @@ public actor MoleService {
         return UninstallInspection(app: app, leftovers: leftovers, homebrewCaskToken: caskToken)
     }
 
-    /// Removes an app with explicit user-reviewed leftover paths and optional Homebrew cask uninstallation.
+    private static let allowedSystemUninstallPrefixes: [String] = [
+        "/Library/Application Support/",
+        "/Library/Caches/",
+        "/Library/Logs/",
+        "/Library/Preferences/",
+        "/Library/LaunchAgents/",
+        "/Library/LaunchDaemons/",
+        "/Library/PrivilegedHelperTools/",
+        "/Users/Shared/",
+        "/private/var/db/receipts/"
+    ]
+
+    private static func isAllowedSystemUninstallTarget(_ rawPath: String) -> Bool {
+        guard rawPath.hasPrefix("/"),
+              !rawPath.contains("/../"),
+              !rawPath.hasSuffix("/.."),
+              !rawPath.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            return false
+        }
+        let trimmed = rawPath.hasSuffix("/") ? String(rawPath.dropLast()) : rawPath
+        let lower = trimmed.lowercased()
+        let base = (lower as NSString).lastPathComponent
+        guard !base.isEmpty, !base.hasPrefix("com.apple.") else {
+            return false
+        }
+        if lower.hasPrefix("/library/launchdaemons/") || lower.hasPrefix("/library/launchagents/") {
+            guard base.hasSuffix(".plist") else { return false }
+        }
+        for prefix in allowedSystemUninstallPrefixes where trimmed.hasPrefix(prefix) && trimmed.count > prefix.count {
+            return true
+        }
+        return false
+    }
+
+    private static let lsregisterPath =
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+    /// Removes an app with explicit user-reviewed leftover paths (including optional allowlisted
+    /// system leftovers via a single native admin prompt) and optional Homebrew cask uninstallation.
     public func uninstallReviewedApp(
         _ app: MoleInstalledApp,
         selectedLeftoverPaths: Set<String>,
@@ -596,10 +634,15 @@ public actor MoleService {
             try? await Task.sleep(for: .milliseconds(250))
         }
 
+        let systemLeftovers = selectedLeftoverPaths.filter {
+            $0.hasPrefix("/Library/") || $0.hasPrefix("/private/") || $0.hasPrefix("/Users/Shared/")
+        }
+        let userLeftovers = selectedLeftoverPaths.subtracting(systemLeftovers)
+
         // Unload any selected user LaunchAgents cleanly via launchctl bootout before trashing
         let uid = getuid()
-        for path in selectedLeftoverPaths
-        where path.contains("/Library/LaunchAgents/") && !path.hasPrefix("/Library/") && path.hasSuffix(".plist") && fm.fileExists(atPath: path) {
+        for path in userLeftovers
+        where path.contains("/Library/LaunchAgents/") && path.hasSuffix(".plist") && fm.fileExists(atPath: path) {
             _ = try? await CLIExecutor.run(
                 binary: "launchctl",
                 arguments: ["bootout", "gui/\(uid)", path]
@@ -625,28 +668,69 @@ public actor MoleService {
             }
         }
 
-        var trashedLeftovers = 0
-        for path in selectedLeftoverPaths where fm.fileExists(atPath: path) {
-            if path.hasPrefix("/Library/") || path.hasPrefix("/private/") || path.hasPrefix("/Users/Shared/") {
-                continue
-            }
+        // Unregister only the removed app bundle from LaunchServices (never rebuild the whole domain)
+        if fm.isExecutableFile(atPath: Self.lsregisterPath) {
+            _ = try? await CLIExecutor.run(binary: Self.lsregisterPath, arguments: ["-u", app.path])
+        }
+
+        var removedLeftovers = 0
+        for path in userLeftovers where fm.fileExists(atPath: path) {
             if (try? fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)) != nil {
-                trashedLeftovers += 1
+                removedLeftovers += 1
+            }
+        }
+
+        var skippedSystemCount = 0
+        let validSystemTargets = systemLeftovers
+            .filter { Self.isAllowedSystemUninstallTarget($0) && fm.fileExists(atPath: $0) }
+            .sorted()
+        if !validSystemTargets.isEmpty {
+            var commands: [String] = []
+            for path in validSystemTargets {
+                let q = Self.shellQuote(path)
+                let lower = path.lowercased()
+                if (lower.hasPrefix("/library/launchdaemons/") || lower.hasPrefix("/library/launchagents/"))
+                    && lower.hasSuffix(".plist") {
+                    commands.append("launchctl bootout system \(q) 2>/dev/null || true")
+                }
+                commands.append("if [ ! -L \(q) ]; then rm -rf \(q) 2>/dev/null || true; fi")
+            }
+            let shellScript = commands.joined(separator: "; ")
+            let escapedForAppleScript = shellScript
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let appleScript = "do shell script \"\(escapedForAppleScript)\" with administrator privileges"
+
+            if let res = try? await CLIExecutor.run(binary: "/usr/bin/osascript", arguments: ["-e", appleScript]),
+               res.exitCode == 0 {
+                for path in validSystemTargets {
+                    if !fm.fileExists(atPath: path) {
+                        removedLeftovers += 1
+                    } else {
+                        skippedSystemCount += 1
+                    }
+                }
+            } else {
+                skippedSystemCount = validSystemTargets.count
             }
         }
 
         cachedApps.removeAll { $0.path == app.path || $0.name.caseInsensitiveCompare(app.name) == .orderedSame }
 
+        let skippedSuffix = skippedSystemCount > 0
+            ? " (\(skippedSystemCount) system \(skippedSystemCount == 1 ? "item" : "items") skipped)"
+            : ""
+
         if usedHomebrew, let token = homebrewCaskToken {
-            if trashedLeftovers > 0 {
-                return "Uninstalled cask `\(token)` via Homebrew and moved \(trashedLeftovers) leftover \(trashedLeftovers == 1 ? "item" : "items") to Trash"
+            if removedLeftovers > 0 {
+                return "Uninstalled cask `\(token)` via Homebrew and removed \(removedLeftovers) leftover \(removedLeftovers == 1 ? "item" : "items")\(skippedSuffix)"
             }
-            return "Uninstalled cask `\(token)` via Homebrew"
+            return "Uninstalled cask `\(token)` via Homebrew\(skippedSuffix)"
         }
-        if trashedLeftovers > 0 {
-            return "Moved \(app.name) and \(trashedLeftovers) leftover \(trashedLeftovers == 1 ? "item" : "items") to Trash"
+        if removedLeftovers > 0 {
+            return "Removed \(app.name) and \(removedLeftovers) leftover \(removedLeftovers == 1 ? "item" : "items")\(skippedSuffix)"
         }
-        return "Moved \(app.name) to Trash"
+        return "Moved \(app.name) to Trash\(skippedSuffix)"
     }
 
     private static func categorizeLeftover(path: String) -> String {

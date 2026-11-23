@@ -1629,6 +1629,11 @@ private struct UninstallReviewSheet: View {
             .reduce(0) { $0 + $1.sizeBytes }
     }
 
+    private var hasSelectedSystemLeftovers: Bool {
+        guard let inspection = vm.uninstallInspection else { return false }
+        return inspection.leftovers.contains { $0.isSystem && selectedLeftovers.contains($0.path) }
+    }
+
     private var totalSelectedSizeFormatted: String {
         let total = (app.size ?? 0) + selectedLeftoversBytes
         return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
@@ -1790,7 +1795,6 @@ private struct UninstallReviewSheet: View {
                                     let isChecked = selectedLeftovers.contains(item.path)
                                     HStack(spacing: 8) {
                                         Button {
-                                            guard !item.isSystem else { return }
                                             if isChecked {
                                                 selectedLeftovers.remove(item.path)
                                             } else {
@@ -1798,15 +1802,15 @@ private struct UninstallReviewSheet: View {
                                             }
                                         } label: {
                                             HStack(spacing: 10) {
-                                                Image(systemName: item.isSystem ? "lock.fill" : (isChecked ? "checkmark.square.fill" : "square"))
-                                                    .foregroundStyle(item.isSystem ? Color.secondary.opacity(0.6) : (isChecked ? Color.accentColor : Color.secondary))
-                                                    .font(.system(size: item.isSystem ? 12 : 14))
+                                                Image(systemName: isChecked ? "checkmark.square.fill" : "square")
+                                                    .foregroundStyle(isChecked ? (item.isSystem ? Color.purple : Color.accentColor) : Color.secondary)
+                                                    .font(.system(size: 14))
                                                     .frame(width: 16)
 
                                                 VStack(alignment: .leading, spacing: 2) {
                                                     Text(item.displayPath)
                                                         .font(.system(size: 11.5, design: .monospaced))
-                                                        .foregroundStyle(item.isSystem ? .secondary : .primary)
+                                                        .foregroundStyle(.primary)
                                                         .lineLimit(1)
                                                         .truncationMode(.middle)
 
@@ -1816,12 +1820,12 @@ private struct UninstallReviewSheet: View {
                                                             .foregroundStyle(.secondary)
 
                                                         if item.isSystem {
-                                                            Text("System · Admin")
+                                                            Label("Admin", systemImage: "lock.fill")
                                                                 .font(.system(size: 9.5, weight: .semibold))
-                                                                .foregroundStyle(.secondary)
-                                                                .padding(.horizontal, 5)
+                                                                .foregroundStyle(.purple)
+                                                                .padding(.horizontal, 5.5)
                                                                 .padding(.vertical, 1)
-                                                                .background(Color.primary.opacity(0.08), in: Capsule())
+                                                                .background(Color.purple.opacity(0.14), in: Capsule())
                                                         } else if !item.defaultSelected {
                                                             Text("Held back · \(item.holdbackReason ?? "Personal data")")
                                                                 .font(.system(size: 9.5, weight: .semibold))
@@ -1892,9 +1896,15 @@ private struct UninstallReviewSheet: View {
                     if vm.isUninstallingApp {
                         ProgressView().controlSize(.small)
                     } else if let token = vm.uninstallInspection?.homebrewCaskToken, useHomebrewCask {
-                        Label("Uninstall Cask (\(token))", systemImage: "trash.fill")
+                        Label(
+                            hasSelectedSystemLeftovers ? "Uninstall Cask (\(token)) + Admin" : "Uninstall Cask (\(token))",
+                            systemImage: "trash.fill"
+                        )
                     } else {
-                        Label("Move to Trash", systemImage: "trash.fill")
+                        Label(
+                            hasSelectedSystemLeftovers ? "Move to Trash (Admin)" : "Move to Trash",
+                            systemImage: "trash.fill"
+                        )
                     }
                 }
                 .buttonStyle(.upkeepPrimary)

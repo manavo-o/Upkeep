@@ -418,7 +418,12 @@ public struct MenuBarView: View {
                 Text("Keep Display Awake")
             }
         } label: {
-            Label(caffeinateMenuTitle, systemImage: keepAwake.isActive ? "cup.and.saucer.fill" : "cup.and.saucer")
+            Label {
+                Text(caffeinateMenuTitle)
+                    .monospacedDigit()
+            } icon: {
+                Image(systemName: keepAwake.isActive ? "cup.and.saucer.fill" : "cup.and.saucer")
+            }
         }
 
         Menu {
@@ -457,7 +462,12 @@ public struct MenuBarView: View {
             Toggle("Dim Screen While Locked", isOn: $vm.cleaningDimScreen)
             Toggle("Lock Pointer", isOn: $vm.cleaningLockPointer)
         } label: {
-            Label(cleanKeysMenuTitle, systemImage: "keyboard.badge.ellipsis")
+            Label {
+                Text(cleanKeysMenuTitle)
+                    .monospacedDigit()
+            } icon: {
+                Image(systemName: "keyboard.badge.ellipsis")
+            }
         }
 
         Button {
@@ -527,20 +537,32 @@ public struct MenuBarView: View {
 
     private var statusHeaderTitle: String {
         if keepAwake.isActive {
-            return "Upkeep v\(updater.currentVersion) · Awake \(keepAwake.formattedRemaining)"
+            return "Upkeep v\(updater.currentVersion) · Awake"
         }
         if cleaning.isLocked {
-            return "Upkeep v\(updater.currentVersion) · Locked \(cleaning.remainingSeconds)s"
+            return "Upkeep v\(updater.currentVersion) · Locked"
         }
         return "Upkeep v\(updater.currentVersion)"
     }
 
-    private var caffeinateMenuTitle: String {
-        keepAwake.isActive ? "Caffeinate (\(keepAwake.formattedRemaining))" : "Caffeinate"
+    private func monospacedMenuTitle(_ raw: String) -> AttributedString {
+        var str = AttributedString(raw)
+        let menuFontSize = NSFont.menuFont(ofSize: 0).pointSize
+        str.appKit.font = NSFont.monospacedDigitSystemFont(ofSize: menuFontSize, weight: .regular)
+        str.swiftUI.font = .system(size: menuFontSize).monospacedDigit()
+        return str
     }
 
-    private var cleanKeysMenuTitle: String {
-        cleaning.isLocked ? "Clean Keys (\(cleaning.remainingSeconds)s)" : "Clean Keys"
+    private var caffeinateMenuTitle: AttributedString {
+        monospacedMenuTitle(
+            keepAwake.isActive ? "Caffeinate (\(keepAwake.formattedRemaining))" : "Caffeinate"
+        )
+    }
+
+    private var cleanKeysMenuTitle: AttributedString {
+        monospacedMenuTitle(
+            cleaning.isLocked ? "Clean Keys (\(cleaning.remainingSeconds)s)" : "Clean Keys"
+        )
     }
 
     private var formattedCleaningDuration: String {

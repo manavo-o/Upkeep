@@ -12,7 +12,11 @@ Instructions and operational gotchas for AI agents working on **Upkeep** (`com.l
      ```bash
      pkill -x Upkeep 2>/dev/null; ~/projects/Upkeep/Scripts/build-app.sh && open ~/projects/Upkeep/dist/Upkeep.app
      ```
-  3. If an ad-hoc build was previously launched, remind the user to toggle **Upkeep** off and back on once in **System Settings → Privacy & Security → Accessibility** so TCC binds to the persistent certificate.
+  3. For cutting a new version release (bump `APP_VERSION` / `CFBundleVersion` in `Scripts/build-app.sh`, commit, tag `v<version>`, then hand off this single command to rebuild, update `/Applications/Upkeep.app`, relaunch, and push `main` + the new tag):
+     ```bash
+     cd ~/projects/Upkeep && pkill -x Upkeep 2>/dev/null; ./Scripts/build-app.sh && ([[ -d /Applications/Upkeep.app ]] && rm -rf /Applications/Upkeep.app && cp -R dist/Upkeep.app /Applications/Upkeep.app && open /Applications/Upkeep.app || open dist/Upkeep.app) && git push origin main && git push -f origin v<version>
+     ```
+  4. If an ad-hoc build was previously launched, remind the user to toggle **Upkeep** off and back on once in **System Settings → Privacy & Security → Accessibility** so TCC binds to the persistent certificate.
 
 ## App Behavior & Launching
 

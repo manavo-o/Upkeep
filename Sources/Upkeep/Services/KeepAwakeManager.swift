@@ -35,9 +35,12 @@ public final class KeepAwakeManager {
     public private(set) var mode: KeepAwakeMode = .displayAndSystem
     public private(set) var expiresAt: Date?
     public private(set) var usingIOKitAssertion: Bool = false
+    /// Observable formatted countdown string updated only when its text changes, so menu bar items
+    /// refresh live while views using `Text(expiresAt, style: .timer)` avoid 1 Hz invalidation.
+    public private(set) var formattedRemaining: String = "Off"
 
-    /// Computed on demand so SwiftUI views don't suffer 1 Hz `@Observable` invalidation storms.
-    /// Live UI countdowns should bind directly to `expiresAt` via `Text(expiresAt, style: .timer)`.
+    /// Computed on demand so views observing `expiresAt` don't suffer 1 Hz `@Observable` invalidation storms.
+    /// Live window countdowns should bind directly to `expiresAt` via `Text(expiresAt, style: .timer)`.
     public var remainingSeconds: Int? {
         guard isActive, let expiresAt else { return nil }
         return max(0, Int(expiresAt.timeIntervalSinceNow.rounded(.up)))
@@ -47,6 +50,7 @@ public final class KeepAwakeManager {
     private var systemAssertionID: IOPMAssertionID = 0
     private var activityToken: NSObjectProtocol?
     private var expirationTask: Task<Void, Never>?
+    private var displayTimer: Timer?
 
     private init() {
         NotificationCenter.default.addObserver(
@@ -104,8 +108,11 @@ public final class KeepAwakeManager {
             let target = Date().addingTimeInterval(TimeInterval(minutes * 60))
             self.expiresAt = target
             scheduleExpiration(at: target)
+            refreshFormattedRemaining()
+            startDisplayTimer()
         } else {
             self.expiresAt = nil
+            refreshFormattedRemaining()
         }
     }
 
@@ -118,11 +125,15 @@ public final class KeepAwakeManager {
         let target = base.addingTimeInterval(TimeInterval(minutes * 60))
         expiresAt = target
         scheduleExpiration(at: target)
+        refreshFormattedRemaining()
+        startDisplayTimer()
     }
 
     public func stop() {
         expirationTask?.cancel()
         expirationTask = nil
+        displayTimer?.invalidate()
+        displayTimer = nil
         if assertionID != 0 {
             IOPMAssertionRelease(assertionID)
             assertionID = 0
@@ -138,9 +149,10 @@ public final class KeepAwakeManager {
         usingIOKitAssertion = false
         isActive = false
         expiresAt = nil
+        formattedRemaining = "Off"
     }
 
-    public var formattedRemaining: String {
+    private func computeFormattedRemaining() -> String {
         guard isActive else { return "Off" }
         guard let seconds = remainingSeconds else { return "Indefinite" }
         let hrs = seconds / 3600
@@ -150,6 +162,25 @@ public final class KeepAwakeManager {
             return String(format: "%dh %02dm", hrs, mins)
         }
         return String(format: "%02dm %02ds", mins, secs)
+    }
+
+    private func refreshFormattedRemaining() {
+        let next = computeFormattedRemaining()
+        if next != formattedRemaining {
+            formattedRemaining = next
+        }
+    }
+
+    private func startDisplayTimer() {
+        displayTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshFormattedRemaining()
+            }
+        }
+        timer.tolerance = 0.1
+        RunLoop.main.add(timer, forMode: .common)
+        displayTimer = timer
     }
 
     private func scheduleExpiration(at target: Date) {

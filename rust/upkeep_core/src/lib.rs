@@ -12,7 +12,7 @@ use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 mod cleaner;
 pub use cleaner::{upkeep_clean_paths_json, upkeep_scan_cleaner_json};
@@ -341,12 +341,181 @@ mod macos_bulk {
             RefCell::new((vec![0u8; 128 * 1024], Vec::with_capacity(512)));
     }
 
+    /// Lock-free per-task accumulator: ordinary files sum directly into `bytes`, while
+    /// hardlinked files (`link_count > 1`) record `(obj_key, bytes)` for a single top-level
+    /// deduplication pass — zero `Mutex` contention across Rayon workers.
+    #[derive(Default)]
+    struct SizeAcc {
+        bytes: u64,
+        hardlinks: Vec<(u64, u64)>,
+    }
+
+    impl SizeAcc {
+        #[inline]
+        fn merge(&mut self, mut other: SizeAcc) {
+            self.bytes = self.bytes.saturating_add(other.bytes);
+            if !other.hardlinks.is_empty() {
+                if self.hardlinks.is_empty() {
+                    self.hardlinks = std::mem::take(&mut other.hardlinks);
+                } else {
+                    self.hardlinks.extend(other.hardlinks);
+                }
+            }
+        }
+    }
+
+    /// Reusable arena across all DFS recursion levels so subdirectories incur zero Vec allocations.
+    struct DfsArena {
+        path_bytes: Vec<u8>,
+        child_names: Vec<u8>,
+        child_offsets: Vec<usize>,
+    }
+
+    /// Shared lock-free `getattrlistbulk` parser for an open directory FD.
+    fn parse_fd_bulk<F>(fd: c_int, buf: &mut [u8], acc: &mut SizeAcc, mut on_dir: F)
+    where
+        F: FnMut(&[u8]),
+    {
+        let mut attrlist = AttrList {
+            bitmapcount: ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: ATTR_CMN_RETURNED_ATTRS
+                | ATTR_CMN_NAME
+                | ATTR_CMN_OBJTYPE
+                | ATTR_CMN_OBJID,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
+            forkattr: 0,
+        };
+
+        loop {
+            let count = unsafe {
+                getattrlistbulk(
+                    fd,
+                    &mut attrlist,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len(),
+                    0,
+                )
+            };
+            if count <= 0 {
+                break;
+            }
+
+            let mut offset: usize = 0;
+            for _ in 0..count {
+                if offset + 4 > buf.len() {
+                    break;
+                }
+                let entry_len =
+                    u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+                if entry_len == 0 || offset + entry_len > buf.len() {
+                    break;
+                }
+
+                let entry = &buf[offset..offset + entry_len];
+                let mut field = 4usize;
+
+                if field + std::mem::size_of::<AttributeSet>() > entry.len() {
+                    offset += entry_len;
+                    continue;
+                }
+                let returned: AttributeSet = unsafe {
+                    std::ptr::read_unaligned(entry.as_ptr().add(field) as *const AttributeSet)
+                };
+                field += std::mem::size_of::<AttributeSet>();
+
+                let mut name_bytes: &[u8] = &[];
+                if returned.commonattr & ATTR_CMN_NAME != 0 {
+                    if field + std::mem::size_of::<AttrReference>() <= entry.len() {
+                        let name_field_start = field;
+                        let attr_ref: AttrReference = unsafe {
+                            std::ptr::read_unaligned(
+                                entry.as_ptr().add(field) as *const AttrReference,
+                            )
+                        };
+                        field += std::mem::size_of::<AttrReference>();
+                        let start =
+                            name_field_start.wrapping_add(attr_ref.attr_dataoffset as usize);
+                        let len = attr_ref.attr_length as usize;
+                        if start < entry.len() && start + len <= entry.len() && len > 0 {
+                            let slice = &entry[start..start + len];
+                            name_bytes = slice.strip_suffix(&[0]).unwrap_or(slice);
+                        }
+                    }
+                }
+
+                let mut obj_type: u32 = 0;
+                if returned.commonattr & ATTR_CMN_OBJTYPE != 0 {
+                    if field + 4 <= entry.len() {
+                        obj_type =
+                            u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
+                        field += 4;
+                    }
+                }
+
+                let mut obj_key: u64 = 0;
+                if returned.commonattr & ATTR_CMN_OBJID != 0 {
+                    if field + std::mem::size_of::<FsObjId>() <= entry.len() {
+                        let id: FsObjId = unsafe {
+                            std::ptr::read_unaligned(entry.as_ptr().add(field) as *const FsObjId)
+                        };
+                        obj_key = ((id.objid as u64) << 32) | (id.objno as u64);
+                        field += std::mem::size_of::<FsObjId>();
+                    }
+                }
+
+                if obj_type == VDIR {
+                    if !name_bytes.is_empty() && name_bytes != b"." && name_bytes != b".." {
+                        on_dir(name_bytes);
+                    }
+                } else if obj_type == VREG {
+                    let mut link_count: u32 = 1;
+                    if returned.fileattr & ATTR_FILE_LINKCOUNT != 0 && field + 4 <= entry.len() {
+                        link_count =
+                            u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
+                        field += 4;
+                    }
+
+                    let mut total_size: i64 = 0;
+                    if returned.fileattr & ATTR_FILE_TOTALSIZE != 0 && field + 8 <= entry.len() {
+                        total_size =
+                            i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
+                        field += 8;
+                    }
+
+                    let mut alloc_size: i64 = 0;
+                    if returned.fileattr & ATTR_FILE_ALLOCSIZE != 0 && field + 8 <= entry.len() {
+                        alloc_size =
+                            i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
+                    }
+
+                    let bytes = if alloc_size > 0 {
+                        alloc_size as u64
+                    } else if total_size > 0 {
+                        total_size as u64
+                    } else {
+                        0
+                    };
+
+                    if link_count > 1 && obj_key != 0 {
+                        acc.hardlinks.push((obj_key, bytes));
+                    } else {
+                        acc.bytes = acc.bytes.saturating_add(bytes);
+                    }
+                }
+
+                offset += entry_len;
+            }
+        }
+    }
+
     fn read_single_dir_bulk(
         dir_path: &Path,
         is_root: bool,
-        seen_objs: &Mutex<HashSet<u64>>,
         subdirs_out: &mut Vec<PathBuf>,
-    ) -> Option<u64> {
+    ) -> Option<SizeAcc> {
         TL_BULK_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (buf, path_buf) = &mut *guard;
@@ -362,380 +531,103 @@ mod macos_bulk {
                 )
             };
             if fd < 0 {
-                return if is_root { None } else { Some(0) };
+                return if is_root { None } else { Some(SizeAcc::default()) };
             }
 
-            let mut attrlist = AttrList {
-                bitmapcount: ATTR_BIT_MAP_COUNT,
-                reserved: 0,
-                commonattr: ATTR_CMN_RETURNED_ATTRS
-                    | ATTR_CMN_NAME
-                    | ATTR_CMN_OBJTYPE
-                    | ATTR_CMN_OBJID,
-                volattr: 0,
-                dirattr: 0,
-                fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
-                forkattr: 0,
-            };
-
-            let mut total: u64 = 0;
-
-            loop {
-                let count = unsafe {
-                    getattrlistbulk(
-                        fd,
-                        &mut attrlist,
-                        buf.as_mut_ptr() as *mut c_void,
-                        buf.len(),
-                        0,
-                    )
-                };
-                if count <= 0 {
-                    break;
+            let mut acc = SizeAcc::default();
+            parse_fd_bulk(fd, buf, &mut acc, |name_bytes| {
+                if let Ok(name_str) = std::str::from_utf8(name_bytes) {
+                    subdirs_out.push(dir_path.join(name_str));
                 }
-
-                let mut offset: usize = 0;
-                for _ in 0..count {
-                    if offset + 4 > buf.len() {
-                        break;
-                    }
-                    let entry_len =
-                        u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-                    if entry_len == 0 || offset + entry_len > buf.len() {
-                        break;
-                    }
-
-                    let entry = &buf[offset..offset + entry_len];
-                    let mut field = 4usize;
-
-                    if field + std::mem::size_of::<AttributeSet>() > entry.len() {
-                        offset += entry_len;
-                        continue;
-                    }
-                    let returned: AttributeSet = unsafe {
-                        std::ptr::read_unaligned(entry.as_ptr().add(field) as *const AttributeSet)
-                    };
-                    field += std::mem::size_of::<AttributeSet>();
-
-                    let mut name_bytes: &[u8] = &[];
-                    if returned.commonattr & ATTR_CMN_NAME != 0 {
-                        if field + std::mem::size_of::<AttrReference>() <= entry.len() {
-                            let name_field_start = field;
-                            let attr_ref: AttrReference = unsafe {
-                                std::ptr::read_unaligned(
-                                    entry.as_ptr().add(field) as *const AttrReference,
-                                )
-                            };
-                            field += std::mem::size_of::<AttrReference>();
-                            let start =
-                                name_field_start.wrapping_add(attr_ref.attr_dataoffset as usize);
-                            let len = attr_ref.attr_length as usize;
-                            if start < entry.len() && start + len <= entry.len() && len > 0 {
-                                let slice = &entry[start..start + len];
-                                name_bytes = slice.strip_suffix(&[0]).unwrap_or(slice);
-                            }
-                        }
-                    }
-
-                    let mut obj_type: u32 = 0;
-                    if returned.commonattr & ATTR_CMN_OBJTYPE != 0 {
-                        if field + 4 <= entry.len() {
-                            obj_type =
-                                u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
-                            field += 4;
-                        }
-                    }
-
-                    let mut obj_key: u64 = 0;
-                    if returned.commonattr & ATTR_CMN_OBJID != 0 {
-                        if field + std::mem::size_of::<FsObjId>() <= entry.len() {
-                            let id: FsObjId = unsafe {
-                                std::ptr::read_unaligned(entry.as_ptr().add(field) as *const FsObjId)
-                            };
-                            obj_key = ((id.objid as u64) << 32) | (id.objno as u64);
-                            field += std::mem::size_of::<FsObjId>();
-                        }
-                    }
-
-                    if obj_type == VDIR {
-                        if !name_bytes.is_empty() && name_bytes != b"." && name_bytes != b".." {
-                            if let Ok(name_str) = std::str::from_utf8(name_bytes) {
-                                subdirs_out.push(dir_path.join(name_str));
-                            }
-                        }
-                    } else if obj_type == VREG {
-                        let mut link_count: u32 = 1;
-                        if returned.fileattr & ATTR_FILE_LINKCOUNT != 0 && field + 4 <= entry.len() {
-                            link_count =
-                                u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
-                            field += 4;
-                        }
-
-                        let mut total_size: i64 = 0;
-                        if returned.fileattr & ATTR_FILE_TOTALSIZE != 0 && field + 8 <= entry.len() {
-                            total_size =
-                                i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
-                            field += 8;
-                        }
-
-                        let mut alloc_size: i64 = 0;
-                        if returned.fileattr & ATTR_FILE_ALLOCSIZE != 0 && field + 8 <= entry.len() {
-                            alloc_size =
-                                i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
-                        }
-
-                        if link_count > 1 && obj_key != 0 {
-                            if let Ok(mut seen) = seen_objs.lock() {
-                                if !seen.insert(obj_key) {
-                                    offset += entry_len;
-                                    continue;
-                                }
-                            }
-                        }
-
-                        let bytes = if alloc_size > 0 {
-                            alloc_size as u64
-                        } else if total_size > 0 {
-                            total_size as u64
-                        } else {
-                            0
-                        };
-                        total = total.saturating_add(bytes);
-                    }
-
-                    offset += entry_len;
-                }
-            }
+            });
 
             unsafe { close(fd) };
-            Some(total)
+            Some(acc)
         })
     }
 
     /// Reads all entries from an already-open directory FD using the thread-local 128KB bulk buffer,
-    /// pushing NUL-terminated child directory names into `child_names` (zero `PathBuf` allocations).
-    fn read_fd_bulk(
-        fd: c_int,
-        seen_objs: &Mutex<HashSet<u64>>,
-        child_names: &mut Vec<u8>,
-        child_offsets: &mut Vec<usize>,
-    ) -> u64 {
+    /// pushing NUL-terminated child directory names into the reusable DFS arena.
+    fn read_fd_bulk(fd: c_int, acc: &mut SizeAcc, arena: &mut DfsArena) {
         TL_BULK_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (buf, _) = &mut *guard;
-
-            let mut attrlist = AttrList {
-                bitmapcount: ATTR_BIT_MAP_COUNT,
-                reserved: 0,
-                commonattr: ATTR_CMN_RETURNED_ATTRS
-                    | ATTR_CMN_NAME
-                    | ATTR_CMN_OBJTYPE
-                    | ATTR_CMN_OBJID,
-                volattr: 0,
-                dirattr: 0,
-                fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
-                forkattr: 0,
-            };
-
-            let mut total: u64 = 0;
-
-            loop {
-                let count = unsafe {
-                    getattrlistbulk(
-                        fd,
-                        &mut attrlist,
-                        buf.as_mut_ptr() as *mut c_void,
-                        buf.len(),
-                        0,
-                    )
-                };
-                if count <= 0 {
-                    break;
-                }
-
-                let mut offset: usize = 0;
-                for _ in 0..count {
-                    if offset + 4 > buf.len() {
-                        break;
-                    }
-                    let entry_len =
-                        u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-                    if entry_len == 0 || offset + entry_len > buf.len() {
-                        break;
-                    }
-
-                    let entry = &buf[offset..offset + entry_len];
-                    let mut field = 4usize;
-
-                    if field + std::mem::size_of::<AttributeSet>() > entry.len() {
-                        offset += entry_len;
-                        continue;
-                    }
-                    let returned: AttributeSet = unsafe {
-                        std::ptr::read_unaligned(entry.as_ptr().add(field) as *const AttributeSet)
-                    };
-                    field += std::mem::size_of::<AttributeSet>();
-
-                    let mut name_bytes: &[u8] = &[];
-                    if returned.commonattr & ATTR_CMN_NAME != 0 {
-                        if field + std::mem::size_of::<AttrReference>() <= entry.len() {
-                            let name_field_start = field;
-                            let attr_ref: AttrReference = unsafe {
-                                std::ptr::read_unaligned(
-                                    entry.as_ptr().add(field) as *const AttrReference,
-                                )
-                            };
-                            field += std::mem::size_of::<AttrReference>();
-                            let start =
-                                name_field_start.wrapping_add(attr_ref.attr_dataoffset as usize);
-                            let len = attr_ref.attr_length as usize;
-                            if start < entry.len() && start + len <= entry.len() && len > 0 {
-                                let slice = &entry[start..start + len];
-                                name_bytes = slice.strip_suffix(&[0]).unwrap_or(slice);
-                            }
-                        }
-                    }
-
-                    let mut obj_type: u32 = 0;
-                    if returned.commonattr & ATTR_CMN_OBJTYPE != 0 {
-                        if field + 4 <= entry.len() {
-                            obj_type =
-                                u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
-                            field += 4;
-                        }
-                    }
-
-                    let mut obj_key: u64 = 0;
-                    if returned.commonattr & ATTR_CMN_OBJID != 0 {
-                        if field + std::mem::size_of::<FsObjId>() <= entry.len() {
-                            let id: FsObjId = unsafe {
-                                std::ptr::read_unaligned(entry.as_ptr().add(field) as *const FsObjId)
-                            };
-                            obj_key = ((id.objid as u64) << 32) | (id.objno as u64);
-                            field += std::mem::size_of::<FsObjId>();
-                        }
-                    }
-
-                    if obj_type == VDIR {
-                        if !name_bytes.is_empty() && name_bytes != b"." && name_bytes != b".." {
-                            child_offsets.push(child_names.len());
-                            child_names.extend_from_slice(name_bytes);
-                            child_names.push(0);
-                        }
-                    } else if obj_type == VREG {
-                        let mut link_count: u32 = 1;
-                        if returned.fileattr & ATTR_FILE_LINKCOUNT != 0 && field + 4 <= entry.len() {
-                            link_count =
-                                u32::from_ne_bytes(entry[field..field + 4].try_into().unwrap());
-                            field += 4;
-                        }
-
-                        let mut total_size: i64 = 0;
-                        if returned.fileattr & ATTR_FILE_TOTALSIZE != 0 && field + 8 <= entry.len() {
-                            total_size =
-                                i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
-                            field += 8;
-                        }
-
-                        let mut alloc_size: i64 = 0;
-                        if returned.fileattr & ATTR_FILE_ALLOCSIZE != 0 && field + 8 <= entry.len() {
-                            alloc_size =
-                                i64::from_ne_bytes(entry[field..field + 8].try_into().unwrap());
-                        }
-
-                        if link_count > 1 && obj_key != 0 {
-                            if let Ok(mut seen) = seen_objs.lock() {
-                                if !seen.insert(obj_key) {
-                                    offset += entry_len;
-                                    continue;
-                                }
-                            }
-                        }
-
-                        let bytes = if alloc_size > 0 {
-                            alloc_size as u64
-                        } else if total_size > 0 {
-                            total_size as u64
-                        } else {
-                            0
-                        };
-                        total = total.saturating_add(bytes);
-                    }
-
-                    offset += entry_len;
-                }
-            }
-
-            total
+            parse_fd_bulk(fd, buf, acc, |name_bytes| {
+                arena.child_offsets.push(arena.child_names.len());
+                arena.child_names.extend_from_slice(name_bytes);
+                arena.child_names.push(0);
+            });
         })
     }
 
     /// Single-FD zero-PathBuf DFS fallback for extreme nesting depths (> 16), keeping FD usage at 1.
-    fn walk_deep_single_fd(
-        path_bytes: &mut Vec<u8>,
-        depth: u16,
-        seen_objs: &Mutex<HashSet<u64>>,
-    ) -> u64 {
+    fn walk_deep_single_fd(arena: &mut DfsArena, depth: u16, acc: &mut SizeAcc) {
         if depth > 256 {
-            return 0;
+            return;
         }
-        path_bytes.push(0);
+        arena.path_bytes.push(0);
         let fd = unsafe {
             open(
-                path_bytes.as_ptr() as *const c_char,
+                arena.path_bytes.as_ptr() as *const c_char,
                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
             )
         };
-        path_bytes.pop();
+        arena.path_bytes.pop();
         if fd < 0 {
-            return 0;
+            return;
         }
 
-        let mut child_names = Vec::new();
-        let mut child_offsets = Vec::new();
-        let mut total = read_fd_bulk(fd, seen_objs, &mut child_names, &mut child_offsets);
+        let names_base = arena.child_names.len();
+        let offsets_base = arena.child_offsets.len();
+        read_fd_bulk(fd, acc, arena);
         unsafe { close(fd) };
 
-        let saved_len = path_bytes.len();
-        for (i, &start) in child_offsets.iter().enumerate() {
-            let end_with_nul = if i + 1 < child_offsets.len() {
-                child_offsets[i + 1]
+        let offsets_end = arena.child_offsets.len();
+        let names_end = arena.child_names.len();
+        let saved_len = arena.path_bytes.len();
+        for idx in offsets_base..offsets_end {
+            let start = arena.child_offsets[idx];
+            let end_with_nul = if idx + 1 < offsets_end {
+                arena.child_offsets[idx + 1]
             } else {
-                child_names.len()
+                names_end
             };
-            let name_slice = &child_names[start..end_with_nul.saturating_sub(1)];
-            path_bytes.push(b'/');
-            path_bytes.extend_from_slice(name_slice);
-            total = total.saturating_add(walk_deep_single_fd(path_bytes, depth + 1, seen_objs));
-            path_bytes.truncate(saved_len);
+            let name_len = end_with_nul.saturating_sub(start + 1);
+            arena.path_bytes.push(b'/');
+            arena
+                .path_bytes
+                .extend_from_slice(&arena.child_names[start..start + name_len]);
+            walk_deep_single_fd(arena, depth + 1, acc);
+            arena.path_bytes.truncate(saved_len);
         }
-        total
+        arena.child_names.truncate(names_base);
+        arena.child_offsets.truncate(offsets_base);
     }
 
     /// Zero-PathBuf `openat` DFS bounded to 16 open FDs per thread (falls back to single-FD path buffer beyond depth 16).
-    fn walk_openat_dfs(
-        dirfd: c_int,
-        depth: u8,
-        path_bytes: &mut Vec<u8>,
-        seen_objs: &Mutex<HashSet<u64>>,
-    ) -> u64 {
-        let mut child_names = Vec::new();
-        let mut child_offsets = Vec::new();
-        let mut total = read_fd_bulk(dirfd, seen_objs, &mut child_names, &mut child_offsets);
+    fn walk_openat_dfs(dirfd: c_int, depth: u8, arena: &mut DfsArena, acc: &mut SizeAcc) {
+        let names_base = arena.child_names.len();
+        let offsets_base = arena.child_offsets.len();
+        read_fd_bulk(dirfd, acc, arena);
 
-        let saved_len = path_bytes.len();
-        for (i, &start) in child_offsets.iter().enumerate() {
-            let end_with_nul = if i + 1 < child_offsets.len() {
-                child_offsets[i + 1]
+        let offsets_end = arena.child_offsets.len();
+        let names_end = arena.child_names.len();
+        let saved_len = arena.path_bytes.len();
+        for idx in offsets_base..offsets_end {
+            let start = arena.child_offsets[idx];
+            let end_with_nul = if idx + 1 < offsets_end {
+                arena.child_offsets[idx + 1]
             } else {
-                child_names.len()
+                names_end
             };
-            let name_slice = &child_names[start..end_with_nul.saturating_sub(1)];
-            path_bytes.push(b'/');
-            path_bytes.extend_from_slice(name_slice);
+            let name_len = end_with_nul.saturating_sub(start + 1);
+            arena.path_bytes.push(b'/');
+            arena
+                .path_bytes
+                .extend_from_slice(&arena.child_names[start..start + name_len]);
 
             if depth < 16 {
-                let name_ptr = unsafe { child_names.as_ptr().add(start) as *const c_char };
+                let name_ptr = unsafe { arena.child_names.as_ptr().add(start) as *const c_char };
                 let child_fd = unsafe {
                     openat(
                         dirfd,
@@ -744,74 +636,91 @@ mod macos_bulk {
                     )
                 };
                 if child_fd >= 0 {
-                    total = total.saturating_add(walk_openat_dfs(
-                        child_fd,
-                        depth + 1,
-                        path_bytes,
-                        seen_objs,
-                    ));
+                    walk_openat_dfs(child_fd, depth + 1, arena, acc);
                     unsafe { close(child_fd) };
                 }
             } else {
-                total = total.saturating_add(walk_deep_single_fd(path_bytes, 0, seen_objs));
+                walk_deep_single_fd(arena, 0, acc);
             }
 
-            path_bytes.truncate(saved_len);
+            arena.path_bytes.truncate(saved_len);
         }
-        total
+        arena.child_names.truncate(names_base);
+        arena.child_offsets.truncate(offsets_base);
     }
 
-    fn walk_subtree_dfs(root: &Path, seen_objs: &Mutex<HashSet<u64>>) -> u64 {
-        let mut path_bytes = Vec::with_capacity(512);
-        path_bytes.extend_from_slice(root.as_os_str().as_encoded_bytes());
-        path_bytes.push(0);
+    fn walk_subtree_dfs(root: &Path) -> SizeAcc {
+        let mut arena = DfsArena {
+            path_bytes: Vec::with_capacity(512),
+            child_names: Vec::with_capacity(2048),
+            child_offsets: Vec::with_capacity(128),
+        };
+        arena
+            .path_bytes
+            .extend_from_slice(root.as_os_str().as_encoded_bytes());
+        arena.path_bytes.push(0);
         let fd = unsafe {
             open(
-                path_bytes.as_ptr() as *const c_char,
+                arena.path_bytes.as_ptr() as *const c_char,
                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
             )
         };
-        path_bytes.pop();
+        arena.path_bytes.pop();
         if fd < 0 {
-            return 0;
+            return SizeAcc::default();
         }
-        let total = walk_openat_dfs(fd, 0, &mut path_bytes, seen_objs);
+        let mut acc = SizeAcc::default();
+        walk_openat_dfs(fd, 0, &mut arena, &mut acc);
         unsafe { close(fd) };
-        total
+        acc
     }
 
-    fn walk_parallel(dir: &Path, depth: u8, seen_objs: &Mutex<HashSet<u64>>) -> Option<u64> {
+    fn walk_parallel(dir: &Path, depth: u8) -> Option<SizeAcc> {
         let mut subdirs: Vec<PathBuf> = Vec::new();
-        let own_bytes = read_single_dir_bulk(dir, depth == 0, seen_objs, &mut subdirs)?;
+        let mut own = read_single_dir_bulk(dir, depth == 0, &mut subdirs)?;
         if subdirs.is_empty() {
-            return Some(own_bytes);
+            return Some(own);
         }
-        let child_bytes: u64 = if depth < 2 && subdirs.len() >= 2 {
+        let children = if depth < 2 && subdirs.len() >= 2 {
             subdirs
                 .into_par_iter()
                 .map(|sub| {
                     if depth + 1 < 2 {
-                        walk_parallel(&sub, depth + 1, seen_objs).unwrap_or(0)
+                        walk_parallel(&sub, depth + 1).unwrap_or_default()
                     } else {
-                        walk_subtree_dfs(&sub, seen_objs)
+                        walk_subtree_dfs(&sub)
                     }
                 })
-                .sum()
+                .reduce(SizeAcc::default, |mut a, b| {
+                    a.merge(b);
+                    a
+                })
         } else {
-            let mut acc: u64 = 0;
+            let mut acc = SizeAcc::default();
             for sub in &subdirs {
-                acc = acc.saturating_add(walk_subtree_dfs(sub, seen_objs));
+                acc.merge(walk_subtree_dfs(sub));
             }
             acc
         };
-        Some(own_bytes.saturating_add(child_bytes))
+        own.merge(children);
+        Some(own)
     }
 
-    /// Walks a directory tree using macOS `getattrlistbulk` with Rayon parallel fan-out
-    /// at shallow depths so massive bundles (Xcode.app, DerivedData) saturate all cores.
+    /// Walks a directory tree using macOS `getattrlistbulk` with lock-free Rayon parallel
+    /// fan-out at shallow depths and zero-allocation arena DFS below.
     pub fn calculate_dir_size_bulk(path: &Path) -> Option<u64> {
-        let seen_objs = Mutex::new(HashSet::new());
-        walk_parallel(path, 0, &seen_objs)
+        let acc = walk_parallel(path, 0)?;
+        if acc.hardlinks.is_empty() {
+            return Some(acc.bytes);
+        }
+        let mut seen = HashSet::with_capacity(acc.hardlinks.len());
+        let mut total = acc.bytes;
+        for (obj_key, bytes) in acc.hardlinks {
+            if seen.insert(obj_key) {
+                total = total.saturating_add(bytes);
+            }
+        }
+        Some(total)
     }
 }
 
@@ -1787,6 +1696,14 @@ struct BundleIdPlist {
 }
 
 #[derive(Deserialize)]
+struct BundleNamesPlist {
+    #[serde(rename = "CFBundleName")]
+    bundle_name: Option<String>,
+    #[serde(rename = "CFBundleDisplayName")]
+    display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ContainerMetaPlist {
     #[serde(rename = "MCMMetadataIdentifier")]
     identifier: Option<String>,
@@ -1820,7 +1737,7 @@ struct JetBrainsInfoPlist {
     jvm_options: Option<JetBrainsJvmOptions>,
 }
 
-fn extract_xml_plist_string(bytes: &[u8], key_tag: &[u8]) -> Option<String> {
+pub(crate) fn extract_xml_plist_string(bytes: &[u8], key_tag: &[u8]) -> Option<String> {
     let pos = memmem::find(bytes, key_tag)?;
     let after_key = &bytes[pos + key_tag.len()..];
     let open_tag = b"<string>";
@@ -1854,6 +1771,47 @@ pub(crate) fn read_bundle_id(app_path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Reads `CFBundleName` and `CFBundleDisplayName` from `Contents/Info.plist` so apps whose
+/// filename includes a version or channel (e.g. `Alfred 4.app` -> `Alfred`) match their data folders.
+fn read_bundle_names(app_path: &Path) -> Vec<String> {
+    let plist_path = app_path.join("Contents").join("Info.plist");
+    let Ok(bytes) = fs::read(&plist_path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if !bytes.starts_with(b"bplist00") {
+        if let Some(n) = extract_xml_plist_string(&bytes, b"<key>CFBundleName</key>") {
+            if !n.is_empty() {
+                out.push(n);
+            }
+        }
+        if let Some(d) = extract_xml_plist_string(&bytes, b"<key>CFBundleDisplayName</key>") {
+            if !d.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+                out.push(d);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let Ok(parsed) = plist::from_bytes::<BundleNamesPlist>(&bytes) {
+        if let Some(n) = parsed.bundle_name {
+            if !n.is_empty() {
+                out.push(n);
+            }
+        }
+        if let Some(d) = parsed.display_name {
+            if !d.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Discovers installed `.app` bundles across `/Applications` and `~/Applications` (including
+/// 1-level subfolders like `/Applications/Setapp`, `/Applications/Utilities`, and Adobe suites),
+/// skipping dot-prefixed updater staging folders (e.g. `/Applications/.x-update/`).
 fn collect_app_paths() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let search_dirs = [
@@ -1863,11 +1821,28 @@ fn collect_app_paths() -> Vec<PathBuf> {
 
     let mut app_paths = Vec::new();
     for dir in search_dirs {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "app") {
-                    app_paths.push(path);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            if path.extension().map_or(false, |ext| ext == "app") {
+                app_paths.push(path);
+            } else if !fname_str.starts_with('.') {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    if let Ok(sub_entries) = fs::read_dir(&path) {
+                        for sub in sub_entries.flatten() {
+                            let sp = sub.path();
+                            if sp.extension().map_or(false, |ext| ext == "app") {
+                                app_paths.push(sp);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2137,8 +2112,68 @@ fn detect_official_uninstaller_vendor(bundle_id: &str) -> Option<String> {
     None
 }
 
+#[inline]
+fn is_uuid_dir_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
+/// Boundary-aware bundle ID matcher for container, script, and FileProvider directories:
+/// matches `<bid>`, `<bid>.*`, `group.<bid>`, `<TeamID>.<bid>`, `<TeamID>.<bid>.*`.
+fn matches_bundle_id_dir(fname_lower: &str, bundle_ids_lower: &[String]) -> bool {
+    bundle_ids_lower.iter().any(|b| {
+        if fname_lower == b {
+            return true;
+        }
+        if fname_lower.len() > b.len()
+            && fname_lower.starts_with(b.as_str())
+            && fname_lower.as_bytes()[b.len()] == b'.'
+        {
+            return true;
+        }
+        if let Some(rest) = fname_lower.strip_prefix("group.") {
+            if rest == b
+                || (rest.len() > b.len()
+                    && rest.starts_with(b.as_str())
+                    && rest.as_bytes()[b.len()] == b'.')
+            {
+                return true;
+            }
+        }
+        if let Some((prefix, rest)) = fname_lower.split_once('.') {
+            if prefix.len() == 10 && prefix.bytes().all(|c| c.is_ascii_alphanumeric()) {
+                if rest == b
+                    || (rest.len() > b.len()
+                        && rest.starts_with(b.as_str())
+                        && rest.as_bytes()[b.len()] == b'.')
+                {
+                    return true;
+                }
+                if let Some(grest) = rest.strip_prefix("group.") {
+                    if grest == b
+                        || (grest.len() > b.len()
+                            && grest.starts_with(b.as_str())
+                            && grest.as_bytes()[b.len()] == b'.')
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    })
+}
+
 fn detect_sibling_app(app_name: &str, bundle_id: &str, app_path: &str) -> bool {
-    let target_canonical = fs::canonicalize(app_path).unwrap_or_else(|_| PathBuf::from(app_path));
+    let target_path = Path::new(app_path);
+    let target_canonical = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let target_base = strip_channel_suffix(app_name)
         .unwrap_or_else(|| app_name.to_string())
         .to_ascii_lowercase();
@@ -2152,8 +2187,7 @@ fn detect_sibling_app(app_name: &str, bundle_id: &str, app_path: &str) -> bool {
 
     let app_paths = collect_app_paths();
     app_paths.par_iter().any(|other_path| {
-        let other_canonical = fs::canonicalize(other_path).unwrap_or_else(|_| other_path.clone());
-        if other_canonical == target_canonical {
+        if other_path.as_path() == target_path {
             return false;
         }
         let other_name = other_path
@@ -2166,7 +2200,8 @@ fn detect_sibling_app(app_name: &str, bundle_id: &str, app_path: &str) -> bool {
             .to_ascii_lowercase();
 
         if other_base == target_base {
-            return true;
+            let other_canonical = fs::canonicalize(other_path).unwrap_or_else(|_| other_path.clone());
+            return other_canonical != target_canonical;
         }
 
         if !target_bid_base.is_empty() {
@@ -2175,7 +2210,8 @@ fn detect_sibling_app(app_name: &str, bundle_id: &str, app_path: &str) -> bool {
                 let other_bid_base =
                     strip_channel_suffix(&other_bid).unwrap_or_else(|| other_bid.clone());
                 if other_bid_base == target_bid_base {
-                    return true;
+                    let other_canonical = fs::canonicalize(other_path).unwrap_or_else(|_| other_path.clone());
+                    return other_canonical != target_canonical;
                 }
             }
         }
@@ -2191,7 +2227,11 @@ fn collect_embedded_bundle_ids(app_path: &Path) -> Vec<String> {
         "XPCServices",
         "Library/LoginItems",
         "Library/SystemExtensions",
+        "Library/QuickLook",
+        "Library/Spotlight",
         "Helpers",
+        "Preferences",
+        "SharedSupport",
     ];
     for rel in subdirs {
         let dir = contents.join(rel);
@@ -2201,7 +2241,10 @@ fn collect_embedded_bundle_ids(app_path: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             let p = entry.path();
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if matches!(ext, "appex" | "xpc" | "app" | "systemextension") {
+            if matches!(
+                ext,
+                "appex" | "xpc" | "app" | "systemextension" | "qlgenerator" | "mdimporter"
+            ) {
                 let bid = read_bundle_id(&p);
                 if !bid.is_empty() && !ids.iter().any(|x| x == &bid) {
                     ids.push(bid);
@@ -2267,12 +2310,31 @@ fn evaluate_holdback(path_str: &str, home: &str, is_system: bool) -> (bool, Opti
     if rel.starts_with("/library/group containers/") {
         return (false, Some("App Group container".to_string()));
     }
+    if rel == "/library/caches/com.raycast.macos"
+        || rel.starts_with("/library/caches/com.raycast.macos/")
+    {
+        return (false, Some("Raycast clipboard history".to_string()));
+    }
+    if rel == "/library/caches/mullvadbrowser"
+        || rel.starts_with("/library/caches/mullvadbrowser/")
+    {
+        return (false, Some("Browser profile".to_string()));
+    }
+    if rel == "/library/caches/buzz" || rel.starts_with("/library/caches/buzz/") {
+        return (false, Some("Whisper models & plugins".to_string()));
+    }
+    if rel == "/library/caches/llama.cpp" || rel.starts_with("/library/caches/llama.cpp/") {
+        return (false, Some("Downloaded LLM models".to_string()));
+    }
     if rel.starts_with("/library/containers/com.isaacmarovitz.whisky")
         || rel.starts_with("/library/containers/com.utmapp.utm")
     {
         return (false, Some("VM / Game library".to_string()));
     }
     if let Some(app_sup_rel) = rel.strip_prefix("/library/application support/") {
+        if app_sup_rel == "spotify" || app_sup_rel.starts_with("spotify/") {
+            return (false, Some("Offline music & settings".to_string()));
+        }
         for browser in HOLDBACK_BROWSER_PREFIXES {
             if app_sup_rel == *browser || app_sup_rel.starts_with(&format!("{}/", browser)) {
                 return (false, Some("Browser profile".to_string()));
@@ -2482,122 +2544,149 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
         let library = home_path.join("Library");
         let app_path_buf = PathBuf::from(app_path);
 
-        let has_sibling_app = detect_sibling_app(app_name, bundle_id, app_path);
         let official_uninstaller_vendor = detect_official_uninstaller_vendor(bundle_id);
 
-        let (leftovers, cask_token) = rayon::join(
-            || {
-                let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
-                let mut seen: HashSet<PathBuf> = HashSet::new();
+        // Run sibling-app detection and Homebrew Caskroom lookup in parallel
+        let (has_sibling_app, cask_token) = rayon::join(
+            || detect_sibling_app(app_name, bundle_id, app_path),
+            || find_installed_cask_parallel(app_name, app_path, brew_prefix),
+        );
 
-                let mut add_if_exists = |p: PathBuf, is_system: bool| {
-                    if is_protected_path(&p, &home) {
-                        return;
-                    }
-                    if p.exists() && seen.insert(p.clone()) {
-                        candidates.push((p, is_system));
-                    }
-                };
+        let leftovers = {
+            let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
+            let mut seen: HashSet<PathBuf> = HashSet::new();
 
-                // 1. Collect all bundle IDs (primary + embedded .appex/.xpc/LoginItems)
-                let mut bundle_ids: Vec<String> = Vec::new();
-                if !bundle_id.is_empty() {
-                    bundle_ids.push(bundle_id.to_string());
+            let mut add_if_exists = |p: PathBuf, is_system: bool| {
+                if is_protected_path(&p, &home) {
+                    return;
                 }
+                if p.exists() && seen.insert(p.clone()) {
+                    candidates.push((p, is_system));
+                }
+            };
+
+            // 1. Collect all bundle IDs (primary + embedded .appex/.xpc/LoginItems/Preferences/Helpers)
+            let mut bundle_ids: Vec<String> = Vec::new();
+            if !bundle_id.is_empty() {
+                bundle_ids.push(bundle_id.to_string());
+            }
+            if !app_path.is_empty() {
+                for emb in collect_embedded_bundle_ids(&app_path_buf) {
+                    if !bundle_ids.iter().any(|x| x == &emb) {
+                        bundle_ids.push(emb);
+                    }
+                }
+            }
+            let bundle_ids_lower: Vec<String> = bundle_ids
+                .iter()
+                .map(|b| b.to_ascii_lowercase())
+                .collect();
+            let is_apple_bundle = bundle_ids_lower
+                .iter()
+                .any(|b| b.starts_with("com.apple."));
+
+            // 2. Collect naming variants (filename + CFBundleName/CFBundleDisplayName, respecting sibling-app guard)
+            let mut name_keys: Vec<String> = Vec::new();
+            collect_name_variants(app_name, &mut name_keys);
+            if !has_sibling_app {
                 if !app_path.is_empty() {
-                    for emb in collect_embedded_bundle_ids(&app_path_buf) {
-                        if !bundle_ids.iter().any(|x| x == &emb) {
-                            bundle_ids.push(emb);
+                    for bname in read_bundle_names(&app_path_buf) {
+                        collect_name_variants(&bname, &mut name_keys);
+                        if let Some(stripped) = strip_channel_suffix(&bname) {
+                            collect_name_variants(&stripped, &mut name_keys);
                         }
                     }
                 }
-
-                // 2. Collect naming variants (respecting sibling-app protection)
-                let mut name_keys: Vec<String> = Vec::new();
-                collect_name_variants(app_name, &mut name_keys);
-                if !has_sibling_app {
-                    if let Some(stripped) = strip_channel_suffix(app_name) {
-                        collect_name_variants(&stripped, &mut name_keys);
+                if let Some(stripped) = strip_channel_suffix(app_name) {
+                    collect_name_variants(&stripped, &mut name_keys);
+                }
+                if let Some(leaf) = bundle_id.rsplit('.').next() {
+                    if leaf.len() >= 3 {
+                        collect_name_variants(leaf, &mut name_keys);
+                        let split = split_camel_case(leaf);
+                        if split != leaf {
+                            collect_name_variants(&split, &mut name_keys);
+                        }
                     }
-                    if let Some(leaf) = bundle_id.rsplit('.').next() {
-                        if leaf.len() >= 3 {
-                            collect_name_variants(leaf, &mut name_keys);
-                            let split = split_camel_case(leaf);
-                            if split != leaf {
-                                collect_name_variants(&split, &mut name_keys);
+                }
+            }
+
+            // 3. Standard ~/Library subdirectories
+            const SUBDIRS: [&str; 10] = [
+                "Application Support",
+                "Caches",
+                "Logs",
+                "HTTPStorages",
+                "WebKit",
+                "Containers",
+                "Application Scripts",
+                "Application Support/FileProvider",
+                "Autosave Information",
+                "SplashBoard/Snapshots",
+            ];
+
+            for subdir in SUBDIRS {
+                let dir = library.join(subdir);
+                for bid in &bundle_ids {
+                    add_if_exists(dir.join(bid), false);
+                }
+                for nk in &name_keys {
+                    add_if_exists(dir.join(nk), false);
+                }
+            }
+
+            // 4. Boundary-matched extension & group directories across Group Containers,
+            // Containers, Application Scripts, and Application Support/FileProvider (Mole #572 parity)
+            if !bundle_ids_lower.is_empty() {
+                for rel_dir in [
+                    "Group Containers",
+                    "Containers",
+                    "Application Scripts",
+                    "Application Support/FileProvider",
+                ] {
+                    let scan_dir = library.join(rel_dir);
+                    if let Ok(entries) = fs::read_dir(&scan_dir) {
+                        for entry in entries.flatten() {
+                            let fname = entry.file_name().to_string_lossy().into_owned();
+                            let fname_lower = fname.to_ascii_lowercase();
+                            if !is_apple_bundle && fname_lower.starts_with("com.apple.") {
+                                continue;
+                            }
+                            if matches_bundle_id_dir(&fname_lower, &bundle_ids_lower) {
+                                add_if_exists(entry.path(), false);
                             }
                         }
                     }
                 }
+            }
 
-                // 3. Standard ~/Library subdirectories
-                const SUBDIRS: [&str; 9] = [
-                    "Application Support",
-                    "Caches",
-                    "Logs",
-                    "HTTPStorages",
-                    "WebKit",
-                    "Containers",
-                    "Application Scripts",
-                    "FileProvider",
-                    "Autosave Information",
-                ];
-
-                for subdir in SUBDIRS {
-                    let dir = library.join(subdir);
-                    for bid in &bundle_ids {
-                        add_if_exists(dir.join(bid), false);
-                    }
-                    for nk in &name_keys {
-                        add_if_exists(dir.join(nk), false);
-                    }
-                }
-
-                // 4. Group Containers (<TeamID>.<bundle_id> and group.<bundle_id> boundary matching)
-                let group_dir = library.join("Group Containers");
-                if let Ok(entries) = fs::read_dir(&group_dir) {
-                    for entry in entries.flatten() {
-                        let fname = entry.file_name().to_string_lossy().into_owned();
-                        let fname_lower = fname.to_ascii_lowercase();
-                        let matched = bundle_ids.iter().any(|bid| {
-                            let b = bid.to_ascii_lowercase();
-                            fname_lower == b
-                                || fname_lower == format!("group.{}", b)
-                                || fname_lower.ends_with(&format!(".{}", b))
-                                || fname_lower.ends_with(&format!(".group.{}", b))
-                        });
-                        if matched {
-                            add_if_exists(entry.path(), false);
-                        }
-                    }
-                }
-
-                // 5. UUID Sandbox Containers (.com.apple.containermanagerd.metadata.plist) — parallel scan
-                let containers_dir = library.join("Containers");
-                if !bundle_ids.is_empty() {
-                    if let Ok(entries) = fs::read_dir(&containers_dir) {
-                        let container_paths: Vec<PathBuf> = entries
-                            .flatten()
-                            .filter_map(|entry| {
-                                let fname = entry.file_name();
-                                let fname_str = fname.to_string_lossy();
-                                if bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(&fname_str)) {
-                                    return None;
-                                }
-                                Some(entry.path())
-                            })
-                            .collect();
-                        let matched_containers: Vec<PathBuf> = container_paths
+            // 5. UUID Sandbox Containers (.com.apple.containermanagerd.metadata.plist) — UUID-filtered parallel scan
+            let containers_dir = library.join("Containers");
+            if !bundle_ids_lower.is_empty() {
+                if let Ok(entries) = fs::read_dir(&containers_dir) {
+                    let uuid_containers: Vec<PathBuf> = entries
+                        .flatten()
+                        .filter_map(|entry| {
+                            let fname = entry.file_name();
+                            let fname_str = fname.to_string_lossy();
+                            if !is_uuid_dir_name(&fname_str) {
+                                return None;
+                            }
+                            Some(entry.path())
+                        })
+                        .collect();
+                    if !uuid_containers.is_empty() {
+                        let matched_containers: Vec<PathBuf> = uuid_containers
                             .into_par_iter()
                             .filter(|p| {
                                 let meta = p.join(".com.apple.containermanagerd.metadata.plist");
                                 let Ok(parsed) = plist::from_file::<_, ContainerMetaPlist>(&meta) else {
                                     return false;
                                 };
-                                parsed
-                                    .identifier
-                                    .as_deref()
-                                    .map_or(false, |id| bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(id)))
+                                parsed.identifier.as_deref().map_or(false, |id| {
+                                    let id_lower = id.to_ascii_lowercase();
+                                    matches_bundle_id_dir(&id_lower, &bundle_ids_lower)
+                                })
                             })
                             .collect();
                         for p in matched_containers {
@@ -2605,123 +2694,144 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                         }
                     }
                 }
+            }
 
-                // 6. Saved State, Preferences, ByHost, SyncedPreferences, Cookies, HTTPStorages.binarycookies
-                let prefs_dir = library.join("Preferences");
-                let byhost_dir = prefs_dir.join("ByHost");
-                let synced_dir = library.join("SyncedPreferences");
-                let cookies_dir = library.join("Cookies");
-                let http_dir = library.join("HTTPStorages");
-                let sfl_dir = library.join("Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments");
+            // 6. Saved State, Preferences, ByHost, SyncedPreferences, Cookies, HTTPStorages.binarycookies
+            let prefs_dir = library.join("Preferences");
+            let byhost_dir = prefs_dir.join("ByHost");
+            let synced_dir = library.join("SyncedPreferences");
+            let cookies_dir = library.join("Cookies");
+            let http_dir = library.join("HTTPStorages");
+            let sfl_dir = library.join("Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments");
 
-                for bid in &bundle_ids {
-                    add_if_exists(
-                        library
-                            .join("Saved Application State")
-                            .join(format!("{}.savedState", bid)),
-                        false,
-                    );
-                    add_if_exists(prefs_dir.join(format!("{}.plist", bid)), false);
-                    add_if_exists(synced_dir.join(format!("{}.plist", bid)), false);
-                    add_if_exists(cookies_dir.join(format!("{}.binarycookies", bid)), false);
-                    add_if_exists(http_dir.join(format!("{}.binarycookies", bid)), false);
-                    add_if_exists(
-                        library
-                            .join("Caches/com.apple.nsurlsessiond/Downloads")
-                            .join(bid),
-                        false,
-                    );
-                    add_if_exists(library.join("Caches").join(format!("{}.ShipIt", bid)), false);
-                    add_if_exists(
-                        library
-                            .join("Caches/com.plausiblelabs.crashreporter.data")
-                            .join(bid),
-                        false,
-                    );
-                    add_if_exists(library.join("Caches/com.crashlytics.data").join(bid), false);
-                    add_if_exists(library.join("Caches/Bugsnag").join(bid), false);
+            for bid in &bundle_ids {
+                add_if_exists(
+                    library
+                        .join("Saved Application State")
+                        .join(format!("{}.savedState", bid)),
+                    false,
+                );
+                add_if_exists(prefs_dir.join(format!("{}.plist", bid)), false);
+                add_if_exists(synced_dir.join(format!("{}.plist", bid)), false);
+                add_if_exists(cookies_dir.join(format!("{}.binarycookies", bid)), false);
+                add_if_exists(http_dir.join(format!("{}.binarycookies", bid)), false);
+                add_if_exists(
+                    library
+                        .join("Caches/com.apple.nsurlsessiond/Downloads")
+                        .join(bid),
+                    false,
+                );
+                add_if_exists(library.join("Caches").join(format!("{}.ShipIt", bid)), false);
+                add_if_exists(
+                    library
+                        .join("Caches/com.plausiblelabs.crashreporter.data")
+                        .join(bid),
+                    false,
+                );
+                add_if_exists(library.join("Caches/com.crashlytics.data").join(bid), false);
+                add_if_exists(library.join("Caches/Bugsnag").join(bid), false);
+                add_if_exists(library.join("Caches/KSCrash").join(bid), false);
+                add_if_exists(library.join("Caches/SentryCrash").join(bid), false);
 
-                    let bid_lower = bid.to_ascii_lowercase();
-                    for ext in ["sfl2", "sfl3", "sfl4"] {
-                        add_if_exists(sfl_dir.join(format!("{}.{}", bid_lower, ext)), false);
-                    }
+                let bid_lower = bid.to_ascii_lowercase();
+                for ext in ["sfl2", "sfl3", "sfl4"] {
+                    add_if_exists(sfl_dir.join(format!("{}.{}", bid_lower, ext)), false);
                 }
+            }
 
-                // Prefix-scan Preferences, ByHost, SyncedPreferences
-                for scan_dir in [&prefs_dir, &byhost_dir, &synced_dir] {
-                    if let Ok(entries) = fs::read_dir(scan_dir) {
-                        for entry in entries.flatten() {
-                            let fname = entry.file_name().to_string_lossy().into_owned();
-                            if !fname.ends_with(".plist") {
-                                continue;
-                            }
-                            let fname_lower = fname.to_ascii_lowercase();
-                            if bundle_ids.iter().any(|b| {
-                                let bl = b.to_ascii_lowercase();
-                                fname_lower == format!("{}.plist", bl)
-                                    || fname_lower.starts_with(&format!("{}.", bl))
-                            }) {
-                                add_if_exists(entry.path(), false);
-                            }
-                        }
-                    }
-                }
-
-                // 7. ShipIt, CrashReporter, Updaters, Cookies by name
-                for nk in &name_keys {
-                    add_if_exists(library.join("Caches").join(format!("{}.ShipIt", nk)), false);
-                    add_if_exists(
-                        library.join("Caches").join(format!("{}-updater", nk)),
-                        false,
-                    );
-                    add_if_exists(library.join("Caches/KSCrash").join(nk), false);
-                    add_if_exists(library.join("Caches/SentryCrash").join(nk), false);
-                    add_if_exists(cookies_dir.join(format!("{}.binarycookies", nk)), false);
-                }
-
-                let crash_dir = library.join("Application Support/CrashReporter");
-                if let Ok(entries) = fs::read_dir(&crash_dir) {
+            // Prefix-scan Preferences, ByHost, SyncedPreferences
+            for scan_dir in [&prefs_dir, &byhost_dir, &synced_dir] {
+                if let Ok(entries) = fs::read_dir(scan_dir) {
                     for entry in entries.flatten() {
                         let fname = entry.file_name().to_string_lossy().into_owned();
-                        if fname.ends_with(".plist") {
-                            let fl = fname.to_ascii_lowercase();
-                            if name_keys
-                                .iter()
-                                .any(|nk| fl.starts_with(&format!("{}_", nk.to_ascii_lowercase())))
-                            {
-                                add_if_exists(entry.path(), false);
-                            }
+                        if !fname.ends_with(".plist") {
+                            continue;
+                        }
+                        let fname_lower = fname.to_ascii_lowercase();
+                        if bundle_ids_lower.iter().any(|bl| {
+                            fname_lower == format!("{}.plist", bl)
+                                || fname_lower.starts_with(&format!("{}.", bl))
+                        }) {
+                            add_if_exists(entry.path(), false);
                         }
                     }
                 }
+            }
 
-                // 8. NativeMessagingHosts JSON manifests pointing inside app_path
-                if !app_path.is_empty() {
-                    let nmh_dirs = [
-                        library.join("Application Support/Google/Chrome/NativeMessagingHosts"),
-                        library.join("Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
-                        library.join("Application Support/Microsoft Edge/NativeMessagingHosts"),
-                        library.join("Application Support/Arc/User Data/NativeMessagingHosts"),
-                        library.join("Application Support/Mozilla/NativeMessagingHosts"),
-                    ];
-                    let app_prefix = format!("{}/", app_path.trim_end_matches('/'));
-                    for nmh_dir in nmh_dirs {
-                        if let Ok(entries) = fs::read_dir(&nmh_dir) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                                    if let Ok(text) = fs::read_to_string(&p) {
-                                        if let Ok(v) =
-                                            serde_json::from_str::<serde_json::Value>(&text)
+            // 7. ShipIt, CrashReporter, Updaters, Cookies, DiagnosticReports by name & bundle ID
+            for nk in &name_keys {
+                add_if_exists(library.join("Caches").join(format!("{}.ShipIt", nk)), false);
+                add_if_exists(
+                    library.join("Caches").join(format!("{}-updater", nk)),
+                    false,
+                );
+                add_if_exists(library.join("Caches/KSCrash").join(nk), false);
+                add_if_exists(library.join("Caches/SentryCrash").join(nk), false);
+                add_if_exists(cookies_dir.join(format!("{}.binarycookies", nk)), false);
+            }
+
+            let crash_dir = library.join("Application Support/CrashReporter");
+            if let Ok(entries) = fs::read_dir(&crash_dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.ends_with(".plist") {
+                        let fl = fname.to_ascii_lowercase();
+                        let matched = name_keys
+                            .iter()
+                            .any(|nk| fl.starts_with(&format!("{}_", nk.to_ascii_lowercase())))
+                            || bundle_ids_lower
+                                .iter()
+                                .any(|bl| fl.starts_with(&format!("{}_", bl)));
+                        if matched {
+                            add_if_exists(entry.path(), false);
+                        }
+                    }
+                }
+            }
+
+            let diag_dir = library.join("Logs/DiagnosticReports");
+            if let Ok(entries) = fs::read_dir(&diag_dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    let fl = fname.to_ascii_lowercase();
+                    if fl.ends_with(".ips") || fl.ends_with(".crash") || fl.ends_with(".diag") {
+                        if name_keys.iter().any(|nk| {
+                            let nkl = nk.to_ascii_lowercase();
+                            fl.starts_with(&format!("{}-", nkl))
+                                || fl.starts_with(&format!("{}_", nkl))
+                        }) {
+                            add_if_exists(entry.path(), false);
+                        }
+                    }
+                }
+            }
+
+            // 8. NativeMessagingHosts JSON manifests pointing inside app_path
+            if !app_path.is_empty() {
+                let nmh_dirs = [
+                    library.join("Application Support/Google/Chrome/NativeMessagingHosts"),
+                    library.join("Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+                    library.join("Application Support/Microsoft Edge/NativeMessagingHosts"),
+                    library.join("Application Support/Arc/User Data/NativeMessagingHosts"),
+                    library.join("Application Support/Mozilla/NativeMessagingHosts"),
+                ];
+                let app_prefix = format!("{}/", app_path.trim_end_matches('/'));
+                for nmh_dir in nmh_dirs {
+                    if let Ok(entries) = fs::read_dir(&nmh_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                                if let Ok(text) = fs::read_to_string(&p) {
+                                    if let Ok(v) =
+                                        serde_json::from_str::<serde_json::Value>(&text)
+                                    {
+                                        if let Some(target) =
+                                            v.get("path").and_then(|x| x.as_str())
                                         {
-                                            if let Some(target) =
-                                                v.get("path").and_then(|x| x.as_str())
+                                            if target == app_path
+                                                || target.starts_with(&app_prefix)
                                             {
-                                                if target == app_path
-                                                    || target.starts_with(&app_prefix)
-                                                {
-                                                    add_if_exists(p, false);
-                                                }
+                                                add_if_exists(p, false);
                                             }
                                         }
                                     }
@@ -2730,217 +2840,219 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                         }
                     }
                 }
+            }
 
-                // 9. XDG paths (~/.config, ~/.cache, ~/.local/share) & User Plug-Ins
-                if !has_sibling_app {
-                    for xdg_root in [
-                        home_path.join(".config"),
-                        home_path.join(".cache"),
-                        home_path.join(".local/share"),
-                    ] {
-                        for nk in &name_keys {
-                            add_if_exists(xdg_root.join(nk), false);
-                        }
-                    }
-                }
-                for plugin_dir_name in [
-                    "Internet Plug-Ins",
-                    "QuickLook",
-                    "Spotlight",
-                    "Screen Savers",
-                    "PreferencePanes",
-                    "Services",
+            // 9. XDG paths (~/.config, ~/.cache, ~/.local/share) & User Plug-Ins
+            if !has_sibling_app {
+                for xdg_root in [
+                    home_path.join(".config"),
+                    home_path.join(".cache"),
+                    home_path.join(".local/share"),
                 ] {
-                    let dir = library.join(plugin_dir_name);
-                    if let Ok(entries) = fs::read_dir(&dir) {
-                        for entry in entries.flatten() {
-                            let fname = entry.file_name().to_string_lossy().into_owned();
-                            let stem = Path::new(&fname)
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            if name_keys.iter().any(|nk| nk.eq_ignore_ascii_case(&stem))
-                                || bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(&stem))
-                            {
-                                add_if_exists(entry.path(), false);
-                            }
+                    for nk in &name_keys {
+                        add_if_exists(xdg_root.join(nk), false);
+                    }
+                }
+            }
+            for plugin_dir_name in [
+                "Internet Plug-Ins",
+                "QuickLook",
+                "Spotlight",
+                "Screen Savers",
+                "PreferencePanes",
+                "Services",
+            ] {
+                let dir = library.join(plugin_dir_name);
+                if let Ok(entries) = fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        let stem = Path::new(&fname)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if name_keys.iter().any(|nk| nk.eq_ignore_ascii_case(&stem))
+                            || bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(&stem))
+                        {
+                            add_if_exists(entry.path(), false);
                         }
                     }
                 }
+            }
 
-                // 10. Vendor-nested folders (<Vendor>/<Product>)
-                let parts: Vec<&str> = bundle_id.split('.').collect();
-                if parts.len() >= 3 {
-                    let vendor = parts[1];
-                    if !is_common_generic_name(vendor) {
-                        for sub in ["Application Support", "Caches", "Logs"] {
-                            let base_dir = library.join(sub);
-                            if let Ok(v_entries) = fs::read_dir(&base_dir) {
-                                for ve in v_entries.flatten() {
-                                    let vname = ve.file_name().to_string_lossy().into_owned();
-                                    if vname.eq_ignore_ascii_case(vendor) && ve.path().is_dir() {
-                                        for nk in &name_keys {
-                                            add_if_exists(ve.path().join(nk), false);
-                                        }
+            // 10. Vendor-nested folders (<Vendor>/<Product>)
+            let parts: Vec<&str> = bundle_id.split('.').collect();
+            if parts.len() >= 3 {
+                let vendor = parts[1];
+                if !is_common_generic_name(vendor) {
+                    for sub in ["Application Support", "Caches", "Logs"] {
+                        let base_dir = library.join(sub);
+                        if let Ok(v_entries) = fs::read_dir(&base_dir) {
+                            for ve in v_entries.flatten() {
+                                let vname = ve.file_name().to_string_lossy().into_owned();
+                                if vname.eq_ignore_ascii_case(vendor) && ve.path().is_dir() {
+                                    for nk in &name_keys {
+                                        add_if_exists(ve.path().join(nk), false);
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                // 11. Special-app rules (VS Code, Xcode, JetBrains, Android Studio, Claude Desktop, Docker, Anki, Godot)
-                let bid_lower = bundle_id.to_ascii_lowercase();
-                if bid_lower == "com.microsoft.vscode" {
-                    add_if_exists(library.join("Application Support/Code"), false);
-                    add_if_exists(home_path.join(".vscode"), false);
-                } else if bid_lower == "com.microsoft.vscodeinsiders" {
-                    add_if_exists(library.join("Application Support/Code - Insiders"), false);
-                    add_if_exists(home_path.join(".vscode-insiders"), false);
-                } else if bid_lower == "com.apple.dt.xcode" {
-                    add_if_exists(library.join("Developer/Xcode"), false);
-                } else if bid_lower.starts_with("com.jetbrains.") {
-                    if let Some(sel) = read_jetbrains_paths_selector(&app_path_buf) {
-                        add_if_exists(library.join("Application Support/JetBrains").join(&sel), false);
-                        add_if_exists(library.join("Caches/JetBrains").join(&sel), false);
-                        add_if_exists(library.join("Logs/JetBrains").join(&sel), false);
-                    }
-                } else if bid_lower.starts_with("com.google.android.studio") {
-                    if let Some(sel) = read_jetbrains_paths_selector(&app_path_buf) {
-                        add_if_exists(library.join("Application Support/Google").join(&sel), false);
-                        add_if_exists(library.join("Caches/Google").join(&sel), false);
-                        add_if_exists(library.join("Logs/Google").join(&sel), false);
-                    }
-                } else if bid_lower == "com.anthropic.claudefordesktop" {
-                    add_if_exists(library.join("Application Support/Claude"), false);
-                    add_if_exists(library.join("Application Support/Claude-3p"), false);
-                } else if bid_lower == "com.docker.docker" {
-                    add_if_exists(home_path.join(".docker/buildx"), false);
-                    add_if_exists(home_path.join(".docker/scan"), false);
-                    add_if_exists(library.join("Group Containers/group.com.docker"), false);
-                } else if bid_lower == "net.ankiweb.dtop" || bid_lower == "net.ankisrs.anki" {
-                    add_if_exists(library.join("Application Support/Anki2"), false);
-                } else if bid_lower == "org.godotengine.godot" {
-                    add_if_exists(library.join("Application Support/Godot"), false);
-                    add_if_exists(library.join("Caches/Godot"), false);
+            // 11. Special-app rules (VS Code, Xcode, JetBrains, Android Studio, Claude Desktop, Docker, Anki, Godot)
+            let bid_lower = bundle_id.to_ascii_lowercase();
+            if bid_lower == "com.microsoft.vscode" {
+                add_if_exists(library.join("Application Support/Code"), false);
+                add_if_exists(home_path.join(".vscode"), false);
+            } else if bid_lower == "com.microsoft.vscodeinsiders" {
+                add_if_exists(library.join("Application Support/Code - Insiders"), false);
+                add_if_exists(home_path.join(".vscode-insiders"), false);
+            } else if bid_lower == "com.apple.dt.xcode" {
+                add_if_exists(library.join("Developer/Xcode"), false);
+            } else if bid_lower.starts_with("com.jetbrains.") {
+                if let Some(sel) = read_jetbrains_paths_selector(&app_path_buf) {
+                    add_if_exists(library.join("Application Support/JetBrains").join(&sel), false);
+                    add_if_exists(library.join("Caches/JetBrains").join(&sel), false);
+                    add_if_exists(library.join("Logs/JetBrains").join(&sel), false);
                 }
+            } else if bid_lower.starts_with("com.google.android.studio") {
+                if let Some(sel) = read_jetbrains_paths_selector(&app_path_buf) {
+                    add_if_exists(library.join("Application Support/Google").join(&sel), false);
+                    add_if_exists(library.join("Caches/Google").join(&sel), false);
+                    add_if_exists(library.join("Logs/Google").join(&sel), false);
+                }
+            } else if bid_lower == "com.anthropic.claudefordesktop" {
+                add_if_exists(library.join("Application Support/Claude"), false);
+                add_if_exists(library.join("Application Support/Claude-3p"), false);
+            } else if bid_lower == "com.docker.docker" {
+                add_if_exists(home_path.join(".docker/buildx"), false);
+                add_if_exists(home_path.join(".docker/scan"), false);
+                add_if_exists(library.join("Group Containers/group.com.docker"), false);
+            } else if bid_lower == "net.ankiweb.dtop" || bid_lower == "net.ankisrs.anki" {
+                add_if_exists(library.join("Application Support/Anki2"), false);
+            } else if bid_lower == "org.godotengine.godot" {
+                add_if_exists(library.join("Application Support/Godot"), false);
+                add_if_exists(library.join("Caches/Godot"), false);
+            }
 
-                // 12. User LaunchAgents (filename prefix OR plist Program/ProgramArguments[0]/Label ownership)
-                let agents_dir = library.join("LaunchAgents");
-                if let Ok(entries) = fs::read_dir(&agents_dir) {
+            // 12. User LaunchAgents (filename prefix OR plist Program/ProgramArguments[0]/Label ownership)
+            let agents_dir = library.join("LaunchAgents");
+            if let Ok(entries) = fs::read_dir(&agents_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if !fname.ends_with(".plist") {
+                        continue;
+                    }
+                    let fname_lower = fname.to_ascii_lowercase();
+                    if !is_apple_bundle && fname_lower.starts_with("com.apple.") {
+                        continue;
+                    }
+                    let name_match = bundle_ids_lower.iter().any(|bl| {
+                        fname_lower == format!("{}.plist", bl)
+                            || fname_lower.starts_with(&format!("{}.", bl))
+                    });
+                    if name_match || launch_plist_owned_by_app(&p, &bundle_ids, app_path) {
+                        add_if_exists(p, false);
+                    }
+                }
+            }
+
+            // 13. System-level remnants (unchecked by default; removable with explicit user opt-in + admin auth)
+            let sys_lib = Path::new("/Library");
+            for subdir in ["Application Support", "Caches", "Logs"] {
+                let dir = sys_lib.join(subdir);
+                for bid in &bundle_ids {
+                    add_if_exists(dir.join(bid), true);
+                }
+                if !has_sibling_app {
+                    for nk in &name_keys {
+                        add_if_exists(dir.join(nk), true);
+                    }
+                }
+            }
+            for bid in &bundle_ids {
+                add_if_exists(sys_lib.join("Preferences").join(format!("{}.plist", bid)), true);
+                add_if_exists(sys_lib.join("PrivilegedHelperTools").join(bid), true);
+            }
+            if !has_sibling_app {
+                for nk in &name_keys {
+                    add_if_exists(Path::new("/Users/Shared").join(nk), true);
+                }
+            }
+            for sys_launch in [sys_lib.join("LaunchAgents"), sys_lib.join("LaunchDaemons")] {
+                if let Ok(entries) = fs::read_dir(&sys_launch) {
                     for entry in entries.flatten() {
                         let p = entry.path();
                         let fname = entry.file_name().to_string_lossy().into_owned();
                         if !fname.ends_with(".plist") {
                             continue;
                         }
-                        let fname_lower = fname.to_ascii_lowercase();
-                        let name_match = bundle_ids.iter().any(|b| {
-                            let bl = b.to_ascii_lowercase();
-                            fname_lower == format!("{}.plist", bl)
-                                || fname_lower.starts_with(&format!("{}.", bl))
+                        let fl = fname.to_ascii_lowercase();
+                        if !is_apple_bundle && fl.starts_with("com.apple.") {
+                            continue;
+                        }
+                        let name_match = bundle_ids_lower.iter().any(|bl| {
+                            fl == format!("{}.plist", bl)
+                                || fl.starts_with(&format!("{}.", bl))
                         });
                         if name_match || launch_plist_owned_by_app(&p, &bundle_ids, app_path) {
-                            add_if_exists(p, false);
+                            add_if_exists(p, true);
                         }
                     }
                 }
+            }
+            if !bundle_ids_lower.is_empty() {
+                if let Ok(entries) = fs::read_dir("/private/var/db/receipts") {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        let fl = fname.to_ascii_lowercase();
+                        if (fl.ends_with(".plist") || fl.ends_with(".bom"))
+                            && bundle_ids_lower
+                                .iter()
+                                .any(|bl| fl.starts_with(&format!("{}.", bl)))
+                        {
+                            add_if_exists(entry.path(), true);
+                        }
+                    }
+                }
+            }
 
-                // 13. System-level remnants (read-only detection, unchecked by default)
-                let sys_lib = Path::new("/Library");
-                for subdir in ["Application Support", "Caches", "Logs"] {
-                    let dir = sys_lib.join(subdir);
-                    for bid in &bundle_ids {
-                        add_if_exists(dir.join(bid), true);
+            let mut records: Vec<LeftoverRecord> = candidates
+                .into_par_iter()
+                .map(|(p, is_system)| {
+                    let path_str = p.to_string_lossy().into_owned();
+                    let display_path = if !home.is_empty() && path_str.starts_with(&home) {
+                        format!("~{}", &path_str[home.len()..])
+                    } else {
+                        path_str.clone()
+                    };
+                    let category = categorize_leftover(&path_str).to_string();
+                    let size_bytes = calculate_path_size_accurate(&p);
+                    let (default_selected, holdback_reason) =
+                        evaluate_holdback(&path_str, &home, is_system);
+                    LeftoverRecord {
+                        path: path_str,
+                        display_path,
+                        category,
+                        size_bytes,
+                        is_system,
+                        default_selected,
+                        holdback_reason,
                     }
-                    if !has_sibling_app {
-                        for nk in &name_keys {
-                            add_if_exists(dir.join(nk), true);
-                        }
-                    }
-                }
-                for bid in &bundle_ids {
-                    add_if_exists(sys_lib.join("Preferences").join(format!("{}.plist", bid)), true);
-                    add_if_exists(sys_lib.join("PrivilegedHelperTools").join(bid), true);
-                }
-                if !has_sibling_app {
-                    for nk in &name_keys {
-                        add_if_exists(Path::new("/Users/Shared").join(nk), true);
-                    }
-                }
-                for sys_launch in [sys_lib.join("LaunchAgents"), sys_lib.join("LaunchDaemons")] {
-                    if let Ok(entries) = fs::read_dir(&sys_launch) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            let fname = entry.file_name().to_string_lossy().into_owned();
-                            if !fname.ends_with(".plist") {
-                                continue;
-                            }
-                            let fl = fname.to_ascii_lowercase();
-                            let name_match = bundle_ids.iter().any(|b| {
-                                let bl = b.to_ascii_lowercase();
-                                fl == format!("{}.plist", bl)
-                                    || fl.starts_with(&format!("{}.", bl))
-                            });
-                            if name_match || launch_plist_owned_by_app(&p, &bundle_ids, app_path) {
-                                add_if_exists(p, true);
-                            }
-                        }
-                    }
-                }
-                if !bundle_ids.is_empty() {
-                    if let Ok(entries) = fs::read_dir("/private/var/db/receipts") {
-                        for entry in entries.flatten() {
-                            let fname = entry.file_name().to_string_lossy().into_owned();
-                            let fl = fname.to_ascii_lowercase();
-                            if (fl.ends_with(".plist") || fl.ends_with(".bom"))
-                                && bundle_ids.iter().any(|b| {
-                                    let bl = b.to_ascii_lowercase();
-                                    fl.starts_with(&format!("{}.", bl))
-                                })
-                            {
-                                add_if_exists(entry.path(), true);
-                            }
-                        }
-                    }
-                }
+                })
+                .collect();
 
-                let mut records: Vec<LeftoverRecord> = candidates
-                    .into_par_iter()
-                    .map(|(p, is_system)| {
-                        let path_str = p.to_string_lossy().into_owned();
-                        let display_path = if !home.is_empty() && path_str.starts_with(&home) {
-                            format!("~{}", &path_str[home.len()..])
-                        } else {
-                            path_str.clone()
-                        };
-                        let category = categorize_leftover(&path_str).to_string();
-                        let size_bytes = calculate_path_size_accurate(&p);
-                        let (default_selected, holdback_reason) =
-                            evaluate_holdback(&path_str, &home, is_system);
-                        LeftoverRecord {
-                            path: path_str,
-                            display_path,
-                            category,
-                            size_bytes,
-                            is_system,
-                            default_selected,
-                            holdback_reason,
-                        }
-                    })
-                    .collect();
-
-                // Sort user items first (selected first, then held-back), system items last; within each group largest first
-                records.sort_unstable_by(|a, b| {
-                    a.is_system
-                        .cmp(&b.is_system)
-                        .then_with(|| b.default_selected.cmp(&a.default_selected))
-                        .then_with(|| b.size_bytes.cmp(&a.size_bytes))
-                });
-                records
-            },
-            || find_installed_cask_parallel(app_name, app_path, brew_prefix),
-        );
+            // Sort user items first (selected first, then held-back), system items last; within each group largest first
+            records.sort_unstable_by(|a, b| {
+                a.is_system
+                    .cmp(&b.is_system)
+                    .then_with(|| b.default_selected.cmp(&a.default_selected))
+                    .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+            });
+            records
+        };
 
         let payload = UninstallInspectionPayload {
             leftovers,
