@@ -1,4 +1,21 @@
-## What's New in v1.3.0
+## What's New in v1.4.1
+
+- **Live, Jitter-Free Caffeinate Menu Bar Countdown**:
+  - Fixed the Caffeinate timer inside the menu bar dropdown not updating after launch by backing `formattedRemaining` with a lightweight observable `Timer` on `RunLoop.main`.
+  - Scheduled the timer on `RunLoop.Mode.default` (pausing during `NSMenu` `.eventTracking`) so the countdown is always fresh to the second whenever you open the menu, while hovering over the **Caffeinate ▸** submenu stays rock-solid without collapsing or resizing the menu.
+  - Applied monospaced digits to the `Caffeinate` and `Clean Keys` menu labels and simplified the top status header to prevent horizontal menu jitter.
+- **Full Mole v1.74 Cleaner & Uninstaller Parity**:
+  - **Opt-In Admin Removal of Uninstaller System Leftovers**: System remnants (`/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/Library/PrivilegedHelperTools`, `/Library/Application Support`, `/Library/Caches`, `/Library/Logs`, `/Library/Preferences`, `/Users/Shared`, `/private/var/db/receipts`) are now toggleable in the Uninstaller review sheet with purple **Admin** badges, validated against a strict allowlist, unloaded via `launchctl bootout system`, and removed in a single native administrator prompt, followed by targeted `lsregister -u` on the removed bundle.
+  - **Deeper App & Helper Discovery**: Reads `CFBundleName` and `CFBundleDisplayName` (catching apps like `Alfred 4.app` → `Alfred`), scans 1-level `/Applications` and `~/Applications` subfolders (Setapp, Utilities, Adobe), expands embedded helper bundle ID scanning (`Contents/Preferences`, `SharedSupport`, `QuickLook`, `Spotlight`), and adds `SplashBoard/Snapshots`, `KSCrash`, `SentryCrash`, `CrashReporter`, `DiagnosticReports`, and boundary-matched `Application Support/FileProvider` leftovers.
+  - **iOS Simulator Per-Device & Browser Update Clone Cleanup**: Scans shut-down (`state == 1`) CoreSimulator devices' `data/{tmp,Library/Caches,Library/Logs}` when Simulator isn't running, plus Chromium `.code_sign_clone` update leftovers (Chrome, Brave, Edge, Helium) in `~/Library/Caches` and `$TMPDIR`.
+  - **Expanded Developer, App & Orphan Coverage**: Added Bazel, Zig, sccache, ccache, Turborepo, esbuild, Biome, Prisma, Conda, Coursier, Ivy2, XCTest, Xcode iOS Device Logs, npm `_logs`, Vesktop `sessionData`, T3 Code preview partitions & `.t3/worktrees`, Adobe Media Cache, Apple Maps `GeoServices`, `com.apple.helpd`, and 30d+ deep-stale orphaned `~/Library/Logs`, `~/Library/HTTPStorages`, and `~/Library/WebKit` leftovers.
+  - **Hardened Live-App & Safety Protections**: Added Chromium/Electron `SingletonLock` live-PID detection, 30-day deep child mtime checks for orphan detection, protected `~/Library/Caches/llama.cpp` and `~/Library/Caches/Buzz`, and held back Playwright/Puppeteer browser binaries, Raycast clipboard history cache, Mullvad Browser profile cache, and Spotify offline data.
+- **Rust & APFS Performance Optimizations**:
+  - Replaced the shared `Mutex<HashSet>` in `getattrlistbulk` APFS sizing with a lock-free `SizeAcc` accumulator and reusable `DfsArena` buffer (zero per-directory heap allocations).
+  - Added a 36-character UUID filter before reading `.com.apple.containermanagerd.metadata.plist` (skipping hundreds of named containers for 5x–10x faster uninstaller inspection) and overlapped sibling-app + Homebrew Caskroom checks via `rayon::join`.
+  - Replaced O(N) bundle-ID lookups with binary-searched `BundleIdIndex`, reused `symlink_metadata` file sizes (`known_file_size`), parallelized `collect_running_apps`, `scan_project_artifacts`, and parent-preserved folder deletion, and skipped post-delete recounts when all children delete cleanly.
+
+### Included from v1.3.0
 
 - **Complete Mole-Parity macOS Cleaner (12 Categories, Zero External CLI)**: Expanded Upkeep's native Rust Cleaner to cover every macOS cleanup surface in Mole (`mo clean`, `mo purge`, and `mo installer`) in one interactive workspace:
   - **System Caches & Logs (Admin)**: Opt-in, allowlisted system cleanup (`/Library/Developer/CoreSimulator/Caches/dyld`, `/Library/Logs/DiagnosticReports`, `/private/var/db/diagnostics/{Special,Persist}`, `/private/var/db/DiagnosticPipeline`, `/private/var/db/reportmemoryexception`, stale `/private/var/log`, `/Library/Caches`, `/private/tmp`, `/private/var/tmp`, and `/private/var/db/powerlog` excluding live `Current*` PerfPowerTelemetry databases) executed via a single native macOS administrator authorization prompt only when admin items are selected.
