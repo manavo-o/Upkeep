@@ -1,4 +1,13 @@
-## What's New in v1.4.1
+## What's New in v1.4.2
+
+- **Mandatory Rust Engine Enforcement for Release Builds**:
+  - Updated `Scripts/build-app.sh` to fail fast in CI/release builds (`CI`, `GITHUB_ACTIONS`, or `UPKEEP_REQUIRE_RUST=1`) if `cargo` is missing or `Frameworks/lib/libupkeep_core.a` is not produced, preventing silent Swift-fallback releases while keeping the Swift fallback available for local development.
+  - Added an explicit `UpkeepEngine.isUsingRustCore` assertion to `UpkeepSelfTest` when `UPKEEP_REQUIRE_RUST=1`, `CI`, or `GITHUB_ACTIONS` is set.
+  - Hardened `.github/workflows/release.yml` to require `cargo`, run `cargo test` in `rust/upkeep_core`, build with `UPKEEP_REQUIRE_RUST=1`, and run `UpkeepSelfTest` before packaging the release archive.
+- **Documentation Overhaul**:
+  - Redesigned `README.md` with dynamic release/CI badges, quick navigation, expandable 12-category Cleaner & Uninstaller inventories, a structured Safety & Protection Model table, a Mermaid architecture diagram, a transparent Privacy & Network Activity audit, and a concise FAQ.
+
+### Included from v1.4.1
 
 - **Live, Jitter-Free Caffeinate Menu Bar Countdown**:
   - Fixed the Caffeinate timer inside the menu bar dropdown not updating after launch by backing `formattedRemaining` with a lightweight observable `Timer` on `RunLoop.main`.

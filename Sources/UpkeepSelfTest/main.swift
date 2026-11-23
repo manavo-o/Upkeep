@@ -19,8 +19,13 @@ struct UpkeepSelfTest {
     }
 
     static func main() async {
-        print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.4.1) ===")
+        print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.4.2) ===")
         print("  Engine: \(UpkeepEngine.isUsingRustCore ? "Rust upkeep_core C-ABI" : "Swift fallback")")
+        let env = ProcessInfo.processInfo.environment
+        let requireRust = env["UPKEEP_REQUIRE_RUST"] == "1" || env["CI"] != nil || env["GITHUB_ACTIONS"] != nil
+        if requireRust {
+            check("Rust upkeep_core C-ABI is linked", UpkeepEngine.isUsingRustCore, UpkeepEngine.isUsingRustCore ? "enabled" : "Swift fallback active")
+        }
 
         // 1. CLIExecutor & ANSI tests
         check("Resolve `brew` binary", CLIExecutor.resolveBinary("brew") != nil, CLIExecutor.resolveBinary("brew") ?? "nil")
