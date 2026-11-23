@@ -107,6 +107,16 @@ public enum UpkeepEngine {
             return Int(upkeep_brew_index_count(ptr))
         }
 
+        /// Immediately evicts the in-memory Rust slab and Swift snapshot to minimize idle RAM.
+        public func clear() {
+            itemsLock.lock()
+            items.removeAll()
+            itemsLock.unlock()
+            if let ptr {
+                upkeep_brew_index_clear(ptr)
+            }
+        }
+
         public func load(items: [BrewPackageItem]) {
             let wire = items.map {
                 WireBrewPackage(
@@ -132,6 +142,23 @@ public enum UpkeepEngine {
             _ = jsonStr.withCString { cstr in
                 upkeep_brew_index_load_json(ptr, cstr)
             }
+        }
+
+        /// Streaming disk-file loader for Homebrew `formula.json` and `cask.json`.
+        /// Streams directly into Rust's contiguous byte slab without loading raw JSON into Swift RAM.
+        @discardableResult
+        public func loadAPIFiles(formulaePath: String?, casksPath: String?, prefix: String = "/opt/homebrew") -> Int {
+            guard let ptr else { return 0 }
+            let fPath = formulaePath ?? ""
+            let cPath = casksPath ?? ""
+            let loadedCount: UInt32 = fPath.withCString { fPtr in
+                cPath.withCString { cPtr in
+                    prefix.withCString { pPtr in
+                        upkeep_brew_index_load_api_files(ptr, fPtr, cPtr, pPtr)
+                    }
+                }
+            }
+            return Int(loadedCount)
         }
 
         /// Zero-copy raw-byte loader for Homebrew `formula.json` and `cask.json`.
@@ -468,10 +495,17 @@ public enum UpkeepEngine {
     public static func scanInstalledApplicationsMetadata() async -> [MoleInstalledApp] {
         #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
-            let capacity = 1024
+            var capacity = 256
             var records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
-            let count = records.withUnsafeMutableBufferPointer { buf in
+            var count = records.withUnsafeMutableBufferPointer { buf in
                 upkeep_scan_applications_metadata(buf.baseAddress, UInt32(buf.count))
+            }
+            if Int(count) == capacity {
+                capacity = 1024
+                records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
+                count = records.withUnsafeMutableBufferPointer { buf in
+                    upkeep_scan_applications_metadata(buf.baseAddress, UInt32(buf.count))
+                }
             }
             var apps: [MoleInstalledApp] = []
             apps.reserveCapacity(Int(count))
@@ -522,10 +556,17 @@ public enum UpkeepEngine {
     public static func scanInstalledApplications() async -> [MoleInstalledApp] {
         #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
-            let capacity = 1024
+            var capacity = 256
             var records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
-            let count = records.withUnsafeMutableBufferPointer { buf in
+            var count = records.withUnsafeMutableBufferPointer { buf in
                 upkeep_scan_applications(buf.baseAddress, UInt32(buf.count))
+            }
+            if Int(count) == capacity {
+                capacity = 1024
+                records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
+                count = records.withUnsafeMutableBufferPointer { buf in
+                    upkeep_scan_applications(buf.baseAddress, UInt32(buf.count))
+                }
             }
             var apps: [MoleInstalledApp] = []
             apps.reserveCapacity(Int(count))

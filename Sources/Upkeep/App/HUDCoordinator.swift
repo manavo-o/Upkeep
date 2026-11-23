@@ -31,10 +31,12 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
                 self?.hideCleaningHUD()
             }
         }
-        // Pre-warm Homebrew's 15k-package Rust index quietly in the background 2s after launch
+        // Evict any initial launch-check catalog slab after 30s so idle menu-bar RSS stays minimal.
         Task(priority: .background) {
-            try? await Task.sleep(for: .seconds(2))
-            await BrewService.shared.prewarmIfNeeded()
+            try? await Task.sleep(for: .seconds(30))
+            if self.mainWindowController == nil && self.homebrewPanel?.isVisible != true {
+                await BrewService.shared.evictRemoteCatalogIfIdle()
+            }
         }
     }
 
@@ -167,6 +169,15 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
     public func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
               window == mainWindowController?.window else { return }
+        // Release NSWindow, NSHostingController, Retina backing layers, and transient scan caches.
+        window.delegate = nil
+        window.contentViewController = nil
+        mainWindowController = nil
+        trayViewModel.releaseTransientCaches()
+        AppIconView.clearCache()
+        if homebrewPanel?.isVisible != true {
+            Task { await BrewService.shared.scheduleIdleEviction(afterSeconds: 60) }
+        }
         NSApp.setActivationPolicy(.accessory)
     }
 
@@ -216,6 +227,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
     // MARK: - Homebrew Floating HUD (Click-Outside Dismissal + Settings Handoff)
 
     public func showHomebrewHUD(initialQuery: String? = nil, initialTab: BrewHUDTab? = nil) {
+        Task { await BrewService.shared.cancelIdleEviction() }
         if let query = initialQuery {
             homebrewModel.query = query
             homebrewModel.activeTab = initialTab
@@ -255,7 +267,12 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
     public func hideHomebrewHUD() {
         removeHomebrewClickOutsideMonitors()
         homebrewModel.showActionMenu = false
+        homebrewModel.packages = []
+        homebrewModel.selectedID = nil
         homebrewPanel?.orderOut(nil)
+        if mainWindowController == nil {
+            Task { await BrewService.shared.scheduleIdleEviction(afterSeconds: 120) }
+        }
     }
 
     private func installHomebrewClickOutsideMonitors() {
@@ -368,6 +385,8 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
 
     public func hideCleaningHUD() {
         cleaningPanel?.orderOut(nil)
+        cleaningPanel?.contentView = nil
+        cleaningPanel = nil
         hideDimmingWindows()
     }
 

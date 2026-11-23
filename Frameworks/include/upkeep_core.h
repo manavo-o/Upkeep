@@ -29,11 +29,23 @@ BrewSearchIndex *upkeep_brew_index_new(void);
 /// Frees a BrewSearchIndex instance.
 void upkeep_brew_index_free(BrewSearchIndex *ptr);
 
+/// Evicts all indexed packages from RAM immediately (releasing slab memory back to the OS).
+void upkeep_brew_index_clear(BrewSearchIndex *ptr);
+
 /// Returns the number of indexed packages currently loaded.
 uint32_t upkeep_brew_index_count(const BrewSearchIndex *ptr);
 
 /// Loads a JSON array of BrewPackage objects into the index. Returns count loaded.
 uint32_t upkeep_brew_index_load_json(BrewSearchIndex *ptr, const char *json_utf8);
+
+/// Streaming raw-file loader for Homebrew formula.json and cask.json on disk.
+/// Streams directly into a contiguous byte slab without loading raw JSON into Swift RAM.
+uint32_t upkeep_brew_index_load_api_files(
+    BrewSearchIndex *ptr,
+    const char *formulae_path_utf8,
+    const char *casks_path_utf8,
+    const char *prefix_utf8
+);
 
 /// Zero-copy raw byte slice loader for Homebrew formula.json and cask.json arrays,
 /// merging installed/pinned/outdated state from the local Homebrew prefix in parallel.

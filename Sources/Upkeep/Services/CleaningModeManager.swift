@@ -88,7 +88,11 @@ public final class CleaningModeManager {
             callback: { _, _, ev, _ in Unmanaged.passUnretained(ev) },
             userInfo: nil
         )
-        return probe != nil
+        if let probe {
+            CFMachPortInvalidate(probe)
+            return true
+        }
+        return false
     }
 
     private var lastPermissionProbeAt: Date = .distantPast

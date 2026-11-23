@@ -298,7 +298,6 @@ public final class HomebrewHUDModel {
 /// and seamless handoff to the Settings Homebrew manager.
 public struct HomebrewHUDView: View {
     @Bindable var model: HomebrewHUDModel
-    @Bindable var logStore = BrewLogStore.shared
     let onDismiss: () -> Void
     @FocusState private var isSearchFocused: Bool
 
@@ -539,26 +538,7 @@ public struct HomebrewHUDView: View {
                 // Bottom Action & Live Transfer Strip with ⌘K Popover Anchor
                 Divider().opacity(0.2)
                 HStack(spacing: 10) {
-                    if logStore.isRunning, let live = logStore.liveStatusLine {
-                        HStack(spacing: 6) {
-                            ProgressView()
-                                .controlSize(.mini)
-                            Text(live)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                        }
-                    } else if let status = model.statusBanner {
-                        Text(status)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    } else {
-                        Text("⌘1 Installed · ⌘2 Formulae · ⌘3 Casks · ⌘4 Upgrades")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
+                    HomebrewHUDStatusStrip(statusBanner: model.statusBanner)
 
                     Spacer()
 
@@ -915,6 +895,35 @@ public struct HomebrewHUDView: View {
             Text("Install")
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Isolated status strip so 40ms `BrewLogStore.liveStatusLine` updates never re-diff `HomebrewHUDView`.
+private struct HomebrewHUDStatusStrip: View {
+    @Bindable var logStore = BrewLogStore.shared
+    let statusBanner: String?
+
+    var body: some View {
+        if logStore.isRunning, let live = logStore.liveStatusLine {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text(live)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        } else if let status = statusBanner {
+            Text(status)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        } else {
+            Text("⌘1 Installed · ⌘2 Formulae · ⌘3 Casks · ⌘4 Upgrades")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 }

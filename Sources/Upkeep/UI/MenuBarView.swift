@@ -61,8 +61,12 @@ public final class TrayViewModel {
     public var brewErrorText: String?
 
     // Native Cleaner state
-    public var cleanerScan: CleanerScanResult?
-    public var selectedCleanPaths: Set<String> = []
+    public var cleanerScan: CleanerScanResult? {
+        didSet { recomputeCleanSelectionMetrics() }
+    }
+    public var selectedCleanPaths: Set<String> = [] {
+        didSet { recomputeCleanSelectionMetrics() }
+    }
     public var lastCleanResult: CleanExecutionResult?
     public var cleanPreview: MoleCleanSummary?
     public var confirmClean: Bool = false
@@ -70,20 +74,42 @@ public final class TrayViewModel {
     public var isCleaning: Bool = false
     public var cleanError: String?
 
-    public var selectedCleanBytes: Int64 {
-        guard let scan = cleanerScan else { return 0 }
-        return scan.allItems
-            .filter { selectedCleanPaths.contains($0.path) }
-            .reduce(0) { $0 + $1.sizeBytes }
+    // Cached selection metrics so SwiftUI body renders never run flatMap + ByteCountFormatter per hover.
+    public private(set) var selectedCleanBytes: Int64 = 0
+    public private(set) var hasSelectedAdminCleanItems: Bool = false
+    public private(set) var formattedSelectedCleanSize: String = "Zero KB"
+
+    private func recomputeCleanSelectionMetrics() {
+        guard let scan = cleanerScan, !selectedCleanPaths.isEmpty else {
+            selectedCleanBytes = 0
+            hasSelectedAdminCleanItems = false
+            formattedSelectedCleanSize = "Zero KB"
+            return
+        }
+        var bytes: Int64 = 0
+        var hasAdmin = false
+        for category in scan.categories {
+            for item in category.items where selectedCleanPaths.contains(item.path) {
+                bytes += item.sizeBytes
+                if item.requiresAdmin { hasAdmin = true }
+            }
+        }
+        selectedCleanBytes = bytes
+        hasSelectedAdminCleanItems = hasAdmin
+        formattedSelectedCleanSize = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
-    public var hasSelectedAdminCleanItems: Bool {
-        guard let scan = cleanerScan else { return false }
-        return scan.allItems.contains { $0.requiresAdmin && selectedCleanPaths.contains($0.path) }
-    }
-
-    public var formattedSelectedCleanSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedCleanBytes, countStyle: .file)
+    /// Releases large scan/app arrays when the Settings window closes to keep menu-bar idle RAM low.
+    public func releaseTransientCaches() {
+        if !isScanningClean && !isCleaning {
+            cleanerScan = nil
+            cleanPreview = nil
+            selectedCleanPaths.removeAll()
+            confirmClean = false
+        }
+        if !isLoadingApps && !isInspectingUninstall && !isUninstallingApp && pendingUninstallApp == nil {
+            installedApps.removeAll()
+        }
     }
 
     public enum AppSortOrder: String, CaseIterable, Identifiable, Sendable {

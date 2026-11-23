@@ -164,21 +164,39 @@ public final class KeepAwakeManager {
         return String(format: "%02dm %02ds", mins, secs)
     }
 
+    private var displayTimerIsMinuteCadence: Bool = false
+
     private func refreshFormattedRemaining() {
         let next = computeFormattedRemaining()
         if next != formattedRemaining {
             formattedRemaining = next
         }
+        // Automatically switch from 60s cadence to 1s cadence when crossing under 1 hour.
+        if isActive, let secs = remainingSeconds {
+            let wantsMinuteCadence = secs >= 3600
+            if displayTimer != nil && wantsMinuteCadence != displayTimerIsMinuteCadence {
+                startDisplayTimer()
+            }
+        }
     }
 
     private func startDisplayTimer() {
         displayTimer?.invalidate()
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+        guard isActive, let secs = remainingSeconds else {
+            displayTimer = nil
+            return
+        }
+        // Above 1 hour the display format is "%dh %02dm" (changes only once per minute),
+        // so wake every 60s instead of 1 Hz (60x fewer idle CPU wakeups).
+        let useMinuteCadence = secs >= 3600
+        displayTimerIsMinuteCadence = useMinuteCadence
+        let interval: TimeInterval = useMinuteCadence ? 60.0 : 1.0
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.refreshFormattedRemaining()
             }
         }
-        timer.tolerance = 0.1
+        timer.tolerance = useMinuteCadence ? 2.0 : 0.25
         // Intentionally use `.default` (not `.common`) so ticks pause during NSMenu `.eventTracking`.
         // This keeps the countdown accurate whenever the menu is opened without rebuilding/closing
         // hovered submenus inside `MenuBarExtraStyle(.menu)`.

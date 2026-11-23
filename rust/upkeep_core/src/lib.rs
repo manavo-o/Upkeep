@@ -2,20 +2,40 @@ use memchr::{memchr, memchr2, memmem};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 mod cleaner;
 pub use cleaner::{upkeep_clean_paths_json, upkeep_scan_cleaner_json};
+
+// MARK: - Bounded Dedicated Rayon Worker Pool (Prevents 8–16 Idle OS Threads in Menu-Bar App)
+
+static WORKER_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+pub(crate) fn worker_pool() -> &'static rayon::ThreadPool {
+    WORKER_POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 4);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|idx| format!("upkeep-worker-{}", idx))
+            .build()
+            .expect("failed to build upkeep Rayon worker pool")
+    })
+}
 
 // MARK: - Core Data Structures
 
@@ -31,25 +51,188 @@ pub struct BrewPackage {
     pub homepage: String,
 }
 
-struct IndexedPackage {
-    pkg: BrewPackage,
-    api_version: String,
-    name_lower: String,
+/// Zero-copy borrowed wire projection for JSON serialization directly from the byte slab.
+#[derive(Serialize)]
+struct BrewPackageRef<'a> {
+    name: &'a str,
+    description: &'a str,
+    version: &'a str,
+    is_cask: bool,
+    is_installed: bool,
+    is_outdated: bool,
+    is_pinned: bool,
+    homepage: &'a str,
 }
 
-impl IndexedPackage {
-    fn new(pkg: BrewPackage) -> Self {
-        let api_version = pkg.version.clone();
-        Self::with_api_version(pkg, api_version)
+#[derive(Clone, Copy, Default)]
+struct StrSpan {
+    off: u32,
+    len: u32,
+}
+
+const FLAG_CASK: u8 = 1 << 0;
+const FLAG_INSTALLED: u8 = 1 << 1;
+const FLAG_OUTDATED: u8 = 1 << 2;
+const FLAG_PINNED: u8 = 1 << 3;
+
+#[derive(Clone, Copy)]
+struct SlabPackage {
+    name: StrSpan,
+    desc: StrSpan,
+    api_ver: StrSpan,
+    homepage: StrSpan,
+    flags: u8,
+}
+
+impl SlabPackage {
+    #[inline]
+    fn is_cask(&self) -> bool {
+        (self.flags & FLAG_CASK) != 0
+    }
+    #[inline]
+    fn is_installed(&self) -> bool {
+        (self.flags & FLAG_INSTALLED) != 0
+    }
+    #[inline]
+    fn is_outdated(&self) -> bool {
+        (self.flags & FLAG_OUTDATED) != 0
+    }
+    #[inline]
+    fn is_pinned(&self) -> bool {
+        (self.flags & FLAG_PINNED) != 0
+    }
+}
+
+/// Contiguous byte-slab catalog: stores all ~15k Homebrew packages in 2 allocations
+/// (`strings` + `entries`) instead of ~90k separate `malloc` chunks, with installed-only
+/// local version overrides in a tiny map.
+#[derive(Default)]
+struct BrewCatalogSlab {
+    strings: Vec<u8>,
+    entries: Vec<SlabPackage>,
+    local_versions: HashMap<u32, String>,
+}
+
+impl BrewCatalogSlab {
+    fn with_capacity(entry_cap: usize, string_bytes_cap: usize) -> Self {
+        Self {
+            strings: Vec::with_capacity(string_bytes_cap),
+            entries: Vec::with_capacity(entry_cap),
+            local_versions: HashMap::new(),
+        }
     }
 
-    fn with_api_version(pkg: BrewPackage, api_version: String) -> Self {
-        let name_lower = pkg.name.to_ascii_lowercase();
-        Self {
-            pkg,
-            api_version,
-            name_lower,
+    #[inline]
+    fn push_str(&mut self, s: &str) -> StrSpan {
+        if s.is_empty() {
+            return StrSpan { off: 0, len: 0 };
         }
+        let off = self.strings.len() as u32;
+        self.strings.extend_from_slice(s.as_bytes());
+        StrSpan {
+            off,
+            len: s.len() as u32,
+        }
+    }
+
+    #[inline]
+    fn str_of(&self, span: StrSpan) -> &str {
+        if span.len == 0 {
+            return "";
+        }
+        let start = span.off as usize;
+        let end = start + span.len as usize;
+        // SAFETY: `self.strings` is only ever populated with valid UTF-8 `&str` bytes in `push_str`.
+        unsafe { std::str::from_utf8_unchecked(&self.strings[start..end]) }
+    }
+
+    #[inline]
+    fn version_of(&self, idx: usize) -> &str {
+        if let Some(local_ver) = self.local_versions.get(&(idx as u32)) {
+            if !local_ver.is_empty() {
+                return local_ver.as_str();
+            }
+        }
+        self.str_of(self.entries[idx].api_ver)
+    }
+
+    #[inline]
+    fn as_wire_ref(&self, idx: usize) -> BrewPackageRef<'_> {
+        let e = &self.entries[idx];
+        BrewPackageRef {
+            name: self.str_of(e.name),
+            description: self.str_of(e.desc),
+            version: self.version_of(idx),
+            is_cask: e.is_cask(),
+            is_installed: e.is_installed(),
+            is_outdated: e.is_outdated(),
+            is_pinned: e.is_pinned(),
+            homepage: self.str_of(e.homepage),
+        }
+    }
+
+    fn push_package(
+        &mut self,
+        name: &str,
+        desc: &str,
+        api_ver: &str,
+        homepage: &str,
+        local_ver: Option<String>,
+        is_cask: bool,
+        is_installed: bool,
+        is_outdated: bool,
+        is_pinned: bool,
+    ) {
+        let name_span = self.push_str(name);
+        let desc_span = self.push_str(desc);
+        let api_span = self.push_str(api_ver);
+        let hp_span = self.push_str(homepage);
+        let mut flags = 0u8;
+        if is_cask {
+            flags |= FLAG_CASK;
+        }
+        if is_installed {
+            flags |= FLAG_INSTALLED;
+        }
+        if is_outdated {
+            flags |= FLAG_OUTDATED;
+        }
+        if is_pinned {
+            flags |= FLAG_PINNED;
+        }
+        let idx = self.entries.len() as u32;
+        self.entries.push(SlabPackage {
+            name: name_span,
+            desc: desc_span,
+            api_ver: api_span,
+            homepage: hp_span,
+            flags,
+        });
+        if let Some(lv) = local_ver {
+            if !lv.is_empty() && lv != api_ver {
+                self.local_versions.insert(idx, lv);
+            }
+        }
+    }
+
+    fn push_local_only(&mut self, pkg: BrewPackage) {
+        self.push_package(
+            &pkg.name,
+            &pkg.description,
+            &pkg.version,
+            &pkg.homepage,
+            None,
+            pkg.is_cask,
+            pkg.is_installed,
+            pkg.is_outdated,
+            pkg.is_pinned,
+        );
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.strings.shrink_to_fit();
+        self.entries.shrink_to_fit();
+        self.local_versions.shrink_to_fit();
     }
 }
 
@@ -109,7 +292,7 @@ pub struct UpkeepAppRecord {
 }
 
 pub struct BrewSearchIndex {
-    packages: RwLock<Vec<IndexedPackage>>,
+    slab: RwLock<BrewCatalogSlab>,
 }
 
 #[derive(Deserialize)]
@@ -140,13 +323,13 @@ struct ApiCask {
     homepage: Option<String>,
 }
 
-// Thread-local Matcher & UTF-32 scratch buffer so single-pair fuzzy calls do zero heap allocations.
+// Thread-local Matcher ONLY for single-pair `upkeep_fuzzy_score` (never touched by Rayon workers).
 thread_local! {
-    static TL_MATCHER: RefCell<(Matcher, Vec<char>)> =
+    static TL_SINGLE_MATCHER: RefCell<(Matcher, Vec<char>)> =
         RefCell::new((Matcher::new(Config::DEFAULT), Vec::with_capacity(256)));
 }
 
-// MARK: - String & Sorting Helpers
+// MARK: - Zero-Allocation String & Sorting Helpers
 
 pub(crate) fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
     if ptr.is_null() {
@@ -169,6 +352,41 @@ fn write_fixed_cstr(src: &str, dst: &mut [c_char]) {
         dst[i] = *b as c_char;
     }
     dst[copy_len] = 0;
+}
+
+/// Zero-allocation check for `haystack == prefix || haystack.starts_with(format!("{prefix}{sep}"))`.
+#[inline]
+pub(crate) fn eq_or_starts_with_sep(haystack: &str, prefix: &str, sep: u8) -> bool {
+    let hb = haystack.as_bytes();
+    let pb = prefix.as_bytes();
+    if hb.len() < pb.len() || &hb[..pb.len()] != pb {
+        return false;
+    }
+    hb.len() == pb.len() || hb[pb.len()] == sep
+}
+
+/// Zero-allocation check for `haystack.starts_with(format!("{prefix}{sep}"))`.
+#[inline]
+pub(crate) fn starts_with_sep(haystack: &str, prefix: &str, sep: u8) -> bool {
+    let hb = haystack.as_bytes();
+    let pb = prefix.as_bytes();
+    hb.len() > pb.len() && hb[pb.len()] == sep && &hb[..pb.len()] == pb
+}
+
+/// Zero-allocation check for `haystack == format!("{prefix}{suffix}")`.
+#[inline]
+fn eq_with_suffix(haystack: &str, prefix: &str, suffix: &str) -> bool {
+    haystack.len() == prefix.len() + suffix.len()
+        && haystack.starts_with(prefix)
+        && haystack.ends_with(suffix)
+}
+
+/// Zero-allocation ASCII case-insensitive prefix check.
+#[inline]
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let pb = prefix.as_bytes();
+    hb.len() >= pb.len() && hb[..pb.len()].eq_ignore_ascii_case(pb)
 }
 
 /// Zero-allocation ASCII case-insensitive comparison.
@@ -236,14 +454,14 @@ fn cmp_versions_natural(a: &str, b: &str) -> Ordering {
     ab.len().cmp(&bb.len())
 }
 
-/// NEON/SIMD-accelerated zero-allocation ASCII case-insensitive substring search via `memchr2`.
+/// NEON/SIMD-accelerated zero-allocation ASCII case-insensitive substring position via `memchr2`.
 #[inline]
-fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
-        return true;
+        return Some(0);
     }
     if needle.len() > haystack.len() {
-        return false;
+        return None;
     }
     let first_lo = needle[0].to_ascii_lowercase();
     let first_hi = needle[0].to_ascii_uppercase();
@@ -251,19 +469,22 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     let max_start = haystack.len() - needle.len();
     let mut offset = 0usize;
     while offset <= max_start {
-        let Some(rel) = memchr2(first_lo, first_hi, &haystack[offset..=max_start]) else {
-            return false;
-        };
+        let rel = memchr2(first_lo, first_hi, &haystack[offset..=max_start])?;
         let pos = offset + rel;
         if haystack[pos + 1..pos + needle.len()].eq_ignore_ascii_case(tail) {
-            return true;
+            return Some(pos);
         }
         offset = pos + 1;
     }
-    false
+    None
 }
 
-// MARK: - macOS getattrlistbulk APFS-Accurate Directory Sizing
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    find_ascii_case_insensitive(haystack, needle).is_some()
+}
+
+// MARK: - macOS getattrlistbulk APFS-Accurate Directory Sizing (Scoped Scratch, Zero Nested Rayon)
 
 #[cfg(target_os = "macos")]
 mod macos_bulk {
@@ -335,10 +556,33 @@ mod macos_bulk {
         ) -> c_int;
     }
 
-    // Thread-local reusable 128KB getattrlistbulk buffer + C-path buffer (zero per-dir heap allocs).
-    thread_local! {
-        static TL_BULK_SCRATCH: RefCell<(Vec<u8>, Vec<u8>)> =
-            RefCell::new((vec![0u8; 128 * 1024], Vec::with_capacity(512)));
+    /// Reusable arena across all DFS recursion levels so subdirectories incur zero Vec allocations.
+    struct DfsArena {
+        path_bytes: Vec<u8>,
+        child_names: Vec<u8>,
+        child_offsets: Vec<usize>,
+    }
+
+    /// Scoped per-worker scratch buffers (64 KB bulk buffer + reusable DFS arena).
+    /// Allocated via `map_init` and automatically freed when the scan ends — zero permanent TLS RSS.
+    pub(crate) struct BulkScratch {
+        buf: Vec<u8>,
+        path_buf: Vec<u8>,
+        arena: DfsArena,
+    }
+
+    impl BulkScratch {
+        pub(crate) fn new() -> Self {
+            Self {
+                buf: vec![0u8; 64 * 1024],
+                path_buf: Vec::with_capacity(512),
+                arena: DfsArena {
+                    path_bytes: Vec::with_capacity(512),
+                    child_names: Vec::with_capacity(4096),
+                    child_offsets: Vec::with_capacity(256),
+                },
+            }
+        }
     }
 
     /// Lock-free per-task accumulator: ordinary files sum directly into `bytes`, while
@@ -362,13 +606,20 @@ mod macos_bulk {
                 }
             }
         }
-    }
 
-    /// Reusable arena across all DFS recursion levels so subdirectories incur zero Vec allocations.
-    struct DfsArena {
-        path_bytes: Vec<u8>,
-        child_names: Vec<u8>,
-        child_offsets: Vec<usize>,
+        fn finalize(self) -> u64 {
+            if self.hardlinks.is_empty() {
+                return self.bytes;
+            }
+            let mut seen = HashSet::with_capacity(self.hardlinks.len());
+            let mut total = self.bytes;
+            for (obj_key, bytes) in self.hardlinks {
+                if seen.insert(obj_key) {
+                    total = total.saturating_add(bytes);
+                }
+            }
+            total
+        }
     }
 
     /// Shared lock-free `getattrlistbulk` parser for an open directory FD.
@@ -514,54 +765,52 @@ mod macos_bulk {
     fn read_single_dir_bulk(
         dir_path: &Path,
         is_root: bool,
+        scratch: &mut BulkScratch,
         subdirs_out: &mut Vec<PathBuf>,
     ) -> Option<SizeAcc> {
-        TL_BULK_SCRATCH.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let (buf, path_buf) = &mut *guard;
+        scratch.path_buf.clear();
+        scratch
+            .path_buf
+            .extend_from_slice(dir_path.as_os_str().as_encoded_bytes());
+        scratch.path_buf.push(0);
 
-            path_buf.clear();
-            path_buf.extend_from_slice(dir_path.as_os_str().as_encoded_bytes());
-            path_buf.push(0);
+        let fd = unsafe {
+            open(
+                scratch.path_buf.as_ptr() as *const c_char,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return if is_root { None } else { Some(SizeAcc::default()) };
+        }
 
-            let fd = unsafe {
-                open(
-                    path_buf.as_ptr() as *const c_char,
-                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return if is_root { None } else { Some(SizeAcc::default()) };
+        let mut acc = SizeAcc::default();
+        parse_fd_bulk(fd, &mut scratch.buf, &mut acc, |name_bytes| {
+            if let Ok(name_str) = std::str::from_utf8(name_bytes) {
+                subdirs_out.push(dir_path.join(name_str));
             }
+        });
 
-            let mut acc = SizeAcc::default();
-            parse_fd_bulk(fd, buf, &mut acc, |name_bytes| {
-                if let Ok(name_str) = std::str::from_utf8(name_bytes) {
-                    subdirs_out.push(dir_path.join(name_str));
-                }
-            });
-
-            unsafe { close(fd) };
-            Some(acc)
-        })
+        unsafe { close(fd) };
+        Some(acc)
     }
 
-    /// Reads all entries from an already-open directory FD using the thread-local 128KB bulk buffer,
-    /// pushing NUL-terminated child directory names into the reusable DFS arena.
-    fn read_fd_bulk(fd: c_int, acc: &mut SizeAcc, arena: &mut DfsArena) {
-        TL_BULK_SCRATCH.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let (buf, _) = &mut *guard;
-            parse_fd_bulk(fd, buf, acc, |name_bytes| {
-                arena.child_offsets.push(arena.child_names.len());
-                arena.child_names.extend_from_slice(name_bytes);
-                arena.child_names.push(0);
-            });
-        })
+    #[inline]
+    fn read_fd_bulk(fd: c_int, buf: &mut [u8], acc: &mut SizeAcc, arena: &mut DfsArena) {
+        parse_fd_bulk(fd, buf, acc, |name_bytes| {
+            arena.child_offsets.push(arena.child_names.len());
+            arena.child_names.extend_from_slice(name_bytes);
+            arena.child_names.push(0);
+        });
     }
 
     /// Single-FD zero-PathBuf DFS fallback for extreme nesting depths (> 16), keeping FD usage at 1.
-    fn walk_deep_single_fd(arena: &mut DfsArena, depth: u16, acc: &mut SizeAcc) {
+    fn walk_deep_single_fd(
+        buf: &mut [u8],
+        arena: &mut DfsArena,
+        depth: u16,
+        acc: &mut SizeAcc,
+    ) {
         if depth > 256 {
             return;
         }
@@ -579,7 +828,7 @@ mod macos_bulk {
 
         let names_base = arena.child_names.len();
         let offsets_base = arena.child_offsets.len();
-        read_fd_bulk(fd, acc, arena);
+        read_fd_bulk(fd, buf, acc, arena);
         unsafe { close(fd) };
 
         let offsets_end = arena.child_offsets.len();
@@ -597,22 +846,30 @@ mod macos_bulk {
             arena
                 .path_bytes
                 .extend_from_slice(&arena.child_names[start..start + name_len]);
-            walk_deep_single_fd(arena, depth + 1, acc);
+            walk_deep_single_fd(buf, arena, depth + 1, acc);
             arena.path_bytes.truncate(saved_len);
         }
         arena.child_names.truncate(names_base);
         arena.child_offsets.truncate(offsets_base);
     }
 
-    /// Zero-PathBuf `openat` DFS bounded to 16 open FDs per thread (falls back to single-FD path buffer beyond depth 16).
-    fn walk_openat_dfs(dirfd: c_int, depth: u8, arena: &mut DfsArena, acc: &mut SizeAcc) {
+    /// Zero-PathBuf `openat` DFS bounded to 16 open FDs per thread.
+    /// Avoids touching `arena.path_bytes` at depth < 16; lazily reconstructs full path only if depth == 16.
+    fn walk_openat_dfs(
+        dirfd: c_int,
+        depth: u8,
+        root_len: usize,
+        ancestors: &mut [(usize, usize); 16],
+        buf: &mut [u8],
+        arena: &mut DfsArena,
+        acc: &mut SizeAcc,
+    ) {
         let names_base = arena.child_names.len();
         let offsets_base = arena.child_offsets.len();
-        read_fd_bulk(dirfd, acc, arena);
+        read_fd_bulk(dirfd, buf, acc, arena);
 
         let offsets_end = arena.child_offsets.len();
         let names_end = arena.child_names.len();
-        let saved_len = arena.path_bytes.len();
         for idx in offsets_base..offsets_end {
             let start = arena.child_offsets[idx];
             let end_with_nul = if idx + 1 < offsets_end {
@@ -621,12 +878,9 @@ mod macos_bulk {
                 names_end
             };
             let name_len = end_with_nul.saturating_sub(start + 1);
-            arena.path_bytes.push(b'/');
-            arena
-                .path_bytes
-                .extend_from_slice(&arena.child_names[start..start + name_len]);
 
             if depth < 16 {
+                ancestors[depth as usize] = (start, name_len);
                 let name_ptr = unsafe { arena.child_names.as_ptr().add(start) as *const c_char };
                 let child_fd = unsafe {
                     openat(
@@ -636,28 +890,39 @@ mod macos_bulk {
                     )
                 };
                 if child_fd >= 0 {
-                    walk_openat_dfs(child_fd, depth + 1, arena, acc);
+                    walk_openat_dfs(child_fd, depth + 1, root_len, ancestors, buf, arena, acc);
                     unsafe { close(child_fd) };
                 }
             } else {
-                walk_deep_single_fd(arena, 0, acc);
+                // Rare deep-tree boundary: reconstruct full path lazily from root + 16 ancestors
+                arena.path_bytes.truncate(root_len);
+                for &(a_start, a_len) in ancestors.iter() {
+                    arena.path_bytes.push(b'/');
+                    arena
+                        .path_bytes
+                        .extend_from_slice(&arena.child_names[a_start..a_start + a_len]);
+                }
+                arena.path_bytes.push(b'/');
+                arena
+                    .path_bytes
+                    .extend_from_slice(&arena.child_names[start..start + name_len]);
+                walk_deep_single_fd(buf, arena, 0, acc);
+                arena.path_bytes.truncate(root_len);
             }
-
-            arena.path_bytes.truncate(saved_len);
         }
         arena.child_names.truncate(names_base);
         arena.child_offsets.truncate(offsets_base);
     }
 
-    fn walk_subtree_dfs(root: &Path) -> SizeAcc {
-        let mut arena = DfsArena {
-            path_bytes: Vec::with_capacity(512),
-            child_names: Vec::with_capacity(2048),
-            child_offsets: Vec::with_capacity(128),
-        };
+    fn walk_subtree_dfs(root: &Path, scratch: &mut BulkScratch) -> Option<SizeAcc> {
+        let arena = &mut scratch.arena;
+        arena.path_bytes.clear();
+        arena.child_names.clear();
+        arena.child_offsets.clear();
         arena
             .path_bytes
             .extend_from_slice(root.as_os_str().as_encoded_bytes());
+        let root_len = arena.path_bytes.len();
         arena.path_bytes.push(0);
         let fd = unsafe {
             open(
@@ -667,60 +932,73 @@ mod macos_bulk {
         };
         arena.path_bytes.pop();
         if fd < 0 {
-            return SizeAcc::default();
+            return None;
         }
         let mut acc = SizeAcc::default();
-        walk_openat_dfs(fd, 0, &mut arena, &mut acc);
+        let mut ancestors = [(0usize, 0usize); 16];
+        walk_openat_dfs(
+            fd,
+            0,
+            root_len,
+            &mut ancestors,
+            &mut scratch.buf,
+            arena,
+            &mut acc,
+        );
         unsafe { close(fd) };
-        acc
+        Some(acc)
     }
 
-    fn walk_parallel(dir: &Path, depth: u8) -> Option<SizeAcc> {
+    /// Serial `getattrlistbulk` DFS using a caller-owned scoped `BulkScratch`.
+    /// Intended for callers already parallelizing across multiple targets via Rayon (zero nested parallelism).
+    pub fn calculate_dir_size_bulk_serial(path: &Path, scratch: &mut BulkScratch) -> Option<u64> {
+        walk_subtree_dfs(path, scratch).map(SizeAcc::finalize)
+    }
+
+    /// Single-root parallel `getattrlistbulk` walker using the bounded worker pool and scoped scratch.
+    pub fn calculate_dir_size_bulk(path: &Path) -> Option<u64> {
+        let mut root_scratch = BulkScratch::new();
         let mut subdirs: Vec<PathBuf> = Vec::new();
-        let mut own = read_single_dir_bulk(dir, depth == 0, &mut subdirs)?;
+        let mut own = read_single_dir_bulk(path, true, &mut root_scratch, &mut subdirs)?;
         if subdirs.is_empty() {
-            return Some(own);
+            return Some(own.finalize());
         }
-        let children = if depth < 2 && subdirs.len() >= 2 {
+        if subdirs.len() < 2 {
+            for sub in &subdirs {
+                if let Some(sub_acc) = walk_subtree_dfs(sub, &mut root_scratch) {
+                    own.merge(sub_acc);
+                }
+            }
+            return Some(own.finalize());
+        }
+        drop(root_scratch);
+
+        let children = worker_pool().install(|| {
             subdirs
                 .into_par_iter()
-                .map(|sub| {
-                    if depth + 1 < 2 {
-                        walk_parallel(&sub, depth + 1).unwrap_or_default()
-                    } else {
-                        walk_subtree_dfs(&sub)
-                    }
+                .map_init(BulkScratch::new, |scratch, sub| {
+                    walk_subtree_dfs(&sub, scratch).unwrap_or_default()
                 })
                 .reduce(SizeAcc::default, |mut a, b| {
                     a.merge(b);
                     a
                 })
-        } else {
-            let mut acc = SizeAcc::default();
-            for sub in &subdirs {
-                acc.merge(walk_subtree_dfs(sub));
-            }
-            acc
-        };
+        });
         own.merge(children);
-        Some(own)
+        Some(own.finalize())
     }
+}
 
-    /// Walks a directory tree using macOS `getattrlistbulk` with lock-free Rayon parallel
-    /// fan-out at shallow depths and zero-allocation arena DFS below.
-    pub fn calculate_dir_size_bulk(path: &Path) -> Option<u64> {
-        let acc = walk_parallel(path, 0)?;
-        if acc.hardlinks.is_empty() {
-            return Some(acc.bytes);
-        }
-        let mut seen = HashSet::with_capacity(acc.hardlinks.len());
-        let mut total = acc.bytes;
-        for (obj_key, bytes) in acc.hardlinks {
-            if seen.insert(obj_key) {
-                total = total.saturating_add(bytes);
-            }
-        }
-        Some(total)
+#[cfg(target_os = "macos")]
+pub(crate) use macos_bulk::BulkScratch;
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct BulkScratch;
+
+#[cfg(not(target_os = "macos"))]
+impl BulkScratch {
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
@@ -750,6 +1028,34 @@ fn calculate_dir_size_fallback(path: &Path, seen_inodes: &mut HashSet<(u64, u64)
     total
 }
 
+/// Accurate physical disk size using a scoped `BulkScratch` (zero nested Rayon, zero permanent TLS).
+pub(crate) fn calculate_path_size_accurate_with_scratch(
+    path: &Path,
+    #[allow(unused_variables)] scratch: &mut BulkScratch,
+) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.is_file() {
+        let disk_bytes = meta.blocks().saturating_mul(512);
+        return if disk_bytes > 0 { disk_bytes } else { meta.len() };
+    }
+    if meta.is_dir() {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(size) = macos_bulk::calculate_dir_size_bulk_serial(path, scratch) {
+                return size;
+            }
+        }
+        let mut seen = HashSet::new();
+        return calculate_dir_size_fallback(path, &mut seen);
+    }
+    0
+}
+
 pub(crate) fn calculate_path_size_accurate(path: &Path) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return 0;
@@ -774,13 +1080,160 @@ pub(crate) fn calculate_path_size_accurate(path: &Path) -> u64 {
     0
 }
 
+// MARK: - Streaming JSON Ingestion Directly into Contiguous Byte Slab
+
+struct FormulaStreamSeed<'a> {
+    slab: &'a mut BrewCatalogSlab,
+    installed: &'a mut HashMap<String, BrewPackage>,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for FormulaStreamSeed<'a> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FormulaSeqVisitor<'a> {
+            slab: &'a mut BrewCatalogSlab,
+            installed: &'a mut HashMap<String, BrewPackage>,
+        }
+
+        impl<'de, 'a> Visitor<'de> for FormulaSeqVisitor<'a> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON array of Homebrew formulae")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut ver_buf = String::with_capacity(32);
+                while let Some(f) = seq.next_element::<ApiFormula>()? {
+                    let local = self.installed.remove(f.name.as_str());
+                    let api_stable = f.versions.and_then(|v| v.stable).unwrap_or_default();
+                    let api_full: &str = if f.revision > 0 && !api_stable.is_empty() {
+                        ver_buf.clear();
+                        ver_buf.push_str(&api_stable);
+                        ver_buf.push('_');
+                        use std::fmt::Write;
+                        let _ = write!(&mut ver_buf, "{}", f.revision);
+                        ver_buf.as_str()
+                    } else {
+                        api_stable.as_str()
+                    };
+
+                    let (local_ver, is_installed, is_outdated, is_pinned) =
+                        if let Some(loc) = local {
+                            let outdated = !loc.is_pinned
+                                && !loc.version.is_empty()
+                                && !api_full.is_empty()
+                                && cmp_versions_natural(api_full, &loc.version)
+                                    == Ordering::Greater;
+                            (Some(loc.version), true, outdated, loc.is_pinned)
+                        } else {
+                            (None, false, false, false)
+                        };
+
+                    self.slab.push_package(
+                        &f.name,
+                        f.desc.as_deref().unwrap_or(""),
+                        api_full,
+                        f.homepage.as_deref().unwrap_or(""),
+                        local_ver,
+                        false,
+                        is_installed,
+                        is_outdated,
+                        is_pinned,
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(FormulaSeqVisitor {
+            slab: self.slab,
+            installed: self.installed,
+        })
+    }
+}
+
+struct CaskStreamSeed<'a> {
+    slab: &'a mut BrewCatalogSlab,
+    installed: &'a mut HashMap<String, BrewPackage>,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for CaskStreamSeed<'a> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CaskSeqVisitor<'a> {
+            slab: &'a mut BrewCatalogSlab,
+            installed: &'a mut HashMap<String, BrewPackage>,
+        }
+
+        impl<'de, 'a> Visitor<'de> for CaskSeqVisitor<'a> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON array of Homebrew casks")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while let Some(c) = seq.next_element::<ApiCask>()? {
+                    let local = self.installed.remove(c.token.as_str());
+                    let api_ver = c.version.as_deref().unwrap_or("");
+
+                    let (local_ver, is_installed, is_outdated) = if let Some(loc) = local {
+                        let outdated = !loc.version.is_empty()
+                            && !api_ver.is_empty()
+                            && api_ver != "latest"
+                            && loc.version != "latest"
+                            && api_ver != loc.version
+                            && cmp_versions_natural(api_ver, &loc.version) == Ordering::Greater;
+                        (Some(loc.version), true, outdated)
+                    } else {
+                        (None, false, false)
+                    };
+
+                    self.slab.push_package(
+                        &c.token,
+                        c.desc.as_deref().unwrap_or(""),
+                        api_ver,
+                        c.homepage.as_deref().unwrap_or(""),
+                        local_ver,
+                        true,
+                        is_installed,
+                        is_outdated,
+                        false,
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(CaskSeqVisitor {
+            slab: self.slab,
+            installed: self.installed,
+        })
+    }
+}
+
 // MARK: - Homebrew Search Index & Direct Disk + API Merging
 
 #[no_mangle]
 pub extern "C" fn upkeep_brew_index_new() -> *mut BrewSearchIndex {
     let result = std::panic::catch_unwind(|| {
         Box::into_raw(Box::new(BrewSearchIndex {
-            packages: RwLock::new(Vec::new()),
+            slab: RwLock::new(BrewCatalogSlab::default()),
         }))
     });
     result.unwrap_or(std::ptr::null_mut())
@@ -793,13 +1246,31 @@ pub extern "C" fn upkeep_brew_index_free(ptr: *mut BrewSearchIndex) {
     }
 }
 
+/// Immediately evicts all indexed packages and releases slab buffers back to the allocator.
+#[no_mangle]
+pub extern "C" fn upkeep_brew_index_clear(ptr: *mut BrewSearchIndex) {
+    if ptr.is_null() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(|| {
+        let index = unsafe { &*ptr };
+        if let Ok(mut guard) = index.slab.write() {
+            *guard = BrewCatalogSlab::default();
+        }
+    });
+}
+
 #[no_mangle]
 pub extern "C" fn upkeep_brew_index_count(ptr: *const BrewSearchIndex) -> u32 {
     if ptr.is_null() {
         return 0;
     }
     let index = unsafe { &*ptr };
-    index.packages.read().map(|g| g.len() as u32).unwrap_or(0)
+    index
+        .slab
+        .read()
+        .map(|g| g.entries.len() as u32)
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -816,46 +1287,23 @@ pub extern "C" fn upkeep_brew_index_load_json(
         let Ok(parsed) = serde_json::from_str::<Vec<BrewPackage>>(json) else {
             return 0;
         };
-        let indexed: Vec<IndexedPackage> = parsed.into_iter().map(IndexedPackage::new).collect();
-        let count = indexed.len() as u32;
-        if let Ok(mut guard) = index.packages.write() {
-            *guard = indexed;
+        let mut slab = BrewCatalogSlab::with_capacity(parsed.len(), parsed.len() * 80);
+        for pkg in parsed {
+            slab.push_local_only(pkg);
+        }
+        slab.shrink_to_fit();
+        let count = slab.entries.len() as u32;
+        if let Ok(mut guard) = index.slab.write() {
+            *guard = slab;
         }
         count
     });
     result.unwrap_or(0)
 }
 
-fn load_api_slices_internal(
-    index: &BrewSearchIndex,
-    formulae_bytes: &[u8],
-    casks_bytes: &[u8],
-    prefix: &str,
-) -> u32 {
-    // Parse formulae JSON, casks JSON, and local Cellar/Caskroom disk state in parallel.
-    let ((formulae_res, casks_res), installed) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    if formulae_bytes.is_empty() {
-                        Vec::new()
-                    } else {
-                        serde_json::from_slice::<Vec<ApiFormula>>(formulae_bytes).unwrap_or_default()
-                    }
-                },
-                || {
-                    if casks_bytes.is_empty() {
-                        Vec::new()
-                    } else {
-                        serde_json::from_slice::<Vec<ApiCask>>(casks_bytes).unwrap_or_default()
-                    }
-                },
-            )
-        },
-        || scan_brew_dirs_internal(prefix),
-    );
-
-    // Split installed packages into separate formula/cask maps so lookups take `&str` with zero clones.
+fn split_installed_maps(
+    installed: Vec<BrewPackage>,
+) -> (HashMap<String, BrewPackage>, HashMap<String, BrewPackage>) {
     let mut installed_formulae: HashMap<String, BrewPackage> = HashMap::new();
     let mut installed_casks: HashMap<String, BrewPackage> = HashMap::new();
     for pkg in installed {
@@ -865,108 +1313,113 @@ fn load_api_slices_internal(
             installed_formulae.insert(pkg.name.clone(), pkg);
         }
     }
+    (installed_formulae, installed_casks)
+}
 
-    // Build formula and cask indexed vectors in parallel.
-    let ((mut merged_formulae, rem_formulae), (merged_casks, rem_casks)) = rayon::join(
-        || {
-            let mut out = Vec::with_capacity(formulae_res.len());
-            for f in formulae_res {
-                let local = installed_formulae.remove(f.name.as_str());
-                let api_stable = f.versions.and_then(|v| v.stable).unwrap_or_default();
-                let api_full_version = if f.revision > 0 && !api_stable.is_empty() {
-                    format!("{}_{}", api_stable, f.revision)
-                } else {
-                    api_stable
-                };
-
-                let stored_api_ver = api_full_version.clone();
-                let (version, is_installed, is_outdated, is_pinned) = if let Some(loc) = local {
-                    let outdated = !loc.is_pinned
-                        && !loc.version.is_empty()
-                        && !api_full_version.is_empty()
-                        && cmp_versions_natural(&api_full_version, &loc.version) == Ordering::Greater;
-                    let ver = if !loc.version.is_empty() {
-                        loc.version
-                    } else {
-                        api_full_version
-                    };
-                    (ver, true, outdated, loc.is_pinned)
-                } else {
-                    (api_full_version, false, false, false)
-                };
-
-                out.push(IndexedPackage::with_api_version(
-                    BrewPackage {
-                        name: f.name,
-                        description: f.desc.unwrap_or_default(),
-                        version,
-                        is_cask: false,
-                        is_installed,
-                        is_outdated,
-                        is_pinned,
-                        homepage: f.homepage.unwrap_or_default(),
-                    },
-                    stored_api_ver,
-                ));
-            }
-            (out, installed_formulae)
-        },
-        || {
-            let mut out = Vec::with_capacity(casks_res.len());
-            for c in casks_res {
-                let local = installed_casks.remove(c.token.as_str());
-                let api_version = c.version.unwrap_or_default();
-                let stored_api_ver = api_version.clone();
-
-                let (version, is_installed, is_outdated) = if let Some(loc) = local {
-                    let outdated = !loc.version.is_empty()
-                        && !api_version.is_empty()
-                        && api_version != "latest"
-                        && loc.version != "latest"
-                        && api_version != loc.version
-                        && cmp_versions_natural(&api_version, &loc.version) == Ordering::Greater;
-                    let ver = if !loc.version.is_empty() {
-                        loc.version
-                    } else {
-                        api_version
-                    };
-                    (ver, true, outdated)
-                } else {
-                    (api_version, false, false)
-                };
-
-                out.push(IndexedPackage::with_api_version(
-                    BrewPackage {
-                        name: c.token,
-                        description: c.desc.unwrap_or_default(),
-                        version,
-                        is_cask: true,
-                        is_installed,
-                        is_outdated,
-                        is_pinned: false,
-                        homepage: c.homepage.unwrap_or_default(),
-                    },
-                    stored_api_ver,
-                ));
-            }
-            (out, installed_casks)
-        },
-    );
-
-    merged_formulae.reserve(merged_casks.len() + rem_formulae.len() + rem_casks.len());
-    merged_formulae.extend(merged_casks);
-    for (_, pkg) in rem_formulae {
-        merged_formulae.push(IndexedPackage::new(pkg));
-    }
-    for (_, pkg) in rem_casks {
-        merged_formulae.push(IndexedPackage::new(pkg));
+fn load_api_readers_internal<R1: Read, R2: Read>(
+    index: &BrewSearchIndex,
+    formulae_reader: Option<R1>,
+    casks_reader: Option<R2>,
+    prefix: &str,
+) -> u32 {
+    // Release old slab before building the new one to prevent 2x steady-state peak RSS.
+    if let Ok(mut guard) = index.slab.write() {
+        *guard = BrewCatalogSlab::default();
     }
 
-    let count = merged_formulae.len() as u32;
-    if let Ok(mut guard) = index.packages.write() {
-        *guard = merged_formulae;
+    let installed = scan_brew_dirs_internal(prefix);
+    let (mut installed_formulae, mut installed_casks) = split_installed_maps(installed);
+
+    let mut slab = BrewCatalogSlab::with_capacity(16_000, 1_800_000);
+
+    if let Some(r1) = formulae_reader {
+        let mut de = serde_json::Deserializer::from_reader(r1);
+        let _ = FormulaStreamSeed {
+            slab: &mut slab,
+            installed: &mut installed_formulae,
+        }
+        .deserialize(&mut de);
+    }
+
+    if let Some(r2) = casks_reader {
+        let mut de = serde_json::Deserializer::from_reader(r2);
+        let _ = CaskStreamSeed {
+            slab: &mut slab,
+            installed: &mut installed_casks,
+        }
+        .deserialize(&mut de);
+    }
+
+    for (_, pkg) in installed_formulae {
+        slab.push_local_only(pkg);
+    }
+    for (_, pkg) in installed_casks {
+        slab.push_local_only(pkg);
+    }
+
+    slab.shrink_to_fit();
+    let count = slab.entries.len() as u32;
+    if let Ok(mut guard) = index.slab.write() {
+        *guard = slab;
     }
     count
+}
+
+fn load_api_slices_internal(
+    index: &BrewSearchIndex,
+    formulae_bytes: &[u8],
+    casks_bytes: &[u8],
+    prefix: &str,
+) -> u32 {
+    let r1 = if formulae_bytes.is_empty() {
+        None
+    } else {
+        Some(formulae_bytes)
+    };
+    let r2 = if casks_bytes.is_empty() {
+        None
+    } else {
+        Some(casks_bytes)
+    };
+    load_api_readers_internal(index, r1, r2, prefix)
+}
+
+/// Streams `formula.json` and `cask.json` directly from disk into the compact byte slab
+/// without ever holding raw 30 MB JSON buffers in Swift or Rust RAM.
+#[no_mangle]
+pub extern "C" fn upkeep_brew_index_load_api_files(
+    ptr: *mut BrewSearchIndex,
+    formulae_path_utf8: *const c_char,
+    casks_path_utf8: *const c_char,
+    prefix_utf8: *const c_char,
+) -> u32 {
+    let result = std::panic::catch_unwind(|| {
+        if ptr.is_null() {
+            return 0;
+        }
+        let index = unsafe { &*ptr };
+        let f_path = cstr_to_str(formulae_path_utf8);
+        let c_path = cstr_to_str(casks_path_utf8);
+        let prefix = cstr_to_str(prefix_utf8);
+
+        let f_reader = if f_path.is_empty() {
+            None
+        } else {
+            File::open(f_path)
+                .ok()
+                .map(|f| BufReader::with_capacity(64 * 1024, f))
+        };
+        let c_reader = if c_path.is_empty() {
+            None
+        } else {
+            File::open(c_path)
+                .ok()
+                .map(|f| BufReader::with_capacity(64 * 1024, f))
+        };
+
+        load_api_readers_internal(index, f_reader, c_reader, prefix)
+    });
+    result.unwrap_or(0)
 }
 
 /// Zero-copy raw byte slice loader for Homebrew `formula.json` and `cask.json`.
@@ -1046,23 +1499,23 @@ fn read_len_str<'a>(data: &'a [u8], cursor: &mut usize) -> Option<&'a str> {
 }
 
 fn save_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path) -> bool {
-    let Ok(guard) = index.packages.read() else {
+    let Ok(guard) = index.slab.read() else {
         return false;
     };
-    if guard.is_empty() {
+    if guard.entries.is_empty() {
         return false;
     }
-    let mut buf = Vec::with_capacity(guard.len() * 96);
+    let mut buf = Vec::with_capacity(guard.strings.len() + guard.entries.len() * 17 + 12);
     buf.extend_from_slice(BREW_CACHE_MAGIC);
     buf.extend_from_slice(&BREW_CACHE_VERSION.to_le_bytes());
-    buf.extend_from_slice(&(guard.len() as u32).to_le_bytes());
-    for item in guard.iter() {
-        let flags: u8 = if item.pkg.is_cask { 1 } else { 0 };
+    buf.extend_from_slice(&(guard.entries.len() as u32).to_le_bytes());
+    for entry in &guard.entries {
+        let flags: u8 = if entry.is_cask() { 1 } else { 0 };
         buf.push(flags);
-        write_len_str(&mut buf, &item.pkg.name);
-        write_len_str(&mut buf, &item.pkg.description);
-        write_len_str(&mut buf, &item.api_version);
-        write_len_str(&mut buf, &item.pkg.homepage);
+        write_len_str(&mut buf, guard.str_of(entry.name));
+        write_len_str(&mut buf, guard.str_of(entry.desc));
+        write_len_str(&mut buf, guard.str_of(entry.api_ver));
+        write_len_str(&mut buf, guard.str_of(entry.homepage));
     }
     if let Some(parent) = cache_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1075,7 +1528,9 @@ fn save_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path) -> boo
 }
 
 fn load_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path, prefix: &str) -> u32 {
-    let (raw_res, installed) = rayon::join(|| fs::read(cache_path), || scan_brew_dirs_internal(prefix));
+    let (raw_res, installed) = worker_pool().install(|| {
+        rayon::join(|| fs::read(cache_path), || scan_brew_dirs_internal(prefix))
+    });
     let Ok(data) = raw_res else {
         return 0;
     };
@@ -1089,17 +1544,10 @@ fn load_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path, prefix
     let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
     let mut cursor = 12usize;
 
-    let mut installed_formulae: HashMap<String, BrewPackage> = HashMap::new();
-    let mut installed_casks: HashMap<String, BrewPackage> = HashMap::new();
-    for pkg in installed {
-        if pkg.is_cask {
-            installed_casks.insert(pkg.name.clone(), pkg);
-        } else {
-            installed_formulae.insert(pkg.name.clone(), pkg);
-        }
-    }
+    let (mut installed_formulae, mut installed_casks) = split_installed_maps(installed);
 
-    let mut merged = Vec::with_capacity(count + 32);
+    let est_string_bytes = data.len().saturating_sub(count.saturating_mul(17));
+    let mut slab = BrewCatalogSlab::with_capacity(count + 32, est_string_bytes);
     for _ in 0..count {
         if cursor >= data.len() {
             return 0;
@@ -1126,7 +1574,7 @@ fn load_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path, prefix
             installed_formulae.remove(name_str)
         };
 
-        let (version_str, is_installed, is_outdated, is_pinned) = if let Some(loc) = local {
+        let (local_ver, is_installed, is_outdated, is_pinned) = if let Some(loc) = local {
             let outdated = if is_cask {
                 !loc.version.is_empty()
                     && !api_ver_str.is_empty()
@@ -1140,46 +1588,41 @@ fn load_binary_cache_internal(index: &BrewSearchIndex, cache_path: &Path, prefix
                     && !api_ver_str.is_empty()
                     && cmp_versions_natural(api_ver_str, &loc.version) == Ordering::Greater
             };
-            let ver = if !loc.version.is_empty() {
-                loc.version
-            } else {
-                api_ver_str.to_string()
-            };
-            (ver, true, outdated, loc.is_pinned)
+            (Some(loc.version), true, outdated, loc.is_pinned)
         } else {
-            (api_ver_str.to_string(), false, false, false)
+            (None, false, false, false)
         };
 
-        merged.push(IndexedPackage::with_api_version(
-            BrewPackage {
-                name: name_str.to_string(),
-                description: desc_str.to_string(),
-                version: version_str,
-                is_cask,
-                is_installed,
-                is_outdated,
-                is_pinned,
-                homepage: homepage_str.to_string(),
-            },
-            api_ver_str.to_string(),
-        ));
+        slab.push_package(
+            name_str,
+            desc_str,
+            api_ver_str,
+            homepage_str,
+            local_ver,
+            is_cask,
+            is_installed,
+            is_outdated,
+            is_pinned,
+        );
     }
 
     for (_, pkg) in installed_formulae {
-        merged.push(IndexedPackage::new(pkg));
+        slab.push_local_only(pkg);
     }
     for (_, pkg) in installed_casks {
-        merged.push(IndexedPackage::new(pkg));
+        slab.push_local_only(pkg);
     }
 
-    let loaded = merged.len() as u32;
-    if let Ok(mut guard) = index.packages.write() {
-        *guard = merged;
+    slab.shrink_to_fit();
+    let loaded = slab.entries.len() as u32;
+    if let Ok(mut guard) = index.slab.write() {
+        *guard = slab;
     }
     loaded
 }
 
-/// Loads a compact binary Homebrew catalog cache from disk (<5ms) and merges local Cellar/Caskroom state in parallel.
+/// Loads a compact binary Homebrew catalog cache from disk (<5ms) into the contiguous slab
+/// and merges local Cellar/Caskroom state in parallel.
 #[no_mangle]
 pub extern "C" fn upkeep_brew_index_load_binary_cache(
     ptr: *mut BrewSearchIndex,
@@ -1234,71 +1677,77 @@ pub extern "C" fn upkeep_brew_index_refresh_local(
         let index = unsafe { &*ptr };
         let prefix = cstr_to_str(prefix_utf8);
         let installed = scan_brew_dirs_internal(prefix);
-        let mut installed_formulae: HashMap<String, BrewPackage> = HashMap::new();
-        let mut installed_casks: HashMap<String, BrewPackage> = HashMap::new();
-        for pkg in installed {
-            if pkg.is_cask {
-                installed_casks.insert(pkg.name.clone(), pkg);
-            } else {
-                installed_formulae.insert(pkg.name.clone(), pkg);
-            }
-        }
+        let (mut installed_formulae, mut installed_casks) = split_installed_maps(installed);
 
-        let Ok(mut guard) = index.packages.write() else {
+        let Ok(mut guard) = index.slab.write() else {
             return 0;
         };
 
+        guard.local_versions.clear();
         let mut installed_count: u32 = 0;
-        for item in guard.iter_mut() {
-            let local = if item.pkg.is_cask {
-                installed_casks.remove(item.pkg.name.as_str())
-            } else {
-                installed_formulae.remove(item.pkg.name.as_str())
+        let len = guard.entries.len();
+
+        for i in 0..len {
+            let is_cask = guard.entries[i].is_cask();
+            let name_span = guard.entries[i].name;
+            let api_span = guard.entries[i].api_ver;
+
+            let local = {
+                let name = guard.str_of(name_span);
+                if is_cask {
+                    installed_casks.remove(name)
+                } else {
+                    installed_formulae.remove(name)
+                }
             };
+
             if let Some(loc) = local {
                 installed_count += 1;
-                item.pkg.is_installed = true;
-                item.pkg.is_pinned = loc.is_pinned;
-                if !loc.version.is_empty() {
-                    item.pkg.version = loc.version.clone();
-                }
-                if item.pkg.is_cask {
-                    item.pkg.is_outdated = !loc.version.is_empty()
-                        && !item.api_version.is_empty()
-                        && item.api_version != "latest"
+                let api_ver = guard.str_of(api_span);
+                let outdated = if is_cask {
+                    !loc.version.is_empty()
+                        && !api_ver.is_empty()
+                        && api_ver != "latest"
                         && loc.version != "latest"
-                        && item.api_version != loc.version
-                        && cmp_versions_natural(&item.api_version, &loc.version) == Ordering::Greater;
+                        && api_ver != loc.version
+                        && cmp_versions_natural(api_ver, &loc.version) == Ordering::Greater
                 } else {
-                    item.pkg.is_outdated = !loc.is_pinned
+                    !loc.is_pinned
                         && !loc.version.is_empty()
-                        && !item.api_version.is_empty()
-                        && cmp_versions_natural(&item.api_version, &loc.version) == Ordering::Greater;
+                        && !api_ver.is_empty()
+                        && cmp_versions_natural(api_ver, &loc.version) == Ordering::Greater
+                };
+                let mut flags = if is_cask { FLAG_CASK } else { 0 } | FLAG_INSTALLED;
+                if outdated {
+                    flags |= FLAG_OUTDATED;
+                }
+                if loc.is_pinned {
+                    flags |= FLAG_PINNED;
+                }
+                let diff_ver = !loc.version.is_empty() && loc.version != api_ver;
+                guard.entries[i].flags = flags;
+                if diff_ver {
+                    guard.local_versions.insert(i as u32, loc.version);
                 }
             } else {
-                item.pkg.is_installed = false;
-                item.pkg.is_pinned = false;
-                item.pkg.is_outdated = false;
-                if !item.api_version.is_empty() {
-                    item.pkg.version = item.api_version.clone();
-                }
+                guard.entries[i].flags = if is_cask { FLAG_CASK } else { 0 };
             }
         }
 
         for (_, pkg) in installed_formulae {
             installed_count += 1;
-            guard.push(IndexedPackage::new(pkg));
+            guard.push_local_only(pkg);
         }
         for (_, pkg) in installed_casks {
             installed_count += 1;
-            guard.push(IndexedPackage::new(pkg));
+            guard.push_local_only(pkg);
         }
         installed_count
     });
     result.unwrap_or(0)
 }
 
-/// Fast parallel native macOS user cache scanner using getattrlistbulk + Rayon (~50-150ms).
+/// Fast parallel native macOS user cache scanner using getattrlistbulk + bounded Rayon pool.
 #[no_mangle]
 pub extern "C" fn upkeep_scan_caches_json() -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
@@ -1314,7 +1763,11 @@ pub extern "C" fn upkeep_scan_caches_json() -> *mut c_char {
         if let Ok(entries) = fs::read_dir(&caches_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') || name.starts_with("com.apple.") || name == "CloudKit" || name == "Homebrew" {
+                if name.starts_with('.')
+                    || name.starts_with("com.apple.")
+                    || name == "CloudKit"
+                    || name == "Homebrew"
+                {
                     continue;
                 }
                 targets.push(("User App Caches", name, entry.path()));
@@ -1323,14 +1776,38 @@ pub extern "C" fn upkeep_scan_caches_json() -> *mut c_char {
 
         // 2. Developer & Package Manager Caches
         let dev_targets: [(&str, &str, PathBuf); 8] = [
-            ("Developer Tools", "Xcode DerivedData", home_path.join("Library/Developer/Xcode/DerivedData")),
-            ("Developer Tools", "Homebrew Download Cache", home_path.join("Library/Caches/Homebrew")),
+            (
+                "Developer Tools",
+                "Xcode DerivedData",
+                home_path.join("Library/Developer/Xcode/DerivedData"),
+            ),
+            (
+                "Developer Tools",
+                "Homebrew Download Cache",
+                home_path.join("Library/Caches/Homebrew"),
+            ),
             ("Developer Tools", "npm Cache", home_path.join(".npm/_cacache")),
             ("Developer Tools", "pip Cache", home_path.join(".cache/pip")),
-            ("Developer Tools", "Cargo Registry Cache", home_path.join(".cargo/registry/cache")),
-            ("Developer Tools", "Gradle Cache", home_path.join(".gradle/caches")),
-            ("Developer Tools", "Yarn Cache", home_path.join("Library/Caches/Yarn")),
-            ("Developer Tools", "pnpm Store Cache", home_path.join("Library/Caches/pnpm")),
+            (
+                "Developer Tools",
+                "Cargo Registry Cache",
+                home_path.join(".cargo/registry/cache"),
+            ),
+            (
+                "Developer Tools",
+                "Gradle Cache",
+                home_path.join(".gradle/caches"),
+            ),
+            (
+                "Developer Tools",
+                "Yarn Cache",
+                home_path.join("Library/Caches/Yarn"),
+            ),
+            (
+                "Developer Tools",
+                "pnpm Store Cache",
+                home_path.join("Library/Caches/pnpm"),
+            ),
         ];
         for (cat, name, p) in dev_targets {
             if p.exists() {
@@ -1349,26 +1826,32 @@ pub extern "C" fn upkeep_scan_caches_json() -> *mut c_char {
             }
         }
 
-        let mut items: Vec<CacheScanItem> = targets
-            .into_par_iter()
-            .filter_map(|(cat, name, p)| {
-                let size = calculate_path_size_accurate(&p);
-                if size < 4096 {
-                    return None;
-                }
-                Some(CacheScanItem {
-                    category: cat.to_string(),
-                    name,
-                    path: p.to_string_lossy().into_owned(),
-                    size_bytes: size,
+        let mut items: Vec<CacheScanItem> = worker_pool().install(|| {
+            targets
+                .into_par_iter()
+                .map_init(BulkScratch::new, |scratch, (cat, name, p)| {
+                    let size = calculate_path_size_accurate_with_scratch(&p, scratch);
+                    if size < 4096 {
+                        return None;
+                    }
+                    Some(CacheScanItem {
+                        category: cat.to_string(),
+                        name,
+                        path: p.to_string_lossy().into_owned(),
+                        size_bytes: size,
+                    })
                 })
-            })
-            .collect();
+                .flatten()
+                .collect()
+        });
 
         items.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
         let total_bytes: u64 = items.iter().map(|i| i.size_bytes).sum();
         let payload = CacheScanPayload { total_bytes, items };
-        string_to_cstr(serde_json::to_string(&payload).unwrap_or_else(|_| "{\"total_bytes\":0,\"items\":[]}".into()))
+        string_to_cstr(
+            serde_json::to_string(&payload)
+                .unwrap_or_else(|_| "{\"total_bytes\":0,\"items\":[]}".into()),
+        )
     });
     result.unwrap_or_else(|_| string_to_cstr("{\"total_bytes\":0,\"items\":[]}".to_string()))
 }
@@ -1381,23 +1864,26 @@ pub extern "C" fn upkeep_brew_index_installed_json(ptr: *const BrewSearchIndex) 
             return string_to_cstr("[]".to_string());
         }
         let index = unsafe { &*ptr };
-        let Ok(guard) = index.packages.read() else {
+        let Ok(guard) = index.slab.read() else {
             return string_to_cstr("[]".to_string());
         };
-        let mut installed: Vec<&BrewPackage> = guard
+        let mut installed: Vec<BrewPackageRef<'_>> = guard
+            .entries
             .iter()
-            .filter(|item| item.pkg.is_installed)
-            .map(|item| &item.pkg)
+            .enumerate()
+            .filter(|(_, e)| e.is_installed())
+            .map(|(idx, _)| guard.as_wire_ref(idx))
             .collect();
-        installed.sort_unstable_by(|a, b| cmp_ignore_ascii_case(&a.name, &b.name));
+        installed.sort_unstable_by(|a, b| cmp_ignore_ascii_case(a.name, b.name));
         string_to_cstr(serde_json::to_string(&installed).unwrap_or_else(|_| "[]".into()))
     });
     result.unwrap_or_else(|_| string_to_cstr("[]".to_string()))
 }
 
 #[inline]
-fn score_indexed_package(
-    item: &IndexedPackage,
+fn score_slab_package(
+    slab: &BrewCatalogSlab,
+    entry: &SlabPackage,
     query_lower: &str,
     q_bytes: &[u8],
     pattern: &Pattern,
@@ -1405,23 +1891,24 @@ fn score_indexed_package(
     char_buf: &mut Vec<char>,
     skip_description: bool,
 ) -> Option<u32> {
-    let installed_bonus: u32 = if item.pkg.is_installed { 180 } else { 0 };
+    let installed_bonus: u32 = if entry.is_installed() { 180 } else { 0 };
+    let name = slab.str_of(entry.name);
 
     // Tier 1: Exact name match
-    if item.name_lower == query_lower {
+    if name.eq_ignore_ascii_case(query_lower) {
         return Some(200_000 + installed_bonus);
     }
 
     // Tier 2: Prefix name match (prefer shorter, closer names)
-    if item.name_lower.starts_with(query_lower) {
-        let extra = (item.name_lower.len().saturating_sub(query_lower.len()) as u32).min(4_000);
+    if starts_with_ignore_ascii_case(name, query_lower) {
+        let extra = (name.len().saturating_sub(query_lower.len()) as u32).min(4_000);
         return Some(120_000 - extra * 10 + installed_bonus);
     }
 
-    // Tier 3: Substring name match (prefer earlier position & word boundary)
-    if let Some(pos) = item.name_lower.find(query_lower) {
+    // Tier 3: Substring name match (SIMD memchr2, zero allocs)
+    if let Some(pos) = find_ascii_case_insensitive(name.as_bytes(), q_bytes) {
         let boundary_bonus: u32 = if pos > 0 {
-            let prev = item.name_lower.as_bytes()[pos - 1];
+            let prev = name.as_bytes()[pos - 1];
             if prev == b'-' || prev == b'_' || prev == b'@' || prev == b'/' || prev == b'.' {
                 5_000
             } else {
@@ -1431,15 +1918,20 @@ fn score_indexed_package(
             5_000
         };
         let pos_penalty = (pos as u32).min(500) * 40;
-        let len_penalty = (item.name_lower.len().saturating_sub(query_lower.len()) as u32).min(500) * 15;
+        let len_penalty = (name.len().saturating_sub(query_lower.len()) as u32).min(500) * 15;
         return Some(75_000 + boundary_bonus - pos_penalty - len_penalty + installed_bonus);
     }
 
     // Tier 4: Fuzzy name match (zero-copy Utf32Str for ASCII package names)
     char_buf.clear();
-    if let Some(name_score) = pattern.score(Utf32Str::new(&item.pkg.name, char_buf), matcher) {
-        let len_penalty = (item.name_lower.len() as u32).min(200) * 10;
-        return Some(25_000u32.saturating_add(name_score).saturating_sub(len_penalty) + installed_bonus);
+    if let Some(name_score) = pattern.score(Utf32Str::new(name, char_buf), matcher) {
+        let len_penalty = (name.len() as u32).min(200) * 10;
+        return Some(
+            25_000u32
+                .saturating_add(name_score)
+                .saturating_sub(len_penalty)
+                + installed_bonus,
+        );
     }
 
     // Short-circuit Tier 5 description scan when top-K name matches are already full.
@@ -1447,20 +1939,20 @@ fn score_indexed_package(
         return None;
     }
 
-    // Tier 5: Description match — require exact substring match for short queries (< 4 chars)
-    // or strong word/substring presence so scattered letters never pollute top results
-    if !item.pkg.description.is_empty() {
-        let desc_bytes = item.pkg.description.as_bytes();
+    // Tier 5: Description match
+    let desc = slab.str_of(entry.desc);
+    if !desc.is_empty() {
+        let desc_bytes = desc.as_bytes();
         if contains_ascii_case_insensitive(desc_bytes, q_bytes) {
             char_buf.clear();
             let desc_score = pattern
-                .score(Utf32Str::new(&item.pkg.description, char_buf), matcher)
+                .score(Utf32Str::new(desc, char_buf), matcher)
                 .unwrap_or(100);
             return Some(8_000u32.saturating_add(desc_score) + installed_bonus);
         }
         if query_lower.len() >= 4 {
             char_buf.clear();
-            if let Some(desc_score) = pattern.score(Utf32Str::new(&item.pkg.description, char_buf), matcher) {
+            if let Some(desc_score) = pattern.score(Utf32Str::new(desc, char_buf), matcher) {
                 if desc_score >= (query_lower.len() as u32) * 28 {
                     return Some(desc_score.min(4_000) + installed_bonus);
                 }
@@ -1472,27 +1964,28 @@ fn score_indexed_package(
 }
 
 fn parallel_score_indices(
-    items: &[IndexedPackage],
+    slab: &BrewCatalogSlab,
     query: &str,
     filter_mode: i32,
     limit: usize,
     installed_only: bool,
 ) -> Vec<(u32, u32)> {
-    let matches_filter = |p: &BrewPackage| {
-        (!installed_only || p.is_installed)
+    let entries = &slab.entries;
+    let matches_filter = |e: &SlabPackage| {
+        (!installed_only || e.is_installed())
             && match filter_mode {
-                0 => !p.is_cask,
-                1 => p.is_cask,
+                0 => !e.is_cask(),
+                1 => e.is_cask(),
                 _ => true,
             }
     };
 
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return items
+        return entries
             .iter()
             .enumerate()
-            .filter(|(_, item)| matches_filter(&item.pkg))
+            .filter(|(_, e)| matches_filter(e))
             .take(limit)
             .map(|(idx, _)| (1u32, idx as u32))
             .collect();
@@ -1502,76 +1995,77 @@ fn parallel_score_indices(
     let q_bytes = query_lower.as_bytes();
     let pattern = Pattern::parse(trimmed, CaseMatching::Smart, Normalization::Smart);
 
-    // Avoid Rayon thread-pool wakeup overhead for small local catalogs (< 1024 items).
-    let mut scored: Vec<(u32, u32)> = if items.len() < 1024 {
-        TL_MATCHER.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let (matcher, char_buf) = &mut *guard;
-            let mut high_tier_count = 0usize;
-            let mut local = Vec::new();
-            for (idx, item) in items.iter().enumerate() {
-                if !matches_filter(&item.pkg) {
-                    continue;
-                }
-                let skip_desc = limit > 0 && high_tier_count >= limit;
-                if let Some(score) = score_indexed_package(
-                    item,
-                    &query_lower,
-                    q_bytes,
-                    &pattern,
-                    matcher,
-                    char_buf,
-                    skip_desc,
-                ) {
-                    if score >= 25_000 {
-                        high_tier_count += 1;
-                    }
-                    local.push((score, idx as u32));
-                }
+    // Avoid Rayon wakeup overhead for small catalogs or installed-only scans.
+    let mut scored: Vec<(u32, u32)> = if entries.len() < 1024 || installed_only {
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut char_buf = Vec::with_capacity(256);
+        let mut high_tier_count = 0usize;
+        let mut local = Vec::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            if !matches_filter(entry) {
+                continue;
             }
-            local
-        })
+            let skip_desc = limit > 0 && high_tier_count >= limit;
+            if let Some(score) = score_slab_package(
+                slab,
+                entry,
+                &query_lower,
+                q_bytes,
+                &pattern,
+                &mut matcher,
+                &mut char_buf,
+                skip_desc,
+            ) {
+                if score >= 25_000 {
+                    high_tier_count += 1;
+                }
+                local.push((score, idx as u32));
+            }
+        }
+        local
     } else {
-        // Chunked parallel scan reusing thread-local Matcher + scratch buffer with per-chunk top-K pruning.
-        const CHUNK_SIZE: usize = 512;
-        let chunk_results: Vec<Vec<(u32, u32)>> = items
-            .par_chunks(CHUNK_SIZE)
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let base_idx = chunk_idx * CHUNK_SIZE;
-                TL_MATCHER.with(|cell| {
-                    let mut guard = cell.borrow_mut();
-                    let (matcher, char_buf) = &mut *guard;
-                    let mut high_tier_count = 0usize;
-                    let mut local = Vec::new();
-                    for (offset, item) in chunk.iter().enumerate() {
-                        if !matches_filter(&item.pkg) {
-                            continue;
-                        }
-                        let skip_desc = limit > 0 && high_tier_count >= limit;
-                        if let Some(score) = score_indexed_package(
-                            item,
-                            &query_lower,
-                            q_bytes,
-                            &pattern,
-                            matcher,
-                            char_buf,
-                            skip_desc,
-                        ) {
-                            if score >= 25_000 {
-                                high_tier_count += 1;
+        // Chunked parallel scan on bounded worker pool with scoped Matcher (freed immediately after search).
+        const CHUNK_SIZE: usize = 1024;
+        let chunk_results: Vec<Vec<(u32, u32)>> = worker_pool().install(|| {
+            entries
+                .par_chunks(CHUNK_SIZE)
+                .enumerate()
+                .map_init(
+                    || (Matcher::new(Config::DEFAULT), Vec::with_capacity(256)),
+                    |(matcher, char_buf), (chunk_idx, chunk)| {
+                        let base_idx = chunk_idx * CHUNK_SIZE;
+                        let mut high_tier_count = 0usize;
+                        let mut local = Vec::new();
+                        for (offset, entry) in chunk.iter().enumerate() {
+                            if !matches_filter(entry) {
+                                continue;
                             }
-                            local.push((score, (base_idx + offset) as u32));
+                            let skip_desc = limit > 0 && high_tier_count >= limit;
+                            if let Some(score) = score_slab_package(
+                                slab,
+                                entry,
+                                &query_lower,
+                                q_bytes,
+                                &pattern,
+                                matcher,
+                                char_buf,
+                                skip_desc,
+                            ) {
+                                if score >= 25_000 {
+                                    high_tier_count += 1;
+                                }
+                                local.push((score, (base_idx + offset) as u32));
+                            }
                         }
-                    }
-                    if limit > 0 && local.len() > limit {
-                        local.select_nth_unstable_by(limit, |a, b| b.0.cmp(&a.0));
-                        local.truncate(limit);
-                    }
-                    local
-                })
-            })
-            .collect();
+                        if limit > 0 && local.len() > limit {
+                            local.select_nth_unstable_by(limit, |a, b| b.0.cmp(&a.0));
+                            local.truncate(limit);
+                        }
+                        local
+                    },
+                )
+                .collect()
+        });
         let total_len: usize = chunk_results.iter().map(Vec::len).sum();
         let mut merged = Vec::with_capacity(total_len);
         for chunk in chunk_results {
@@ -1586,7 +2080,10 @@ fn parallel_score_indices(
     }
     scored.sort_unstable_by(|a, b| {
         b.0.cmp(&a.0).then_with(|| {
-            cmp_ignore_ascii_case(&items[a.1 as usize].pkg.name, &items[b.1 as usize].pkg.name)
+            cmp_ignore_ascii_case(
+                slab.str_of(entries[a.1 as usize].name),
+                slab.str_of(entries[b.1 as usize].name),
+            )
         })
     });
     scored
@@ -1606,14 +2103,15 @@ pub extern "C" fn upkeep_brew_index_search_scoped_json(
         }
         let index = unsafe { &*ptr };
         let query = cstr_to_str(query_utf8);
-        let Ok(guard) = index.packages.read() else {
+        let Ok(guard) = index.slab.read() else {
             return string_to_cstr("[]".to_string());
         };
 
-        let top_indices = parallel_score_indices(&guard, query, filter_mode, limit as usize, installed_only);
-        let top: Vec<&BrewPackage> = top_indices
+        let top_indices =
+            parallel_score_indices(&guard, query, filter_mode, limit as usize, installed_only);
+        let top: Vec<BrewPackageRef<'_>> = top_indices
             .into_iter()
-            .map(|(_, idx)| &guard[idx as usize].pkg)
+            .map(|(_, idx)| guard.as_wire_ref(idx as usize))
             .collect();
         string_to_cstr(serde_json::to_string(&top).unwrap_or_else(|_| "[]".into()))
     });
@@ -1645,7 +2143,7 @@ pub extern "C" fn upkeep_brew_index_search_fast(
         }
         let index = unsafe { &*ptr };
         let query = cstr_to_str(query_utf8);
-        let Ok(guard) = index.packages.read() else {
+        let Ok(guard) = index.slab.read() else {
             return 0;
         };
 
@@ -1674,7 +2172,7 @@ pub extern "C" fn upkeep_fuzzy_score(
         }
         let candidate = cstr_to_str(candidate_utf8);
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-        TL_MATCHER.with(|cell| {
+        TL_SINGLE_MATCHER.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (matcher, buf) = &mut *guard;
             buf.clear();
@@ -1771,8 +2269,7 @@ pub(crate) fn read_bundle_id(app_path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Reads `CFBundleName` and `CFBundleDisplayName` from `Contents/Info.plist` so apps whose
-/// filename includes a version or channel (e.g. `Alfred 4.app` -> `Alfred`) match their data folders.
+/// Reads `CFBundleName` and `CFBundleDisplayName` from `Contents/Info.plist`.
 fn read_bundle_names(app_path: &Path) -> Vec<String> {
     let plist_path = app_path.join("Contents").join("Info.plist");
     let Ok(bytes) = fs::read(&plist_path) else {
@@ -1882,19 +2379,21 @@ pub extern "C" fn upkeep_scan_applications_metadata(
             return 0;
         }
         let app_paths = collect_app_paths();
-        let mut records: Vec<(String, String, String, u64)> = app_paths
-            .par_iter()
-            .map(|path| {
-                let name = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                let bundle_id = read_bundle_id(path);
-                let path_str = path.to_string_lossy().into_owned();
-                (name, bundle_id, path_str, 0u64)
-            })
-            .collect();
+        let mut records: Vec<(String, String, String, u64)> = worker_pool().install(|| {
+            app_paths
+                .par_iter()
+                .map(|path| {
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    let bundle_id = read_bundle_id(path);
+                    let path_str = path.to_string_lossy().into_owned();
+                    (name, bundle_id, path_str, 0u64)
+                })
+                .collect()
+        });
 
         records.sort_unstable_by(|a, b| cmp_ignore_ascii_case(&a.0, &b.0));
         write_app_records(records, out_apps, capacity)
@@ -1903,7 +2402,7 @@ pub extern "C" fn upkeep_scan_applications_metadata(
 }
 
 /// Full multi-threaded parallel scanner of /Applications and ~/Applications using
-/// Rayon + macOS `getattrlistbulk` for APFS-accurate sizes.
+/// bounded Rayon pool + scoped serial `getattrlistbulk` per app (zero nested Rayon).
 #[no_mangle]
 pub extern "C" fn upkeep_scan_applications(
     out_apps: *mut UpkeepAppRecord,
@@ -1914,20 +2413,22 @@ pub extern "C" fn upkeep_scan_applications(
             return 0;
         }
         let app_paths = collect_app_paths();
-        let mut records: Vec<(String, String, String, u64)> = app_paths
-            .par_iter()
-            .map(|path| {
-                let name = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                let bundle_id = read_bundle_id(path);
-                let path_str = path.to_string_lossy().into_owned();
-                let size = calculate_path_size_accurate(path);
-                (name, bundle_id, path_str, size)
-            })
-            .collect();
+        let mut records: Vec<(String, String, String, u64)> = worker_pool().install(|| {
+            app_paths
+                .par_iter()
+                .map_init(BulkScratch::new, |scratch, path| {
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    let bundle_id = read_bundle_id(path);
+                    let path_str = path.to_string_lossy().into_owned();
+                    let size = calculate_path_size_accurate_with_scratch(path, scratch);
+                    (name, bundle_id, path_str, size)
+                })
+                .collect()
+        });
 
         records.sort_unstable_by(|a, b| cmp_ignore_ascii_case(&a.0, &b.0));
         write_app_records(records, out_apps, capacity)
@@ -2032,19 +2533,33 @@ const HOLDBACK_DATA_LIBRARY_NAMES: &[&str] = &[
 ];
 
 fn is_common_generic_name(name: &str) -> bool {
-    let lower = name.trim().to_ascii_lowercase();
-    lower.len() < 3 || COMMON_APP_NAMES.contains(&lower.as_str())
+    let trimmed = name.trim();
+    if trimmed.len() < 3 {
+        return true;
+    }
+    COMMON_APP_NAMES
+        .iter()
+        .any(|c| trimmed.eq_ignore_ascii_case(c))
 }
 
+/// Zero-allocation channel/version suffix stripper (eliminates 60 `format!()` allocs per call).
 fn strip_channel_suffix(name: &str) -> Option<String> {
     let trimmed = name.trim();
-    let lower = trimmed.to_ascii_lowercase();
+    let bytes = trimmed.as_bytes();
 
     for suffix in CHANNEL_SUFFIXES {
+        let sb = suffix.as_bytes();
+        if bytes.len() <= sb.len() {
+            continue;
+        }
+        let tail_start = bytes.len() - sb.len();
+        if !bytes[tail_start..].eq_ignore_ascii_case(sb) {
+            continue;
+        }
+        let head = &trimmed[..tail_start];
         for sep in [" - ", " ", "-", "_"] {
-            let pattern = format!("{}{}", sep, suffix);
-            if lower.ends_with(&pattern) {
-                let base = trimmed[..trimmed.len() - pattern.len()].trim();
+            if let Some(base) = head.strip_suffix(sep) {
+                let base = base.trim();
                 if base.len() >= 3 {
                     return Some(base.to_string());
                 }
@@ -2103,9 +2618,8 @@ fn collect_name_variants(name: &str, out: &mut Vec<String>) {
 }
 
 fn detect_official_uninstaller_vendor(bundle_id: &str) -> Option<String> {
-    let lower = bundle_id.to_ascii_lowercase();
     for (prefix, vendor) in OFFICIAL_UNINSTALLER_RULES {
-        if lower.starts_with(prefix) {
+        if starts_with_ignore_ascii_case(bundle_id, prefix) {
             return Some((*vendor).to_string());
         }
     }
@@ -2129,39 +2643,21 @@ fn is_uuid_dir_name(s: &str) -> bool {
 /// matches `<bid>`, `<bid>.*`, `group.<bid>`, `<TeamID>.<bid>`, `<TeamID>.<bid>.*`.
 fn matches_bundle_id_dir(fname_lower: &str, bundle_ids_lower: &[String]) -> bool {
     bundle_ids_lower.iter().any(|b| {
-        if fname_lower == b {
-            return true;
-        }
-        if fname_lower.len() > b.len()
-            && fname_lower.starts_with(b.as_str())
-            && fname_lower.as_bytes()[b.len()] == b'.'
-        {
+        if eq_or_starts_with_sep(fname_lower, b, b'.') {
             return true;
         }
         if let Some(rest) = fname_lower.strip_prefix("group.") {
-            if rest == b
-                || (rest.len() > b.len()
-                    && rest.starts_with(b.as_str())
-                    && rest.as_bytes()[b.len()] == b'.')
-            {
+            if eq_or_starts_with_sep(rest, b, b'.') {
                 return true;
             }
         }
         if let Some((prefix, rest)) = fname_lower.split_once('.') {
             if prefix.len() == 10 && prefix.bytes().all(|c| c.is_ascii_alphanumeric()) {
-                if rest == b
-                    || (rest.len() > b.len()
-                        && rest.starts_with(b.as_str())
-                        && rest.as_bytes()[b.len()] == b'.')
-                {
+                if eq_or_starts_with_sep(rest, b, b'.') {
                     return true;
                 }
                 if let Some(grest) = rest.strip_prefix("group.") {
-                    if grest == b
-                        || (grest.len() > b.len()
-                            && grest.starts_with(b.as_str())
-                            && grest.as_bytes()[b.len()] == b'.')
-                    {
+                    if eq_or_starts_with_sep(grest, b, b'.') {
                         return true;
                     }
                 }
@@ -2173,7 +2669,8 @@ fn matches_bundle_id_dir(fname_lower: &str, bundle_ids_lower: &[String]) -> bool
 
 fn detect_sibling_app(app_name: &str, bundle_id: &str, app_path: &str) -> bool {
     let target_path = Path::new(app_path);
-    let target_canonical = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let target_canonical =
+        fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let target_base = strip_channel_suffix(app_name)
         .unwrap_or_else(|| app_name.to_string())
         .to_ascii_lowercase();
@@ -2186,36 +2683,40 @@ fn detect_sibling_app(app_name: &str, bundle_id: &str, app_path: &str) -> bool {
         strip_channel_suffix(&target_bid_lower).unwrap_or_else(|| target_bid_lower.clone());
 
     let app_paths = collect_app_paths();
-    app_paths.par_iter().any(|other_path| {
-        if other_path.as_path() == target_path {
-            return false;
-        }
-        let other_name = other_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let other_base = strip_channel_suffix(&other_name)
-            .unwrap_or_else(|| other_name.clone())
-            .to_ascii_lowercase();
+    worker_pool().install(|| {
+        app_paths.par_iter().any(|other_path| {
+            if other_path.as_path() == target_path {
+                return false;
+            }
+            let other_name = other_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let other_base = strip_channel_suffix(&other_name)
+                .unwrap_or_else(|| other_name.clone())
+                .to_ascii_lowercase();
 
-        if other_base == target_base {
-            let other_canonical = fs::canonicalize(other_path).unwrap_or_else(|_| other_path.clone());
-            return other_canonical != target_canonical;
-        }
+            if other_base == target_base {
+                let other_canonical =
+                    fs::canonicalize(other_path).unwrap_or_else(|_| other_path.clone());
+                return other_canonical != target_canonical;
+            }
 
-        if !target_bid_base.is_empty() {
-            let other_bid = read_bundle_id(other_path).to_ascii_lowercase();
-            if !other_bid.is_empty() && other_bid != target_bid_lower {
-                let other_bid_base =
-                    strip_channel_suffix(&other_bid).unwrap_or_else(|| other_bid.clone());
-                if other_bid_base == target_bid_base {
-                    let other_canonical = fs::canonicalize(other_path).unwrap_or_else(|_| other_path.clone());
-                    return other_canonical != target_canonical;
+            if !target_bid_base.is_empty() {
+                let other_bid = read_bundle_id(other_path).to_ascii_lowercase();
+                if !other_bid.is_empty() && other_bid != target_bid_lower {
+                    let other_bid_base =
+                        strip_channel_suffix(&other_bid).unwrap_or_else(|| other_bid.clone());
+                    if other_bid_base == target_bid_base {
+                        let other_canonical =
+                            fs::canonicalize(other_path).unwrap_or_else(|_| other_path.clone());
+                        return other_canonical != target_canonical;
+                    }
                 }
             }
-        }
-        false
+            false
+        })
     })
 }
 
@@ -2310,20 +2811,16 @@ fn evaluate_holdback(path_str: &str, home: &str, is_system: bool) -> (bool, Opti
     if rel.starts_with("/library/group containers/") {
         return (false, Some("App Group container".to_string()));
     }
-    if rel == "/library/caches/com.raycast.macos"
-        || rel.starts_with("/library/caches/com.raycast.macos/")
-    {
+    if eq_or_starts_with_sep(rel, "/library/caches/com.raycast.macos", b'/') {
         return (false, Some("Raycast clipboard history".to_string()));
     }
-    if rel == "/library/caches/mullvadbrowser"
-        || rel.starts_with("/library/caches/mullvadbrowser/")
-    {
+    if eq_or_starts_with_sep(rel, "/library/caches/mullvadbrowser", b'/') {
         return (false, Some("Browser profile".to_string()));
     }
-    if rel == "/library/caches/buzz" || rel.starts_with("/library/caches/buzz/") {
+    if eq_or_starts_with_sep(rel, "/library/caches/buzz", b'/') {
         return (false, Some("Whisper models & plugins".to_string()));
     }
-    if rel == "/library/caches/llama.cpp" || rel.starts_with("/library/caches/llama.cpp/") {
+    if eq_or_starts_with_sep(rel, "/library/caches/llama.cpp", b'/') {
         return (false, Some("Downloaded LLM models".to_string()));
     }
     if rel.starts_with("/library/containers/com.isaacmarovitz.whisky")
@@ -2332,16 +2829,16 @@ fn evaluate_holdback(path_str: &str, home: &str, is_system: bool) -> (bool, Opti
         return (false, Some("VM / Game library".to_string()));
     }
     if let Some(app_sup_rel) = rel.strip_prefix("/library/application support/") {
-        if app_sup_rel == "spotify" || app_sup_rel.starts_with("spotify/") {
+        if eq_or_starts_with_sep(app_sup_rel, "spotify", b'/') {
             return (false, Some("Offline music & settings".to_string()));
         }
         for browser in HOLDBACK_BROWSER_PREFIXES {
-            if app_sup_rel == *browser || app_sup_rel.starts_with(&format!("{}/", browser)) {
+            if eq_or_starts_with_sep(app_sup_rel, browser, b'/') {
                 return (false, Some("Browser profile".to_string()));
             }
         }
         for lib_name in HOLDBACK_DATA_LIBRARY_NAMES {
-            if app_sup_rel == *lib_name || app_sup_rel.starts_with(&format!("{}/", lib_name)) {
+            if eq_or_starts_with_sep(app_sup_rel, lib_name, b'/') {
                 return (false, Some("VM / Game library".to_string()));
             }
         }
@@ -2369,10 +2866,7 @@ fn launch_plist_owned_by_app(plist_path: &Path, bundle_ids: &[String], app_path:
     if !app_path.is_empty() {
         let app_trimmed = app_path.trim_end_matches('/');
         let matches_app_path = |p: &str| {
-            p == app_path
-                || (p.len() > app_trimmed.len()
-                    && p.as_bytes()[app_trimmed.len()] == b'/'
-                    && p.starts_with(app_trimmed))
+            p == app_path || starts_with_sep(p, app_trimmed, b'/')
         };
         if let Some(prog) = parsed.program.as_deref() {
             if matches_app_path(prog) {
@@ -2471,36 +2965,39 @@ fn find_installed_cask_parallel(app_name: &str, app_path: &str, prefix: &str) ->
     let needle_bytes = app_bundle_name.as_bytes();
     let normalized_app = normalize_token(app_name);
 
-    // Phase 1: direct app bundle match or .metadata byte search in parallel
-    let direct_match = tokens.par_iter().find_map_any(|token| {
-        let token_dir = caskroom.join(token);
-        if let Ok(versions) = fs::read_dir(&token_dir) {
-            for entry in versions.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with('.') {
-                    continue;
-                }
-                if entry.path().join(&app_bundle_name).exists() {
-                    return Some(token.clone());
+    // Phase 1: direct app bundle match or .metadata byte search on bounded worker pool
+    let direct_match = worker_pool().install(|| {
+        tokens.par_iter().find_map_any(|token| {
+            let token_dir = caskroom.join(token);
+            if let Ok(versions) = fs::read_dir(&token_dir) {
+                for entry in versions.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    if entry.path().join(&app_bundle_name).exists() {
+                        return Some(token.clone());
+                    }
                 }
             }
-        }
 
-        if !needle_bytes.is_empty() {
-            let meta_dir = token_dir.join(".metadata");
-            if meta_dir.exists() {
-                let mut stack = vec![meta_dir];
-                while let Some(dir) = stack.pop() {
-                    if let Ok(meta_entries) = fs::read_dir(dir) {
-                        for entry in meta_entries.flatten() {
-                            let p = entry.path();
-                            if p.is_dir() {
-                                stack.push(p);
-                            } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                                if ext == "rb" || ext == "json" {
-                                    if let Ok(bytes) = fs::read(&p) {
-                                        if contains_ascii_case_insensitive(&bytes, needle_bytes) {
-                                            return Some(token.clone());
+            if !needle_bytes.is_empty() {
+                let meta_dir = token_dir.join(".metadata");
+                if meta_dir.exists() {
+                    let mut stack = vec![meta_dir];
+                    while let Some(dir) = stack.pop() {
+                        if let Ok(meta_entries) = fs::read_dir(dir) {
+                            for entry in meta_entries.flatten() {
+                                let p = entry.path();
+                                if p.is_dir() {
+                                    stack.push(p);
+                                } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                                    if ext == "rb" || ext == "json" {
+                                        if let Ok(bytes) = fs::read(&p) {
+                                            if contains_ascii_case_insensitive(&bytes, needle_bytes)
+                                            {
+                                                return Some(token.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -2509,8 +3006,8 @@ fn find_installed_cask_parallel(app_name: &str, app_path: &str, prefix: &str) ->
                     }
                 }
             }
-        }
-        None
+            None
+        })
     });
 
     if direct_match.is_some() {
@@ -2525,7 +3022,7 @@ fn find_installed_cask_parallel(app_name: &str, app_path: &str, prefix: &str) ->
 
 /// Parallel Mole-parity inspector for Uninstaller: discovers user & system leftovers,
 /// applies sibling-app & independent-CLI safety guards, computes APFS sizes concurrently
-/// via `getattrlistbulk`, and matches Homebrew Caskroom in parallel.
+/// via scoped `getattrlistbulk`, and matches Homebrew Caskroom in parallel.
 #[no_mangle]
 pub extern "C" fn upkeep_inspect_app_uninstall_json(
     app_name_utf8: *const c_char,
@@ -2546,11 +3043,13 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
 
         let official_uninstaller_vendor = detect_official_uninstaller_vendor(bundle_id);
 
-        // Run sibling-app detection and Homebrew Caskroom lookup in parallel
-        let (has_sibling_app, cask_token) = rayon::join(
-            || detect_sibling_app(app_name, bundle_id, app_path),
-            || find_installed_cask_parallel(app_name, app_path, brew_prefix),
-        );
+        // Run sibling-app detection and Homebrew Caskroom lookup in parallel on bounded pool
+        let (has_sibling_app, cask_token) = worker_pool().install(|| {
+            rayon::join(
+                || detect_sibling_app(app_name, bundle_id, app_path),
+                || find_installed_cask_parallel(app_name, app_path, brew_prefix),
+            )
+        });
 
         let leftovers = {
             let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
@@ -2610,6 +3109,10 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                     }
                 }
             }
+            let name_keys_lower: Vec<String> = name_keys
+                .iter()
+                .map(|k| k.to_ascii_lowercase())
+                .collect();
 
             // 3. Standard ~/Library subdirectories
             const SUBDIRS: [&str; 10] = [
@@ -2635,8 +3138,7 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                 }
             }
 
-            // 4. Boundary-matched extension & group directories across Group Containers,
-            // Containers, Application Scripts, and Application Support/FileProvider (Mole #572 parity)
+            // 4. Boundary-matched extension & group directories
             if !bundle_ids_lower.is_empty() {
                 for rel_dir in [
                     "Group Containers",
@@ -2676,19 +3178,24 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                         })
                         .collect();
                     if !uuid_containers.is_empty() {
-                        let matched_containers: Vec<PathBuf> = uuid_containers
-                            .into_par_iter()
-                            .filter(|p| {
-                                let meta = p.join(".com.apple.containermanagerd.metadata.plist");
-                                let Ok(parsed) = plist::from_file::<_, ContainerMetaPlist>(&meta) else {
-                                    return false;
-                                };
-                                parsed.identifier.as_deref().map_or(false, |id| {
-                                    let id_lower = id.to_ascii_lowercase();
-                                    matches_bundle_id_dir(&id_lower, &bundle_ids_lower)
+                        let matched_containers: Vec<PathBuf> = worker_pool().install(|| {
+                            uuid_containers
+                                .into_par_iter()
+                                .filter(|p| {
+                                    let meta =
+                                        p.join(".com.apple.containermanagerd.metadata.plist");
+                                    let Ok(parsed) =
+                                        plist::from_file::<_, ContainerMetaPlist>(&meta)
+                                    else {
+                                        return false;
+                                    };
+                                    parsed.identifier.as_deref().map_or(false, |id| {
+                                        let id_lower = id.to_ascii_lowercase();
+                                        matches_bundle_id_dir(&id_lower, &bundle_ids_lower)
+                                    })
                                 })
-                            })
-                            .collect();
+                                .collect()
+                        });
                         for p in matched_containers {
                             add_if_exists(p, false);
                         }
@@ -2739,7 +3246,7 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                 }
             }
 
-            // Prefix-scan Preferences, ByHost, SyncedPreferences
+            // Prefix-scan Preferences, ByHost, SyncedPreferences (zero inner-loop format! allocs)
             for scan_dir in [&prefs_dir, &byhost_dir, &synced_dir] {
                 if let Ok(entries) = fs::read_dir(scan_dir) {
                     for entry in entries.flatten() {
@@ -2749,8 +3256,8 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                         }
                         let fname_lower = fname.to_ascii_lowercase();
                         if bundle_ids_lower.iter().any(|bl| {
-                            fname_lower == format!("{}.plist", bl)
-                                || fname_lower.starts_with(&format!("{}.", bl))
+                            eq_with_suffix(&fname_lower, bl, ".plist")
+                                || starts_with_sep(&fname_lower, bl, b'.')
                         }) {
                             add_if_exists(entry.path(), false);
                         }
@@ -2776,12 +3283,12 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                     let fname = entry.file_name().to_string_lossy().into_owned();
                     if fname.ends_with(".plist") {
                         let fl = fname.to_ascii_lowercase();
-                        let matched = name_keys
+                        let matched = name_keys_lower
                             .iter()
-                            .any(|nk| fl.starts_with(&format!("{}_", nk.to_ascii_lowercase())))
+                            .any(|nkl| starts_with_sep(&fl, nkl, b'_'))
                             || bundle_ids_lower
                                 .iter()
-                                .any(|bl| fl.starts_with(&format!("{}_", bl)));
+                                .any(|bl| starts_with_sep(&fl, bl, b'_'));
                         if matched {
                             add_if_exists(entry.path(), false);
                         }
@@ -2795,10 +3302,8 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                     let fname = entry.file_name().to_string_lossy().into_owned();
                     let fl = fname.to_ascii_lowercase();
                     if fl.ends_with(".ips") || fl.ends_with(".crash") || fl.ends_with(".diag") {
-                        if name_keys.iter().any(|nk| {
-                            let nkl = nk.to_ascii_lowercase();
-                            fl.starts_with(&format!("{}-", nkl))
-                                || fl.starts_with(&format!("{}_", nkl))
+                        if name_keys_lower.iter().any(|nkl| {
+                            starts_with_sep(&fl, nkl, b'-') || starts_with_sep(&fl, nkl, b'_')
                         }) {
                             add_if_exists(entry.path(), false);
                         }
@@ -2810,26 +3315,25 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
             if !app_path.is_empty() {
                 let nmh_dirs = [
                     library.join("Application Support/Google/Chrome/NativeMessagingHosts"),
-                    library.join("Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+                    library
+                        .join("Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
                     library.join("Application Support/Microsoft Edge/NativeMessagingHosts"),
                     library.join("Application Support/Arc/User Data/NativeMessagingHosts"),
                     library.join("Application Support/Mozilla/NativeMessagingHosts"),
                 ];
-                let app_prefix = format!("{}/", app_path.trim_end_matches('/'));
+                let app_trimmed = app_path.trim_end_matches('/');
                 for nmh_dir in nmh_dirs {
                     if let Ok(entries) = fs::read_dir(&nmh_dir) {
                         for entry in entries.flatten() {
                             let p = entry.path();
                             if p.extension().and_then(|e| e.to_str()) == Some("json") {
                                 if let Ok(text) = fs::read_to_string(&p) {
-                                    if let Ok(v) =
-                                        serde_json::from_str::<serde_json::Value>(&text)
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
                                     {
-                                        if let Some(target) =
-                                            v.get("path").and_then(|x| x.as_str())
+                                        if let Some(target) = v.get("path").and_then(|x| x.as_str())
                                         {
                                             if target == app_path
-                                                || target.starts_with(&app_prefix)
+                                                || starts_with_sep(target, app_trimmed, b'/')
                                             {
                                                 add_if_exists(p, false);
                                             }
@@ -2912,7 +3416,10 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                 add_if_exists(library.join("Developer/Xcode"), false);
             } else if bid_lower.starts_with("com.jetbrains.") {
                 if let Some(sel) = read_jetbrains_paths_selector(&app_path_buf) {
-                    add_if_exists(library.join("Application Support/JetBrains").join(&sel), false);
+                    add_if_exists(
+                        library.join("Application Support/JetBrains").join(&sel),
+                        false,
+                    );
                     add_if_exists(library.join("Caches/JetBrains").join(&sel), false);
                     add_if_exists(library.join("Logs/JetBrains").join(&sel), false);
                 }
@@ -2936,7 +3443,7 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                 add_if_exists(library.join("Caches/Godot"), false);
             }
 
-            // 12. User LaunchAgents (filename prefix OR plist Program/ProgramArguments[0]/Label ownership)
+            // 12. User LaunchAgents
             let agents_dir = library.join("LaunchAgents");
             if let Ok(entries) = fs::read_dir(&agents_dir) {
                 for entry in entries.flatten() {
@@ -2950,8 +3457,8 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                         continue;
                     }
                     let name_match = bundle_ids_lower.iter().any(|bl| {
-                        fname_lower == format!("{}.plist", bl)
-                            || fname_lower.starts_with(&format!("{}.", bl))
+                        eq_with_suffix(&fname_lower, bl, ".plist")
+                            || starts_with_sep(&fname_lower, bl, b'.')
                     });
                     if name_match || launch_plist_owned_by_app(&p, &bundle_ids, app_path) {
                         add_if_exists(p, false);
@@ -2973,7 +3480,10 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                 }
             }
             for bid in &bundle_ids {
-                add_if_exists(sys_lib.join("Preferences").join(format!("{}.plist", bid)), true);
+                add_if_exists(
+                    sys_lib.join("Preferences").join(format!("{}.plist", bid)),
+                    true,
+                );
                 add_if_exists(sys_lib.join("PrivilegedHelperTools").join(bid), true);
             }
             if !has_sibling_app {
@@ -2994,8 +3504,7 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                             continue;
                         }
                         let name_match = bundle_ids_lower.iter().any(|bl| {
-                            fl == format!("{}.plist", bl)
-                                || fl.starts_with(&format!("{}.", bl))
+                            eq_with_suffix(&fl, bl, ".plist") || starts_with_sep(&fl, bl, b'.')
                         });
                         if name_match || launch_plist_owned_by_app(&p, &bundle_ids, app_path) {
                             add_if_exists(p, true);
@@ -3011,7 +3520,7 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                         if (fl.ends_with(".plist") || fl.ends_with(".bom"))
                             && bundle_ids_lower
                                 .iter()
-                                .any(|bl| fl.starts_with(&format!("{}.", bl)))
+                                .any(|bl| starts_with_sep(&fl, bl, b'.'))
                         {
                             add_if_exists(entry.path(), true);
                         }
@@ -3019,30 +3528,32 @@ pub extern "C" fn upkeep_inspect_app_uninstall_json(
                 }
             }
 
-            let mut records: Vec<LeftoverRecord> = candidates
-                .into_par_iter()
-                .map(|(p, is_system)| {
-                    let path_str = p.to_string_lossy().into_owned();
-                    let display_path = if !home.is_empty() && path_str.starts_with(&home) {
-                        format!("~{}", &path_str[home.len()..])
-                    } else {
-                        path_str.clone()
-                    };
-                    let category = categorize_leftover(&path_str).to_string();
-                    let size_bytes = calculate_path_size_accurate(&p);
-                    let (default_selected, holdback_reason) =
-                        evaluate_holdback(&path_str, &home, is_system);
-                    LeftoverRecord {
-                        path: path_str,
-                        display_path,
-                        category,
-                        size_bytes,
-                        is_system,
-                        default_selected,
-                        holdback_reason,
-                    }
-                })
-                .collect();
+            let mut records: Vec<LeftoverRecord> = worker_pool().install(|| {
+                candidates
+                    .into_par_iter()
+                    .map_init(BulkScratch::new, |scratch, (p, is_system)| {
+                        let path_str = p.to_string_lossy().into_owned();
+                        let display_path = if !home.is_empty() && path_str.starts_with(&home) {
+                            format!("~{}", &path_str[home.len()..])
+                        } else {
+                            path_str.clone()
+                        };
+                        let category = categorize_leftover(&path_str).to_string();
+                        let size_bytes = calculate_path_size_accurate_with_scratch(&p, scratch);
+                        let (default_selected, holdback_reason) =
+                            evaluate_holdback(&path_str, &home, is_system);
+                        LeftoverRecord {
+                            path: path_str,
+                            display_path,
+                            category,
+                            size_bytes,
+                            is_system,
+                            default_selected,
+                            holdback_reason,
+                        }
+                    })
+                    .collect()
+            });
 
             // Sort user items first (selected first, then held-back), system items last; within each group largest first
             records.sort_unstable_by(|a, b| {
@@ -3108,41 +3619,42 @@ fn scan_brew_dirs_internal(prefix: &str) -> Vec<BrewPackage> {
         }
     }
 
-    let mut packages: Vec<BrewPackage> = work
-        .into_par_iter()
-        .map(|(pkg_dir, name, is_cask)| {
-            let version = fs::read_dir(&pkg_dir)
-                .ok()
-                .map(|versions| {
-                    let mut list: Vec<String> = versions
-                        .flatten()
-                        .filter_map(|v| {
-                            let s = v.file_name().to_string_lossy().into_owned();
-                            if s.starts_with('.') { None } else { Some(s) }
-                        })
-                        .collect();
-                    list.sort_unstable_by(|a, b| cmp_versions_natural(a, b));
-                    list.pop().unwrap_or_default()
-                })
-                .unwrap_or_default();
+    let mut packages: Vec<BrewPackage> = worker_pool().install(|| {
+        work.into_par_iter()
+            .map(|(pkg_dir, name, is_cask)| {
+                let version = fs::read_dir(&pkg_dir)
+                    .ok()
+                    .map(|versions| {
+                        let mut list: Vec<String> = versions
+                            .flatten()
+                            .filter_map(|v| {
+                                let s = v.file_name().to_string_lossy().into_owned();
+                                if s.starts_with('.') { None } else { Some(s) }
+                            })
+                            .collect();
+                        list.sort_unstable_by(|a, b| cmp_versions_natural(a, b));
+                        list.pop().unwrap_or_default()
+                    })
+                    .unwrap_or_default();
 
-            let is_pinned = !is_cask && pinned_set.contains(&name);
-            BrewPackage {
-                name,
-                description: if is_cask {
-                    "Installed Cask".to_string()
-                } else {
-                    "Installed Formula".to_string()
-                },
-                version,
-                is_cask,
-                is_installed: true,
-                is_outdated: false,
-                is_pinned,
-                homepage: String::new(),
-            }
-        })
-        .collect();
+                let is_pinned = !is_cask && pinned_set.contains(&name);
+                BrewPackage {
+                    name,
+                    description: if is_cask {
+                        "Installed Cask".to_string()
+                    } else {
+                        "Installed Formula".to_string()
+                    },
+                    version,
+                    is_cask,
+                    is_installed: true,
+                    is_outdated: false,
+                    is_pinned,
+                    homepage: String::new(),
+                }
+            })
+            .collect()
+    });
 
     packages.sort_unstable_by(|a, b| cmp_ignore_ascii_case(&a.name, &b.name));
     packages
@@ -3235,7 +3747,8 @@ pub extern "C" fn upkeep_parse_mole_clean_json(
                             if has_digit {
                                 item_count = n;
                             }
-                        } else if p.len() >= 6 && p.as_bytes()[..6].eq_ignore_ascii_case(b"items:") {
+                        } else if p.len() >= 6 && p.as_bytes()[..6].eq_ignore_ascii_case(b"items:")
+                        {
                             let mut n: u32 = 0;
                             let mut has_digit = false;
                             for b in p[6..].bytes() {
@@ -3278,5 +3791,56 @@ pub extern "C" fn upkeep_parse_mole_clean_json(
 pub extern "C" fn upkeep_string_free(s: *mut c_char) {
     if !s.is_null() {
         let _ = std::panic::catch_unwind(|| unsafe { drop(CString::from_raw(s)) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slab_streaming_search_and_clear() {
+        let idx = BrewSearchIndex {
+            slab: RwLock::new(BrewCatalogSlab::default()),
+        };
+        let formulae = br#"[
+            {"name":"ripgrep","desc":"Search tool like grep","homepage":"https://example.com/rg","versions":{"stable":"14.1.0"},"revision":1},
+            {"name":"git","desc":"Distributed revision control system","homepage":"https://git-scm.com","versions":{"stable":"2.47.0"},"revision":0}
+        ]"#;
+        let casks = br#"[
+            {"token":"visual-studio-code","desc":"Open-source code editor","version":"1.95.0","homepage":"https://code.visualstudio.com"}
+        ]"#;
+
+        let empty_prefix = std::env::temp_dir()
+            .join(format!("upkeep_slab_test_prefix_{}", std::process::id()));
+        let _ = fs::create_dir_all(&empty_prefix);
+        let prefix_str = empty_prefix.to_string_lossy().into_owned();
+
+        let loaded = load_api_slices_internal(&idx, formulae, casks, &prefix_str);
+        let _ = fs::remove_dir_all(&empty_prefix);
+        assert_eq!(loaded, 3);
+
+        let guard = idx.slab.read().unwrap();
+        let hits = parallel_score_indices(&guard, "rg", -1, 10, false);
+        assert!(!hits.is_empty());
+        assert_eq!(guard.str_of(guard.entries[hits[0].1 as usize].name), "ripgrep");
+        assert_eq!(guard.version_of(hits[0].1 as usize), "14.1.0_1");
+        drop(guard);
+
+        // Clear releases slab memory back to 0
+        let raw = Box::into_raw(Box::new(idx));
+        upkeep_brew_index_clear(raw);
+        assert_eq!(upkeep_brew_index_count(raw), 0);
+        upkeep_brew_index_free(raw);
+    }
+
+    #[test]
+    fn zero_alloc_prefix_and_channel_helpers() {
+        assert!(eq_or_starts_with_sep("google/chrome/default", "google/chrome", b'/'));
+        assert!(eq_or_starts_with_sep("google/chrome", "google/chrome", b'/'));
+        assert!(!eq_or_starts_with_sep("google/chrome2", "google/chrome", b'/'));
+        assert_eq!(strip_channel_suffix("Firefox Nightly").as_deref(), Some("Firefox"));
+        assert_eq!(strip_channel_suffix("Visual Studio Code - Insiders").as_deref(), Some("Visual Studio Code"));
+        assert_eq!(strip_channel_suffix("Alfred 5").as_deref(), Some("Alfred"));
     }
 }

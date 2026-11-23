@@ -81,6 +81,8 @@ public final class BrewLogStore {
         }
     }
 
+    private static let maxLiveBufferUTF8Bytes = 64 * 1024
+
     private func flushPendingLiveLines() {
         liveFlushTask = nil
         guard !pendingLiveLines.isEmpty, let current = lastLog else { return }
@@ -94,6 +96,17 @@ public final class BrewLogStore {
         } else {
             liveOutputBuffer.append("\n")
             liveOutputBuffer.append(batch)
+        }
+        // Cap live buffer to the latest 64 KB so long upgrades never bloat RAM or SwiftUI diffs.
+        if liveOutputBuffer.utf8.count > Self.maxLiveBufferUTF8Bytes {
+            let dropCount = liveOutputBuffer.utf8.count - Self.maxLiveBufferUTF8Bytes
+            let cutIdx = liveOutputBuffer.utf8.index(liveOutputBuffer.utf8.startIndex, offsetBy: dropCount)
+            let trimmed = String(liveOutputBuffer[cutIdx...])
+            if let firstNL = trimmed.firstIndex(of: "\n") {
+                liveOutputBuffer = "… (earlier output truncated)\n" + String(trimmed[trimmed.index(after: firstNL)...])
+            } else {
+                liveOutputBuffer = trimmed
+            }
         }
         self.lastLog = BrewOperationLog(
             command: current.command,
@@ -216,6 +229,7 @@ public actor BrewService {
     private var remoteCatalog: [BrewPackageItem] = []
     private var lastRemoteCatalogFetch: Date?
     private var inFlightRemoteCatalogTask: Task<[BrewPackageItem], Never>?
+    private var idleEvictionTask: Task<Void, Never>?
 
     #if USE_RUST_UPKEEP_CORE
     private let rustLocalIndex = UpkeepEngine.RustBrewIndex()
@@ -486,7 +500,8 @@ public actor BrewService {
         cacheDirURL.appendingPathComponent("catalog.bin")
     }
 
-    private static func fetchOrLoadCachedJSON(urlString: String, cacheFileName: String) async -> (data: Data?, notModified: Bool) {
+    /// Ensures the cached Homebrew JSON API file is fresh on disk without loading 30 MB into Swift RAM.
+    private static func ensureCachedJSONFile(urlString: String, cacheFileName: String) async -> (url: URL?, notModified: Bool) {
         let fm = FileManager.default
         try? fm.createDirectory(at: cacheDirURL, withIntermediateDirectories: true)
         let dataURL = cacheDirURL.appendingPathComponent(cacheFileName)
@@ -496,12 +511,12 @@ public actor BrewService {
         if let attrs = try? fm.attributesOfItem(atPath: dataURL.path),
            let modDate = attrs[.modificationDate] as? Date,
            Date().timeIntervalSince(modDate) < 6 * 3600,
-           let cached = try? Data(contentsOf: dataURL), !cached.isEmpty {
-            return (cached, true)
+           let fileSize = attrs[.size] as? NSNumber, fileSize.intValue > 0 {
+            return (dataURL, true)
         }
 
         guard let url = URL(string: urlString) else {
-            return (try? Data(contentsOf: dataURL), false)
+            return (fm.fileExists(atPath: dataURL.path) ? dataURL : nil, false)
         }
 
         var request = URLRequest(url: url)
@@ -516,27 +531,58 @@ public actor BrewService {
             if let http = response as? HTTPURLResponse {
                 if http.statusCode == 304 {
                     try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: dataURL.path)
-                    return (try? Data(contentsOf: dataURL), true)
+                    return (fm.fileExists(atPath: dataURL.path) ? dataURL : nil, true)
                 }
                 if (200..<300).contains(http.statusCode), !data.isEmpty {
                     try? data.write(to: dataURL, options: .atomic)
                     if let etag = http.value(forHTTPHeaderField: "ETag") {
                         try? etag.write(to: etagURL, atomically: true, encoding: .utf8)
                     }
-                    return (data, false)
+                    return (dataURL, false)
                 }
             }
         } catch {
             // Fall through to stale disk cache if offline
         }
 
-        return (try? Data(contentsOf: dataURL), false)
+        return (fm.fileExists(atPath: dataURL.path) ? dataURL : nil, false)
     }
 
-    /// Pre-warms the 15k-package Rust Homebrew index quietly in the background after app launch.
+    /// Pre-warms the 15k-package Rust Homebrew index on demand.
     public func prewarmIfNeeded() async {
         guard Self.isInstalled() else { return }
+        cancelIdleEviction()
         _ = await ensureRemoteCatalogLoaded()
+    }
+
+    /// Cancels any pending idle-eviction timer (called when the HUD or Homebrew pane becomes active).
+    public func cancelIdleEviction() {
+        idleEvictionTask?.cancel()
+        idleEvictionTask = nil
+    }
+
+    /// Schedules automatic RAM eviction of the 15k-package catalog after `afterSeconds` of inactivity.
+    /// Reloading `catalog.bin` takes <5ms on the next open, keeping menu-bar idle RSS near zero.
+    public func scheduleIdleEviction(afterSeconds seconds: Int = 120) {
+        idleEvictionTask?.cancel()
+        idleEvictionTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled, let self else { return }
+            await self.evictRemoteCatalogIfIdle()
+        }
+    }
+
+    /// Immediately frees the in-memory 15k Homebrew catalog slab back to the OS.
+    public func evictRemoteCatalogIfIdle() {
+        idleEvictionTask?.cancel()
+        idleEvictionTask = nil
+        guard inFlightRemoteCatalogTask == nil else { return }
+        #if USE_RUST_UPKEEP_CORE
+        rustRemoteIndex.clear()
+        rustLocalIndex.clear()
+        #endif
+        remoteCatalog.removeAll()
+        lastRemoteCatalogFetch = nil
     }
 
     /// Returns true when the remote Homebrew catalog is already warm in memory (zero debounce needed).
@@ -548,6 +594,7 @@ public actor BrewService {
     }
 
     private func ensureRemoteCatalogLoaded() async -> Bool {
+        cancelIdleEviction()
         #if USE_RUST_UPKEEP_CORE
         if rustRemoteIndex.count > 0,
            let last = lastRemoteCatalogFetch,
@@ -581,7 +628,7 @@ public actor BrewService {
             let fm = FileManager.default
             let binURL = Self.catalogBinURL
             let hasBinCache = fm.fileExists(atPath: binURL.path)
-            // Ultra-fast <5ms cold-start path: load compact binary cache directly when fresher than 6 hours.
+            // Ultra-fast <5ms cold-start path: load compact binary cache directly into Rust's byte slab.
             if hasBinCache,
                let attrs = try? fm.attributesOfItem(atPath: binURL.path),
                let modDate = attrs[.modificationDate] as? Date,
@@ -592,18 +639,16 @@ public actor BrewService {
             }
             #endif
 
-            async let formulaeFetch = Self.fetchOrLoadCachedJSON(
+            async let formulaeFetch = Self.ensureCachedJSONFile(
                 urlString: "https://formulae.brew.sh/api/formula.json",
                 cacheFileName: "formula.json"
             )
-            async let casksFetch = Self.fetchOrLoadCachedJSON(
+            async let casksFetch = Self.ensureCachedJSONFile(
                 urlString: "https://formulae.brew.sh/api/cask.json",
                 cacheFileName: "cask.json"
             )
 
             let (fRes, cRes) = await (formulaeFetch, casksFetch)
-            let fData = fRes.data
-            let cData = cRes.data
 
             #if USE_RUST_UPKEEP_CORE
             // If both ETags returned 304 Not Modified and catalog.bin exists, load binary cache directly.
@@ -613,13 +658,16 @@ public actor BrewService {
                     return []
                 }
             }
-            // Zero-copy raw-byte ingestion directly into Rust, then persist compact binary cache.
-            let loadedCount = rustIndex.loadAPI(formulaeData: fData, casksData: cData)
+            // Stream directly from disk into Rust's contiguous byte slab (avoids 30 MB Swift Data spike).
+            let loadedCount = rustIndex.loadAPIFiles(formulaePath: fRes.url?.path, casksPath: cRes.url?.path)
             if loadedCount > 0 {
                 rustIndex.saveBinaryCache(path: binURL.path)
                 return []
             }
             #endif
+
+            let fData = fRes.url.flatMap { try? Data(contentsOf: $0) }
+            let cData = cRes.url.flatMap { try? Data(contentsOf: $0) }
 
             var merged: [BrewPackageItem] = []
             merged.reserveCapacity(16_000)

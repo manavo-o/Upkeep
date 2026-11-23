@@ -602,9 +602,14 @@ public struct UninstallerAppRow: View {
 public struct AppIconView: View {
     private static let iconCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
-        cache.countLimit = 256
+        cache.countLimit = 128
+        cache.totalCostLimit = 8 * 1024 * 1024 // 8 MB cap
         return cache
     }()
+
+    public static func clearCache() {
+        iconCache.removeAllObjects()
+    }
 
     let path: String
     var size: CGFloat = 24

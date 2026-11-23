@@ -1,5 +1,6 @@
 use crate::{
-    calculate_path_size_accurate, cstr_to_str, is_protected_path, read_bundle_id, string_to_cstr,
+    calculate_path_size_accurate_with_scratch, cstr_to_str, eq_or_starts_with_sep,
+    is_protected_path, read_bundle_id, string_to_cstr, worker_pool, BulkScratch,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -466,23 +467,25 @@ fn collect_running_apps() -> RunningApps {
         }
     }
 
-    let pairs: Vec<(Option<String>, Option<String>)> = seen_bundles
-        .into_par_iter()
-        .map(|bundle_path| {
-            let name = bundle_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_ascii_lowercase())
-                .filter(|s| !s.is_empty());
-            let bid = read_bundle_id(&bundle_path);
-            let bid_opt = if bid.is_empty() {
-                None
-            } else {
-                Some(bid.to_ascii_lowercase())
-            };
-            (name, bid_opt)
-        })
-        .collect();
+    let pairs: Vec<(Option<String>, Option<String>)> = worker_pool().install(|| {
+        seen_bundles
+            .into_par_iter()
+            .map(|bundle_path| {
+                let name = bundle_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .filter(|s| !s.is_empty());
+                let bid = read_bundle_id(&bundle_path);
+                let bid_opt = if bid.is_empty() {
+                    None
+                } else {
+                    Some(bid.to_ascii_lowercase())
+                };
+                (name, bid_opt)
+            })
+            .collect()
+    });
 
     let mut bundle_ids = HashSet::with_capacity(pairs.len());
     let mut app_names = HashSet::with_capacity(pairs.len());
@@ -577,11 +580,11 @@ fn is_dir_stale_deep(path: &Path, cutoff: SystemTime) -> bool {
 
 fn collect_installed_bundle_ids(home_path: &Path) -> BundleIdIndex {
     let mut app_paths: Vec<PathBuf> = Vec::new();
+    // Note: /Applications/Setapp is already discovered by the 1-level subfolder scan of /Applications.
     let app_roots = [
         PathBuf::from("/Applications"),
         PathBuf::from("/System/Applications"),
         home_path.join("Applications"),
-        PathBuf::from("/Applications/Setapp"),
     ];
 
     for root in app_roots {
@@ -634,17 +637,19 @@ fn collect_installed_bundle_ids(home_path: &Path) -> BundleIdIndex {
         }
     }
 
-    let set: HashSet<String> = app_paths
-        .par_iter()
-        .filter_map(|p| {
-            let bid = read_bundle_id(p);
-            if bid.is_empty() {
-                None
-            } else {
-                Some(bid.to_ascii_lowercase())
-            }
-        })
-        .collect();
+    let set: HashSet<String> = worker_pool().install(|| {
+        app_paths
+            .par_iter()
+            .filter_map(|p| {
+                let bid = read_bundle_id(p);
+                if bid.is_empty() {
+                    None
+                } else {
+                    Some(bid.to_ascii_lowercase())
+                }
+            })
+            .collect()
+    });
     BundleIdIndex::from_set(set)
 }
 
@@ -699,14 +704,16 @@ fn scan_project_artifacts(
         }
     }
 
-    let per_root: Vec<Vec<(String, PathBuf, bool)>> = unique_roots
-        .into_par_iter()
-        .map(|root_path| {
-            let mut local = Vec::new();
-            walk_project_dir(&root_path, 0, recent_cutoff, started, budget, &mut local);
-            local
-        })
-        .collect();
+    let per_root: Vec<Vec<(String, PathBuf, bool)>> = worker_pool().install(|| {
+        unique_roots
+            .into_par_iter()
+            .map(|root_path| {
+                let mut local = Vec::new();
+                walk_project_dir(&root_path, 0, recent_cutoff, started, budget, &mut local);
+                local
+            })
+            .collect()
+    });
 
     for batch in per_root {
         for item in batch {
@@ -733,26 +740,26 @@ fn walk_project_dir(
         return;
     };
 
-    let mut subdirs: Vec<(String, PathBuf, Option<SystemTime>)> = Vec::new();
+    let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
     let mut sibling_names: HashSet<String> = HashSet::new();
 
+    // Use d_type via entry.file_type() (zero extra lstat syscalls per file/dir).
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let p = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&p) else {
+        let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if meta.file_type().is_symlink() {
+        if ft.is_symlink() {
             continue;
         }
-        if meta.is_file() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if ft.is_file() {
             sibling_names.insert(name);
-        } else if meta.is_dir() {
-            subdirs.push((name, p, meta.modified().ok()));
+        } else if ft.is_dir() {
+            subdirs.push((name, entry.path()));
         }
     }
 
-    for (name, sub_path, mtime_opt) in subdirs {
+    for (name, sub_path) in subdirs {
         if started.elapsed() > budget || out.len() >= 120 {
             return;
         }
@@ -763,6 +770,7 @@ fn walk_project_dir(
             let has_marker = markers.iter().any(|m| sibling_names.contains(*m));
             // Never delete a directory that contains a nested .git repository
             if has_marker && !sub_path.join(".git").exists() {
+                let mtime_opt = fs::symlink_metadata(&sub_path).ok().and_then(|m| m.modified().ok());
                 let is_recent = mtime_opt.map_or(true, |mtime| mtime > recent_cutoff);
                 let project_label = dir
                     .file_name()
@@ -817,15 +825,15 @@ fn is_cleaner_protected_rel(rel_lower: &str) -> bool {
         "/library/unity",
     ];
     for prefix in PROTECTED_PREFIXES {
-        if rel_lower == *prefix || rel_lower.starts_with(&format!("{}/", prefix)) {
+        if eq_or_starts_with_sep(rel_lower, prefix, b'/') {
             return true;
         }
     }
     if let Some(cache_entry) = rel_lower.strip_prefix("/library/caches/") {
         if cache_entry.starts_with("com.apple.") {
-            let is_safe_apple = SAFE_APPLE_CACHE_REL_PATHS.iter().any(|safe| {
-                rel_lower == *safe || rel_lower.starts_with(&format!("{}/", safe))
-            });
+            let is_safe_apple = SAFE_APPLE_CACHE_REL_PATHS
+                .iter()
+                .any(|safe| eq_or_starts_with_sep(rel_lower, safe, b'/'));
             if !is_safe_apple {
                 return true;
             }
@@ -868,13 +876,53 @@ fn has_symlinked_ancestor(path: &Path, base: &Path) -> bool {
     false
 }
 
+struct CleanRoots {
+    home_trimmed: String,
+    tmp_trimmed: String,
+    canon_home: String,
+    canon_tmp: String,
+}
+
+impl CleanRoots {
+    fn new(home: &str, tmpdir: &str) -> Self {
+        let home_trimmed = home.trim_end_matches('/').to_string();
+        let tmp_trimmed = tmpdir.trim_end_matches('/').to_string();
+        let canon_home = if !home_trimmed.is_empty() {
+            fs::canonicalize(&home_trimmed)
+                .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
+                .unwrap_or_else(|_| home_trimmed.clone())
+        } else {
+            String::new()
+        };
+        let canon_tmp = if !tmp_trimmed.is_empty() {
+            fs::canonicalize(&tmp_trimmed)
+                .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
+                .unwrap_or_else(|_| tmp_trimmed.clone())
+        } else {
+            String::new()
+        };
+        Self {
+            home_trimmed,
+            tmp_trimmed,
+            canon_home,
+            canon_tmp,
+        }
+    }
+}
+
 /// Validates that a path is strictly safe to delete under `$HOME` or `$TMPDIR`.
 /// Returns `Ok(preserve_parent_dir)` or `Err(reason)`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_clean_target(
     path: &Path,
     home: &str,
     tmpdir: &str,
 ) -> Result<bool, String> {
+    let roots = CleanRoots::new(home, tmpdir);
+    validate_clean_target_with_roots(path, &roots)
+}
+
+fn validate_clean_target_with_roots(path: &Path, roots: &CleanRoots) -> Result<bool, String> {
     if path.as_os_str().is_empty() {
         return Err("Empty path".to_string());
     }
@@ -896,8 +944,8 @@ pub(crate) fn validate_clean_target(
         return Err("Refused to follow symlink".to_string());
     }
 
-    let home_trimmed = home.trim_end_matches('/');
-    let tmp_trimmed = tmpdir.trim_end_matches('/');
+    let home_trimmed = roots.home_trimmed.as_str();
+    let tmp_trimmed = roots.tmp_trimmed.as_str();
 
     if !home_trimmed.is_empty()
         && raw_str.len() > home_trimmed.len()
@@ -929,30 +977,17 @@ pub(crate) fn validate_clean_target(
 
     let target_str = canonical_target.to_string_lossy();
     let target_trimmed = target_str.trim_end_matches('/');
-
-    let canon_home = if !home_trimmed.is_empty() {
-        fs::canonicalize(home_trimmed)
-            .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
-            .unwrap_or_else(|_| home_trimmed.to_string())
-    } else {
-        String::new()
-    };
-    let canon_tmp = if !tmp_trimmed.is_empty() {
-        fs::canonicalize(tmp_trimmed)
-            .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
-            .unwrap_or_else(|_| tmp_trimmed.to_string())
-    } else {
-        String::new()
-    };
+    let canon_home = roots.canon_home.as_str();
+    let canon_tmp = roots.canon_tmp.as_str();
 
     let in_home = !canon_home.is_empty()
         && target_trimmed.len() > canon_home.len()
-        && target_trimmed.starts_with(&canon_home)
+        && target_trimmed.starts_with(canon_home)
         && target_trimmed.as_bytes()[canon_home.len()] == b'/';
 
     let in_tmp = !canon_tmp.is_empty()
         && target_trimmed.len() > canon_tmp.len()
-        && target_trimmed.starts_with(&canon_tmp)
+        && target_trimmed.starts_with(canon_tmp)
         && target_trimmed.as_bytes()[canon_tmp.len()] == b'/';
 
     if !in_home && !in_tmp {
@@ -960,7 +995,7 @@ pub(crate) fn validate_clean_target(
     }
 
     if in_home {
-        if is_protected_path(&canonical_target, &canon_home) {
+        if is_protected_path(&canonical_target, canon_home) {
             return Err("Path is protected".to_string());
         }
         let rel_lower = target_trimmed[canon_home.len()..].to_ascii_lowercase();
@@ -1021,8 +1056,13 @@ fn remove_entry_safely(path: &Path) -> Result<(), String> {
     }
 }
 
-fn clean_single_target(path: &Path, preserve_parent: bool, dry_run: bool) -> Result<u64, String> {
-    let size = calculate_path_size_accurate(path);
+fn clean_single_target(
+    path: &Path,
+    preserve_parent: bool,
+    dry_run: bool,
+    scratch: &mut BulkScratch,
+) -> Result<u64, String> {
+    let size = calculate_path_size_accurate_with_scratch(path, scratch);
     if dry_run {
         return Ok(size);
     }
@@ -1034,10 +1074,12 @@ fn clean_single_target(path: &Path, preserve_parent: bool, dry_run: bool) -> Res
             .map(|e| e.path())
             .collect();
         let first_err: Option<String> = if children.len() >= 4 {
-            children
-                .into_par_iter()
-                .filter_map(|child| remove_entry_safely(&child).err())
-                .find_any(|_| true)
+            worker_pool().install(|| {
+                children
+                    .into_par_iter()
+                    .filter_map(|child| remove_entry_safely(&child).err())
+                    .find_any(|_| true)
+            })
         } else {
             let mut err: Option<String> = None;
             for child in children {
@@ -1053,7 +1095,7 @@ fn clean_single_target(path: &Path, preserve_parent: bool, dry_run: bool) -> Res
         let Some(err) = first_err else {
             return Ok(size);
         };
-        let remaining = calculate_path_size_accurate(path);
+        let remaining = calculate_path_size_accurate_with_scratch(path, scratch);
         let reclaimed = size.saturating_sub(remaining);
         if reclaimed == 0 {
             return Err(err);
@@ -1082,19 +1124,21 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
 
     let home_path = PathBuf::from(&home);
 
-    // Collect running apps, installed bundle IDs, and project artifacts in parallel
-    let ((running_apps, installed_bundle_ids), project_artifacts) = rayon::join(
-        || {
-            rayon::join(collect_running_apps, || {
-                collect_installed_bundle_ids(&home_path)
-            })
-        },
-        || {
-            let mut found = Vec::new();
-            scan_project_artifacts(&home_path, started, &mut found);
-            found
-        },
-    );
+    // Collect running apps, installed bundle IDs, and project artifacts on bounded worker pool
+    let ((running_apps, installed_bundle_ids), project_artifacts) = worker_pool().install(|| {
+        rayon::join(
+            || {
+                rayon::join(collect_running_apps, || {
+                    collect_installed_bundle_ids(&home_path)
+                })
+            },
+            || {
+                let mut found = Vec::new();
+                scan_project_artifacts(&home_path, started, &mut found);
+                found
+            },
+        )
+    });
 
     let mut targets: Vec<ScanTarget> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
@@ -2126,37 +2170,40 @@ pub(crate) fn scan_cleaner_internal() -> CleanerScanPayload {
         false,
     );
 
-    // Parallel APFS sizing via getattrlistbulk + Rayon
-    let scored: Vec<(&'static str, CleanerItem)> = targets
-        .into_par_iter()
-        .filter_map(|target| {
-            let size = target
-                .known_file_size
-                .unwrap_or_else(|| calculate_path_size_accurate(&target.path));
-            if size < 4096 && !target.requires_admin {
-                return None;
-            }
-            if size == 0 {
-                return None;
-            }
-            let path_str = target.path.to_string_lossy().into_owned();
-            let display_path = format_display_path(&path_str, &home);
-            Some((
-                target.category_id,
-                CleanerItem {
-                    id: path_str.clone(),
-                    category: target.category_title.to_string(),
-                    name: target.name,
-                    path: path_str,
-                    display_path,
-                    size_bytes: size,
-                    default_selected: target.default_selected,
-                    holdback_reason: target.holdback_reason.map(|s| s.to_string()),
-                    requires_admin: target.requires_admin,
-                },
-            ))
-        })
-        .collect();
+    // Parallel APFS sizing via bounded worker pool + scoped BulkScratch (zero nested Rayon)
+    let scored: Vec<(&'static str, CleanerItem)> = worker_pool().install(|| {
+        targets
+            .into_par_iter()
+            .map_init(BulkScratch::new, |scratch, target| {
+                let size = target
+                    .known_file_size
+                    .unwrap_or_else(|| calculate_path_size_accurate_with_scratch(&target.path, scratch));
+                if size < 4096 && !target.requires_admin {
+                    return None;
+                }
+                if size == 0 {
+                    return None;
+                }
+                let path_str = target.path.to_string_lossy().into_owned();
+                let display_path = format_display_path(&path_str, &home);
+                Some((
+                    target.category_id,
+                    CleanerItem {
+                        id: path_str.clone(),
+                        category: target.category_title.to_string(),
+                        name: target.name,
+                        path: path_str,
+                        display_path,
+                        size_bytes: size,
+                        default_selected: target.default_selected,
+                        holdback_reason: target.holdback_reason.map(|s| s.to_string()),
+                        requires_admin: target.requires_admin,
+                    },
+                ))
+            })
+            .flatten()
+            .collect()
+    });
 
     let mut grouped: HashMap<&'static str, Vec<CleanerItem>> = HashMap::new();
     for (cat_id, item) in scored {
@@ -2223,17 +2270,22 @@ pub(crate) fn clean_paths_internal(
         }
     }
 
-    let outcomes: Vec<(String, Result<u64, String>)> = unique_paths
-        .into_par_iter()
-        .map(|p| {
-            let path = Path::new(&p);
-            let res = match validate_clean_target(path, home, tmpdir) {
-                Ok(preserve_parent) => clean_single_target(path, preserve_parent, dry_run),
-                Err(reason) => Err(reason),
-            };
-            (p, res)
-        })
-        .collect();
+    let roots = CleanRoots::new(home, tmpdir);
+    let outcomes: Vec<(String, Result<u64, String>)> = worker_pool().install(|| {
+        unique_paths
+            .into_par_iter()
+            .map_init(BulkScratch::new, |scratch, p| {
+                let path = Path::new(&p);
+                let res = match validate_clean_target_with_roots(path, &roots) {
+                    Ok(preserve_parent) => {
+                        clean_single_target(path, preserve_parent, dry_run, scratch)
+                    }
+                    Err(reason) => Err(reason),
+                };
+                (p, res)
+            })
+            .collect()
+    });
 
     let mut reclaimed_bytes: u64 = 0;
     let mut removed_count: usize = 0;

@@ -1,8 +1,8 @@
 [package]
 name = "upkeep_core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "C-ABI Rust engine: parallel nucleo fuzzy matcher, compact binary Brew catalog cache, APFS-accurate parallel app & cleaner scanner, and safe parallel cleaner"
+description = "C-ABI Rust engine: bounded Rayon pool, contiguous byte-slab Brew catalog with streaming JSON ingestion, zero-nested-Rayon getattrlistbulk APFS scanner, and safe parallel cleaner"
 
 [lib]
 crate-type = ["staticlib", "cdylib"]

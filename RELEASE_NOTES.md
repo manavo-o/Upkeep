@@ -1,4 +1,17 @@
-## What's New in v1.4.2
+## What's New in v1.4.3
+
+- **Rust `upkeep_core` v0.5.0 — Low-RSS Contiguous Slab, Streaming JSON & Bounded Thread Pool**:
+  - Replaced `BrewSearchIndex`'s per-package `String` structs (~90k `malloc` chunks for ~15k Homebrew packages) with a contiguous UTF-8 byte slab (`BrewCatalogSlab`) using 2 allocations (`strings` + `entries`), eliminating duplicate `name_lower` and `api_version` strings and serializing search/installed hits via zero-copy `BrewPackageRef<'a>`.
+  - Added streaming `serde::de::DeserializeSeed` JSON ingestion directly from disk (`upkeep_brew_index_load_api_files`) so neither Swift nor Rust ever loads raw ~30 MB `formula.json`/`cask.json` arrays into RAM at once, plus `upkeep_brew_index_clear` for instant idle eviction.
+  - Replaced Rayon's default global thread pool (8–16 permanent OS threads on Apple Silicon) with a dedicated `worker_pool()` capped at 2–4 threads, and replaced permanent 128 KB `thread_local!` `getattrlistbulk` and `Matcher` buffers with scoped `map_init` scratch buffers (64 KB) freed immediately when scans finish.
+  - Eliminated nested Rayon fan-out during multi-target scans (`calculate_dir_size_bulk_serial`), skipped unused `path_bytes` copies in `walk_openat_dfs` at depth < 16 (lazy reconstruction only at depth 16), replaced inner-loop `format!()` allocations with zero-alloc slice helpers (`eq_or_starts_with_sep`, `starts_with_sep`), hoisted `CleanRoots` canonicalization out of per-path validation, switched `walk_project_dir` to zero-syscall `d_type`, and removed duplicate `/Applications/Setapp` scanning.
+- **Swift Idle RAM, Energy & UI Efficiency**:
+  - Added automatic idle eviction for the 15k Homebrew catalog (`BrewService.scheduleIdleEviction` / `evictRemoteCatalogIfIdle`), stopped pre-warming the full catalog at launch, and released `mainWindowController`, `cleaningPanel`, transient Cleaner/Uninstaller arrays, and `AppIconView`'s 8 MB-capped `NSCache` when windows close.
+  - Switched `KeepAwakeManager`'s display timer to a 60s cadence (`tolerance = 2.0s`) when remaining time is ≥ 1 hour (60× fewer idle CPU wakeups) and `tolerance = 0.25s` under 1 hour.
+  - Capped `BrewLogStore.liveOutputBuffer` to the latest 64 KB, replaced `CLIExecutor.LineStreamBuffer.feed()`'s O(N²) `removeSubrange` loop with an O(N) cursor, switched `UpkeepAppRecord` scans to adaptive 256→1024 sizing (395 KB vs 1.58 MB), and invalidated temporary `CGEvent` probe Mach ports in `CleaningModeManager`.
+  - Cached Cleaner selection byte/admin metrics in `TrayViewModel` (eliminating per-hover `flatMap` + `ByteCountFormatter` work), isolated `CleanerItemRow` hover state in `MainWindowView`, and isolated `HomebrewHUDStatusStrip` so 40 ms streaming log updates no longer re-diff `HomebrewHUDView`.
+
+### Included from v1.4.2
 
 - **Mandatory Rust Engine Enforcement for Release Builds**:
   - Updated `Scripts/build-app.sh` to fail fast in CI/release builds (`CI`, `GITHUB_ACTIONS`, or `UPKEEP_REQUIRE_RUST=1`) if `cargo` is missing or `Frameworks/lib/libupkeep_core.a` is not produced, preventing silent Swift-fallback releases while keeping the Swift fallback available for local development.

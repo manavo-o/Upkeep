@@ -1052,7 +1052,6 @@ private struct HomebrewSettingsPane: View {
 private struct CleanerWorkspacePane: View {
     @Bindable var vm: TrayViewModel
     @State private var collapsedCategories: Set<String> = []
-    @State private var hoveredItemID: String?
     @State private var copiedCleanError = false
 
     var body: some View {
@@ -1340,25 +1339,32 @@ private struct CleanerWorkspacePane: View {
             if !isCollapsed {
                 VStack(spacing: 3) {
                     ForEach(category.items) { item in
-                        cleanerItemRow(item)
+                        let isChecked = vm.selectedCleanPaths.contains(item.path)
+                        CleanerItemRow(item: item, isChecked: isChecked) {
+                            if isChecked {
+                                vm.selectedCleanPaths.remove(item.path)
+                            } else {
+                                vm.selectedCleanPaths.insert(item.path)
+                            }
+                        }
                     }
                 }
                 .padding(.leading, 8)
             }
         }
     }
+}
 
-    private func cleanerItemRow(_ item: CleanerItem) -> some View {
-        let isChecked = vm.selectedCleanPaths.contains(item.path)
+/// Isolated Cleaner row so pointer hover never invalidates the parent `CleanerWorkspacePane`.
+private struct CleanerItemRow: View {
+    let item: CleanerItem
+    let isChecked: Bool
+    let onToggle: () -> Void
+    @State private var isHovered: Bool = false
 
-        return HStack(spacing: 8) {
-            Button {
-                if isChecked {
-                    vm.selectedCleanPaths.remove(item.path)
-                } else {
-                    vm.selectedCleanPaths.insert(item.path)
-                }
-            } label: {
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onToggle) {
                 HStack(spacing: 10) {
                     Image(systemName: isChecked ? "checkmark.square.fill" : "square")
                         .foregroundStyle(isChecked ? Color.accentColor : Color.secondary)
@@ -1420,12 +1426,12 @@ private struct CleanerWorkspacePane: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            hoveredItemID == item.id
+            isHovered
                 ? Color.primary.opacity(0.055)
                 : Color.primary.opacity(0.025),
             in: RoundedRectangle(cornerRadius: 7, style: .continuous)
         )
-        .onHover { hoveredItemID = $0 ? item.id : nil }
+        .onHover { isHovered = $0 }
     }
 }
 

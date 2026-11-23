@@ -185,15 +185,21 @@ public enum CLIExecutor {
                 var emitted: [String] = []
                 lock.lock()
                 pending.append(chunk)
-                while let nl = pending.firstIndex(of: 0x0A) {
-                    let lineData = pending[pending.startIndex..<nl]
-                    pending.removeSubrange(pending.startIndex...nl)
+                var cursor = pending.startIndex
+                while let nl = pending[cursor...].firstIndex(of: 0x0A) {
+                    let lineData = pending[cursor..<nl]
+                    cursor = pending.index(after: nl)
                     if let raw = String(data: lineData, encoding: .utf8) {
                         let clean = UpkeepEngine.stripANSI(raw).trimmingCharacters(in: .whitespacesAndNewlines)
                         if !clean.isEmpty {
                             emitted.append(clean)
                         }
                     }
+                }
+                if cursor == pending.endIndex {
+                    pending.removeAll(keepingCapacity: true)
+                } else if cursor > pending.startIndex {
+                    pending = Data(pending[cursor...])
                 }
                 lock.unlock()
                 for line in emitted {
