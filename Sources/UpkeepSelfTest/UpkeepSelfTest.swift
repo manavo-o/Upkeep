@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import UpkeepCore
@@ -19,6 +20,11 @@ struct UpkeepSelfTest {
     }
 
     static func main() async {
+        if ProcessInfo.processInfo.arguments.contains("--status-menu") {
+            testStatusMenu()
+            if failed > 0 { Foundation.exit(1) }
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("--memory-recovery") || ProcessInfo.processInfo.environment["UPKEEP_MEMORY_SELF_TEST"] == "1" {
             let path = ProcessInfo.processInfo.environment["UPKEEP_MEMORY_TEST_DIRECTORY"]
                 ?? FileManager.default.temporaryDirectory.appendingPathComponent("upkeep-recovery-test-\(UUID().uuidString)").path
@@ -28,7 +34,7 @@ struct UpkeepSelfTest {
             MemoryRecoveryTestApp.main()
             return
         }
-        print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.4.3) ===")
+        print("=== Upkeep Self-Test Suite ===")
         print("  Engine: \(UpkeepEngine.isUsingRustCore ? "Rust upkeep_core C-ABI" : "Swift fallback")")
         let env = ProcessInfo.processInfo.environment
         let requireRust = env["UPKEEP_REQUIRE_RUST"] == "1" || env["CI"] != nil || env["GITHUB_ACTIONS"] != nil
@@ -200,7 +206,7 @@ struct UpkeepSelfTest {
             check("Segmented picker selected in light mode is primary", lightSelected == Color.primary)
 
             let vm = TrayViewModel()
-            check("TrayViewModel starts on .controls section", vm.activeSection == .controls)
+            check("TrayViewModel starts on General", vm.activeSection == .general)
             vm.activeSection = .homebrew
             check("TrayViewModel switches to .homebrew section", vm.activeSection == .homebrew)
             vm.activeSection = .cleaner
@@ -210,8 +216,16 @@ struct UpkeepSelfTest {
             vm.activeSection = .updates
             check("TrayViewModel switches to .updates section", vm.activeSection == .updates)
 
-            let menuBarView = MenuBarView(coordinator: HUDCoordinator.shared)
-            check("MenuBarView instantiates cleanly with HUDCoordinator", menuBarView.coordinator === HUDCoordinator.shared)
+            let search = UpkeepSearchEngine()
+            search.query = "  CLEAN keys TRACKPAD "
+            check("Settings search matches words across category and title", search.results.first?.id == "power.lockPointer")
+            search.query = "refresh package catalog"
+            check("Settings search links catalog refresh to Homebrew", search.results.first?.tab == .homebrew)
+            search.query = "GitHub Repository"
+            check("Settings search ranks an exact title first", search.results.first?.id == "updates.repository")
+            search.query = "  "
+            check("Whitespace clears settings search", !search.isSearching && search.results.isEmpty && search.groupedResults.isEmpty)
+
             let mainWindow = MainWindowView(vm: HUDCoordinator.shared.trayViewModel, coordinator: HUDCoordinator.shared)
             check("MainWindowView instantiates cleanly with HUDCoordinator", mainWindow.coordinator === HUDCoordinator.shared)
         }
@@ -220,5 +234,41 @@ struct UpkeepSelfTest {
         if failed > 0 {
             Foundation.exit(1)
         }
+    }
+
+    private static func testStatusMenu() {
+        let app = NSApplication.shared
+        let coordinator = HUDCoordinator.shared
+        let controller = StatusMenuController(coordinator: coordinator)
+        let menu = NSMenu()
+        controller.menuNeedsUpdate(menu)
+
+        guard let start = menu.item(withTitle: "Caffeinate")?.submenu?.items.first,
+              let action = start.action else {
+            check("Caffeinate has a native start command", false)
+            return
+        }
+        defer { KeepAwakeManager.shared.stop() }
+        check("The native menu dispatches Caffeinate", app.sendAction(action, to: start.target, from: start))
+        check("Caffeinate started", KeepAwakeManager.shared.isActive)
+
+        controller.menuNeedsUpdate(menu)
+        guard let row = menu.item(withTitle: "Caffeinate status")?.view,
+              let field = row.subviews.first as? NSTextField else {
+            check("The active session has a countdown row", false)
+            return
+        }
+        let initialTitle = field.stringValue
+        let initialFrame = row.frame
+        let initialItems = menu.items
+        controller.menuWillOpen(menu)
+        defer { controller.menuDidClose(menu) }
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline && field.stringValue == initialTitle {
+            RunLoop.main.run(mode: .eventTracking, before: deadline)
+        }
+        check("Countdown updates during menu tracking", field.stringValue != initialTitle, "\(initialTitle) → \(field.stringValue)")
+        check("Countdown keeps the menu row the same size", row.frame == initialFrame)
+        check("Countdown keeps the same submenu items", menu.items == initialItems)
     }
 }

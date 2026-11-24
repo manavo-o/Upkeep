@@ -51,7 +51,7 @@ public final class HomebrewHUDModel {
     private var isPresented = false
 
     public var isOperating: Bool {
-        activeOperationPackageID != nil
+        activeOperationPackageID != nil || BrewLogStore.shared.isRunning
     }
 
     public var isShowingCategoryMenu: Bool {

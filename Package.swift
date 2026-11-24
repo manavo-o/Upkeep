@@ -42,7 +42,6 @@ let package = Package(
             name: "UpkeepCore",
             dependencies: coreDependencies,
             path: "Sources/Upkeep",
-            exclude: ["App/UpkeepApp.swift"],
             swiftSettings: coreSwiftSettings,
             linkerSettings: coreLinkerSettings
         ),

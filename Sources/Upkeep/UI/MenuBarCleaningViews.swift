@@ -573,11 +573,12 @@ public struct UninstallerAppRow: View {
 
             Spacer()
 
-            Button("Remove") {
+            Button("Review…") {
                 onRemove()
             }
             .buttonStyle(.upkeepSecondary)
             .controlSize(.small)
+            .accessibilityLabel("Review removal of \(app.name)")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

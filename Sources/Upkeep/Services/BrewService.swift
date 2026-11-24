@@ -26,6 +26,7 @@ public final class BrewLogStore {
     public private(set) var isRunning: Bool = false
     public private(set) var activeCommand: String? = nil
     public private(set) var liveStatusLine: String? = nil
+    private var liveOperationID: UUID?
 
     private static let fileURL: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -52,7 +53,8 @@ public final class BrewLogStore {
     private var pendingLiveLines: [String] = []
     private var liveFlushTask: Task<Void, Never>?
 
-    public func beginLive(command: String) {
+    func beginLive(command: String, operationID: UUID) {
+        liveOperationID = operationID
         liveFlushTask?.cancel()
         liveFlushTask = nil
         pendingLiveLines.removeAll(keepingCapacity: true)
@@ -69,8 +71,8 @@ public final class BrewLogStore {
         )
     }
 
-    public func appendLiveLine(_ line: String) {
-        guard lastLog != nil else { return }
+    func appendLiveLine(_ line: String, operationID: UUID) {
+        guard liveOperationID == operationID else { return }
         let cleanedLine = CLIExecutor.stripANSI(line).trimmingCharacters(in: .whitespacesAndNewlines)
         pendingLiveLines.append(cleanedLine.isEmpty ? line : cleanedLine)
         if liveFlushTask == nil {
@@ -124,6 +126,7 @@ public final class BrewLogStore {
         pendingLiveLines.removeAll()
         liveOutputBuffer = ""
         self.isRunning = false
+        liveOperationID = nil
         self.activeCommand = nil
         self.liveStatusLine = nil
         let cleanOut = CLIExecutor.stripANSI(stdout).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,6 +161,7 @@ public final class BrewLogStore {
     }
 
     public func clear() {
+        guard !isRunning else { return }
         self.lastLog = nil
         let url = Self.fileURL
         Task.detached(priority: .utility) {
@@ -232,6 +236,7 @@ public actor BrewService {
     private var catalog: [BrewPackageItem] = []
     private var catalogLookup: [String: BrewPackageItem] = [:]
     private var lastLoadedAt: Date?
+    private var isRunningCommand = false
     private var inFlightLoadTask: Task<[BrewPackageItem], Error>?
 
     // Cached full Homebrew API catalog (~15k formulae + casks) for sub-ms remote search without spawning Ruby `brew search`
@@ -886,19 +891,37 @@ public actor BrewService {
         #endif
     }
 
+    private struct CommandInProgress: LocalizedError {
+        var errorDescription: String? { "Wait for the current Homebrew command to finish." }
+    }
+
     private func runBrewStreaming(arguments: [String], commandLabel: String) async throws -> CLIResult {
-        await BrewLogStore.shared.beginLive(command: commandLabel)
-        let res = try await CLIExecutor.runStreaming(
-            binary: "brew",
-            arguments: arguments,
-            environment: Self.brewEnv
-        ) { line in
-            Task { @MainActor in
-                BrewLogStore.shared.appendLiveLine(line)
+        guard !isRunningCommand else { throw CommandInProgress() }
+        isRunningCommand = true
+        defer { isRunningCommand = false }
+
+        let operationID = UUID()
+        await BrewLogStore.shared.beginLive(command: commandLabel, operationID: operationID)
+        do {
+            let result = try await CLIExecutor.runStreaming(
+                binary: "brew",
+                arguments: arguments,
+                environment: Self.brewEnv
+            ) { line in
+                Task { @MainActor in
+                    BrewLogStore.shared.appendLiveLine(line, operationID: operationID)
+                }
             }
+            await BrewLogStore.shared.record(
+                command: commandLabel, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode
+            )
+            return result
+        } catch {
+            await BrewLogStore.shared.record(
+                command: commandLabel, stdout: "", stderr: error.localizedDescription, exitCode: 1
+            )
+            throw error
         }
-        await BrewLogStore.shared.record(command: commandLabel, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
-        return res
     }
 
     public func install(name: String, isCask: Bool) async throws -> String {
@@ -948,8 +971,7 @@ public actor BrewService {
 
     public func pin(name: String) async throws -> String {
         let cmd = "brew pin \(name)"
-        let res = try await CLIExecutor.run(binary: "brew", arguments: ["pin", name], environment: Self.brewEnv)
-        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        let res = try await runBrewStreaming(arguments: ["pin", name], commandLabel: cmd)
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
@@ -976,8 +998,7 @@ public actor BrewService {
 
     public func unpin(name: String) async throws -> String {
         let cmd = "brew unpin \(name)"
-        let res = try await CLIExecutor.run(binary: "brew", arguments: ["unpin", name], environment: Self.brewEnv)
-        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        let res = try await runBrewStreaming(arguments: ["unpin", name], commandLabel: cmd)
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
@@ -1003,8 +1024,7 @@ public actor BrewService {
 
     public func updateBrew() async throws -> String {
         let cmd = "brew update"
-        let res = try await CLIExecutor.run(binary: "brew", arguments: ["update"], environment: Self.brewEnv)
-        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        let res = try await runBrewStreaming(arguments: ["update"], commandLabel: cmd)
         guard res.succeeded else {
             throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
         }
@@ -1013,8 +1033,7 @@ public actor BrewService {
 
     public func runDoctor() async throws -> String {
         let cmd = "brew doctor"
-        let res = try await CLIExecutor.run(binary: "brew", arguments: ["doctor"], environment: Self.brewEnv)
-        await BrewLogStore.shared.record(command: cmd, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode)
+        let res = try await runBrewStreaming(arguments: ["doctor"], commandLabel: cmd)
         return CLIExecutor.stripANSI(res.stdout + "\n" + res.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -1,7 +1,5 @@
 import SwiftUI
 
-// MARK: - Settings Search Engine & Target Highlighting (DockDoor Pattern)
-
 public struct UpkeepSearchItem: Identifiable, Hashable, Sendable {
     public let id: String
     public let title: String
@@ -28,214 +26,152 @@ public struct UpkeepSearchItem: Identifiable, Hashable, Sendable {
 }
 
 public enum UpkeepSearchCatalog {
-    public static let allItems: [UpkeepSearchItem] = [
-        // Power & Input
-        UpkeepSearchItem(
-            id: "power.keepAwake",
-            title: "Keep Mac Awake",
-            section: "Caffeinate",
-            tab: .controls,
-            icon: "cup.and.saucer.fill",
-            keywords: ["caffeinate", "sleep", "awake", "display", "prevent", "power"]
-        ),
-        UpkeepSearchItem(
-            id: "power.assertionMode",
-            title: "Assertion Mode",
-            section: "Caffeinate",
-            tab: .controls,
-            icon: "display",
-            keywords: ["display", "system only", "iokit", "caffeinate", "sleep"]
-        ),
-        UpkeepSearchItem(
-            id: "power.quickDuration",
-            title: "Quick Duration",
-            section: "Caffeinate",
-            tab: .controls,
-            icon: "timer",
-            keywords: ["30m", "1h", "2h", "indefinite", "timer", "duration"]
-        ),
-        UpkeepSearchItem(
-            id: "power.cleanKeys",
-            title: "Keyboard Cleaning Lock",
-            section: "Clean Keys",
-            tab: .controls,
-            icon: "keyboard.badge.ellipsis",
-            keywords: ["lock", "keyboard", "wipe", "clean", "keys", "input"]
-        ),
-        UpkeepSearchItem(
-            id: "power.lockDuration",
-            title: "Lock Duration",
-            section: "Clean Keys",
-            tab: .controls,
-            icon: "clock",
-            keywords: ["30 seconds", "60 seconds", "2 minutes", "clean keys"]
-        ),
-        UpkeepSearchItem(
-            id: "power.dimScreen",
-            title: "Dim Screen While Locked",
-            section: "Clean Keys",
-            tab: .controls,
-            icon: "moon.fill",
-            keywords: ["dim", "screen", "backdrop", "dark", "clean keys"]
-        ),
-        UpkeepSearchItem(
-            id: "power.lockPointer",
-            title: "Lock Pointer & Trackpad",
-            section: "Clean Keys",
-            tab: .controls,
-            icon: "cursorarrow.slash",
-            keywords: ["mouse", "pointer", "trackpad", "cursor", "clean keys"]
-        ),
+    public static let allItems: [UpkeepSearchItem] =
+        items(for: .general, in: "Interface", [
+            ("updates.preferences", "Show setting descriptions", "text.alignleft", ["explanations", "appearance"]),
+        ]) +
+        items(for: .general, in: "Keyboard Shortcuts", [
+            ("general.shortcuts", "Open and Find Settings", "command", ["keybind", "cmd", "⌘f", "⌘,"]),
+        ]) +
+        items(for: .general, in: "Application", [
+            ("general.reset", "Restore Default Preferences", "arrow.counterclockwise", ["reset", "restore defaults"]),
+            ("general.lifecycle", "Restart or Quit Upkeep", "power", ["relaunch", "exit", "close"]),
+        ]) +
+        items(for: .controls, in: "", [
+            ("power.keepAwake", "Keep Mac Awake", "cup.and.saucer.fill", ["prevent sleep", "idle", "power", "stop", "extend"]),
+            ("power.assertionMode", "Keep Awake", "display", ["screen", "mac only", "display sleep", "power & input"]),
+            ("power.quickDuration", "Start a Session", "timer", ["30m", "1h", "2h", "indefinite", "duration"]),
+        ]) +
+        items(for: .cleanKeys, in: "", [
+            ("power.cleanKeys", "Lock Keyboard", "keyboard", ["wipe", "clean", "accessibility", "input", "power & input"]),
+            ("power.lockDuration", "Lock Duration", "clock", ["30 seconds", "60 seconds", "2 minutes", "timer"]),
+            ("power.dimScreen", "Dim Screen", "moon.fill", ["display", "brightness", "backdrop", "dark", "locked"]),
+            ("power.lockPointer", "Lock Pointer & Trackpad", "cursorarrow.slash", ["mouse", "cursor", "clicks"]),
+            ("power.unlock", "Unlock Early", "lock.open", ["escape", "esc", "command", "shortcut"]),
+        ]) +
+        items(for: .homebrew, in: "Packages", [
+            ("brew.hud", "Find Homebrew Packages", "magnifyingglass", ["brew", "search", "floating hud", "formulae", "casks", "install"]),
+            ("brew.outdated", "Package Upgrades", "arrow.up.circle", ["outdated", "update", "brew"]),
+        ]) +
+        items(for: .homebrew, in: "Activity", [
+            ("brew.log", "Homebrew Activity", "doc.text", ["log", "output", "stdout", "stderr", "install"]),
+            ("brew.diagnostics", "Homebrew Diagnostics", "stethoscope", ["doctor", "troubleshoot"]),
+        ]) +
+        items(for: .homebrew, in: "Installation", [
+            ("brew.installation", "Homebrew CLI", "terminal", ["install", "not found", "binary", "environment"]),
+            ("updates.cli", "Refresh Package Catalog", "arrow.clockwise", ["brew update", "definitions", "cli"]),
+            ("brew.shortcuts", "Floating Search Shortcuts", "command", ["keybinds", "cmd+k", "cmd+1", "esc", "hud"]),
+        ]) +
+        items(for: .cleaner, in: "", [
+            ("cleaner.dryRun", "Scan for Reclaimable Files", "sparkles", ["cache", "disk cleanup", "space", "storage", "dry run", "logs", "trash"]),
+        ]) +
+        items(for: .uninstaller, in: "", [
+            ("uninstaller.apps", "Uninstall Applications", "trash", ["remove", "apps", "trash", "leftovers", "cask"]),
+        ]) +
+        items(for: .updates, in: "Upkeep", [
+            ("updates.releases", "Check for Updates", "arrow.down.circle", ["version", "release", "install", "github"]),
+            ("updates.autoCheck", "Automatically check for updates", "clock.arrow.circlepath", ["auto check", "release"]),
+            ("updates.repository", "GitHub Repository", "link", ["source", "owner", "updates"]),
+            ("updates.permissions", "Accessibility Permission", "accessibility", ["grant", "system permissions", "clean keys"]),
+        ])
 
-        // Homebrew
-        UpkeepSearchItem(
-            id: "brew.hud",
-            title: "Homebrew Search HUD",
-            section: "Packages",
-            tab: .homebrew,
-            icon: "magnifyingglass",
-            keywords: ["brew", "search", "hud", "floating", "formulae", "casks"]
-        ),
-        UpkeepSearchItem(
-            id: "brew.outdated",
-            title: "Outdated Packages & Upgrades",
-            section: "Packages",
-            tab: .homebrew,
-            icon: "arrow.up.circle",
-            keywords: ["upgrade", "outdated", "updates", "brew", "packages"]
-        ),
-        UpkeepSearchItem(
-            id: "brew.log",
-            title: "Last Operation Log",
-            section: "Last Operation Log",
-            tab: .homebrew,
-            icon: "doc.text",
-            keywords: ["log", "output", "stdout", "stderr", "upgrade", "install", "doctor", "brew"]
-        ),
-        UpkeepSearchItem(
-            id: "brew.shortcuts",
-            title: "HUD Keyboard Shortcuts",
-            section: "HUD Shortcuts",
-            tab: .homebrew,
-            icon: "command",
-            keywords: ["shortcuts", "keybinds", "cmd+k", "cmd+1", "esc"]
-        ),
+    private static func items(
+        for tab: TraySection,
+        in section: String,
+        _ entries: [(id: String, title: String, icon: String, keywords: [String])]
+    ) -> [UpkeepSearchItem] {
+        entries.map {
+            UpkeepSearchItem(id: $0.id, title: $0.title, section: section, tab: tab, icon: $0.icon, keywords: $0.keywords)
+        }
+    }
+}
 
-        // Cleaner
-        UpkeepSearchItem(
-            id: "cleaner.dryRun",
-            title: "System & Cache Cleaner",
-            section: "Cleaner",
-            tab: .cleaner,
-            icon: "sparkles",
-            keywords: ["clean", "cache", "disk", "space", "storage", "dry-run", "logs", "trash"]
-        ),
-
-        // Uninstaller
-        UpkeepSearchItem(
-            id: "uninstaller.apps",
-            title: "Uninstall Applications",
-            section: "Uninstaller",
-            tab: .uninstaller,
-            icon: "trash",
-            keywords: ["uninstall", "remove", "apps", "trash", "leftovers", "cask"]
-        ),
-
-        // Updates & System
-        UpkeepSearchItem(
-            id: "updates.releases",
-            title: "Upkeep Releases & Auto-Check",
-            section: "Upkeep Releases",
-            tab: .updates,
-            icon: "arrow.triangle.2.circlepath",
-            keywords: ["version", "update", "github", "release", "auto"]
-        ),
-        UpkeepSearchItem(
-            id: "updates.cli",
-            title: "Update Homebrew CLI",
-            section: "CLI Utilities",
-            tab: .updates,
-            icon: "terminal",
-            keywords: ["brew", "homebrew", "cli", "update", "terminal"]
-        ),
-        UpkeepSearchItem(
-            id: "updates.permissions",
-            title: "Permissions & System Environment",
-            section: "Permissions & Environment",
-            tab: .updates,
-            icon: "lock.shield",
-            keywords: ["accessibility", "permission", "environment", "status", "cli"]
-        ),
-        UpkeepSearchItem(
-            id: "updates.preferences",
-            title: "Interface Preferences & Reset",
-            section: "Preferences",
-            tab: .updates,
-            icon: "slider.horizontal.3",
-            keywords: ["descriptions", "reset", "defaults", "restart", "quit"]
-        ),
-    ]
+struct UpkeepSettingsReveal: Equatable {
+    let tab: TraySection
+    let target: String
+    let request = UUID()
 }
 
 @MainActor
 @Observable
 public final class UpkeepSearchEngine {
-    private struct IndexedSearchEntry {
-        let item: UpkeepSearchItem
-        let titleLower: String
-        let sectionLower: String
-        let tabLower: String
-        let keywordsLower: [String]
+    public var query = "" {
+        didSet {
+            if query != oldValue {
+                recomputeResults()
+            }
+        }
     }
 
-    private static let indexedCatalog: [IndexedSearchEntry] = UpkeepSearchCatalog.allItems.map { item in
-        IndexedSearchEntry(
-            item: item,
-            titleLower: item.title.lowercased(),
-            sectionLower: item.section.lowercased(),
-            tabLower: item.tab.rawValue.lowercased(),
-            keywordsLower: item.keywords.map { $0.lowercased() }
-        )
-    }
-
-    public var query: String = "" {
-        didSet { recomputeResults() }
-    }
-
-    public private(set) var isSearching: Bool = false
     public private(set) var results: [UpkeepSearchItem] = []
     public private(set) var groupedResults: [(tab: TraySection, items: [UpkeepSearchItem])] = []
+    private(set) var highlightedItem: UpkeepSearchItem?
+    private(set) var reveal: UpkeepSettingsReveal?
+
+    public var isSearching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     public init() {}
 
+    func reveal(_ target: String, in tab: TraySection) {
+        reveal = UpkeepSettingsReveal(tab: tab, target: target)
+    }
+
+    func reveal(for tab: TraySection) -> UpkeepSettingsReveal? {
+        reveal?.tab == tab ? reveal : nil
+    }
+
+    func moveHighlight(by offset: Int) {
+        let orderedItems = groupedResults.flatMap(\.items)
+        guard !orderedItems.isEmpty else { return }
+        let currentIndex = highlightedItem.flatMap { orderedItems.firstIndex(of: $0) }
+        let newIndex = currentIndex.map { min(max($0 + offset, 0), orderedItems.count - 1) }
+            ?? (offset < 0 ? orderedItems.count - 1 : 0)
+        highlightedItem = orderedItems[newIndex]
+    }
+
+    func clear() {
+        query = ""
+        reveal = nil
+    }
+
     private func recomputeResults() {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else {
-            isSearching = false
+        let phrase = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let words = phrase.split(whereSeparator: \.isWhitespace)
+        highlightedItem = nil
+        guard !words.isEmpty else {
             results = []
             groupedResults = []
             return
         }
 
-        isSearching = true
-        let matched = Self.indexedCatalog.compactMap { entry -> UpkeepSearchItem? in
-            if entry.titleLower.contains(q)
-                || entry.sectionLower.contains(q)
-                || entry.tabLower.contains(q)
-                || entry.keywordsLower.contains(where: { $0.contains(q) }) {
-                return entry.item
+        let matches = UpkeepSearchCatalog.allItems.enumerated().compactMap { index, item -> (Int, Int, UpkeepSearchItem)? in
+            let fields = [item.title, item.section, item.tab.settingsTitle] + item.keywords
+            guard words.allSatisfy({ word in fields.contains { $0.localizedStandardContains(word) } }) else {
+                return nil
             }
-            return nil
+            let score: Int
+            if item.title.compare(phrase, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
+                score = 3
+            } else if item.title.localizedStandardContains(phrase) {
+                score = 2
+            } else if words.contains(where: { item.title.localizedStandardContains($0) }) {
+                score = 1
+            } else {
+                score = 0
+            }
+            return (score, index, item)
         }
-        results = matched
-        groupedResults = TraySection.allCases.compactMap { tab in
-            let items = matched.filter { $0.tab == tab }
-            return items.isEmpty ? nil : (tab, items)
+        results = matches.sorted {
+            $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 > $1.0
+        }.map(\.2)
+
+        var seenTabs = Set<TraySection>()
+        groupedResults = results.compactMap { result in
+            guard seenTabs.insert(result.tab).inserted else { return nil }
+            return (result.tab, results.filter { $0.tab == result.tab })
         }
     }
 }
-
-// MARK: - Search Results View
 
 public struct UpkeepSearchResultsView: View {
     let engine: UpkeepSearchEngine
@@ -251,15 +187,21 @@ public struct UpkeepSearchResultsView: View {
             ContentUnavailableView.search(text: engine.query)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            UpkeepSettingsFormView {
-                ForEach(engine.groupedResults, id: \.tab) { group in
-                    UpkeepSettingsSection(group.tab.rawValue) {
-                        ForEach(group.items) { item in
-                            UpkeepSearchResultRow(item: item) {
-                                onSelect(item)
+            ScrollViewReader { proxy in
+                UpkeepSettingsFormView {
+                    ForEach(engine.groupedResults, id: \.tab) { group in
+                        UpkeepSettingsSection(group.tab.settingsTitle) {
+                            ForEach(group.items) { item in
+                                UpkeepSearchResultRow(item: item, isHighlighted: item == engine.highlightedItem) {
+                                    onSelect(item)
+                                }
+                                .id(item.id)
                             }
                         }
                     }
+                }
+                .onChange(of: engine.highlightedItem) { _, item in
+                    if let item { proxy.scrollTo(item.id) }
                 }
             }
         }
@@ -268,95 +210,80 @@ public struct UpkeepSearchResultsView: View {
 
 private struct UpkeepSearchResultRow: View {
     let item: UpkeepSearchItem
+    let isHighlighted: Bool
     let action: () -> Void
-
-    @State private var isHovered = false
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
-                UpkeepSettingsIcon(systemName: item.icon, color: item.tab.accentColor, size: 24)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(item.title)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-
-                    Text("\(item.tab.rawValue) › \(item.section)")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+            HStack(spacing: 10) {
+                UpkeepSettingsIcon(systemName: item.icon, color: item.tab.accentColor, size: 26)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title).font(.body)
+                    if !item.section.isEmpty {
+                        Text(item.section)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
-
-                Spacer()
-
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .semibold))
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.forward")
+                    .font(.footnote.weight(.semibold))
                     .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
             }
-            .padding(.vertical, 2)
+            .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
-        .listRowBackground(isHovered ? Color.accentColor.opacity(0.08) : Color.clear)
+        .accessibilityAddTraits(isHighlighted ? .isSelected : [])
+        .listRowBackground(isHighlighted ? UpkeepSettingsPalette.accent.opacity(0.20) : nil)
     }
 }
 
-// MARK: - Scroll-To & Highlight Flash Environment
-
-private struct UpkeepScrollTargetKey: EnvironmentKey {
-    static let defaultValue: String? = nil
+private struct UpkeepSettingsRevealKey: EnvironmentKey {
+    static let defaultValue: UpkeepSettingsReveal? = nil
 }
 
-public extension EnvironmentValues {
-    var upkeepScrollTarget: String? {
-        get { self[UpkeepScrollTargetKey.self] }
-        set { self[UpkeepScrollTargetKey.self] = newValue }
+extension EnvironmentValues {
+    var upkeepSettingsReveal: UpkeepSettingsReveal? {
+        get { self[UpkeepSettingsRevealKey.self] }
+        set { self[UpkeepSettingsRevealKey.self] = newValue }
     }
 }
 
-public struct UpkeepSearchTargetModifier: ViewModifier {
-    let targetId: String
-    @Environment(\.upkeepScrollTarget) private var scrollTarget
+private struct UpkeepSearchTargetModifier: ViewModifier {
+    let id: String
+    @Environment(\.upkeepSettingsReveal) private var reveal
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHighlighted = false
 
-    public func body(content: Content) -> some View {
+    func body(content: Content) -> some View {
         content
-            .id(targetId)
             .background {
                 if isHighlighted {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.22))
-                        .padding(-6)
-                        .transition(.opacity)
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(UpkeepSettingsPalette.accent.opacity(0.20))
+                        .padding(-4)
                 }
             }
-            .onChange(of: scrollTarget) { _, newTarget in
-                flash(if: newTarget)
+            .id(id)
+            .task(id: reveal) {
+                guard reveal?.target == id else {
+                    isHighlighted = false
+                    return
+                }
+                isHighlighted = true
+                try? await Task.sleep(for: .seconds(1.4))
+                guard !Task.isCancelled else { return }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.35)) {
+                    isHighlighted = false
+                }
             }
-            .onAppear {
-                flash(if: scrollTarget)
-            }
-    }
-
-    private func flash(if target: String?) {
-        guard target == targetId else {
-            if isHighlighted {
-                withAnimation(.easeOut(duration: 0.25)) { isHighlighted = false }
-            }
-            return
-        }
-        withAnimation(.easeIn(duration: 0.18)) { isHighlighted = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) {
-            withAnimation(.easeOut(duration: 0.45)) { isHighlighted = false }
-        }
     }
 }
 
 public extension View {
     func upkeepSearchTarget(_ id: String) -> some View {
-        modifier(UpkeepSearchTargetModifier(targetId: id))
+        modifier(UpkeepSearchTargetModifier(id: id))
     }
 }

@@ -62,6 +62,22 @@ public final class KeepAwakeManager {
                 self?.stop()
             }
         }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let expiry = self.expiresAt else { return }
+                if expiry <= Date() {
+                    self.stop()
+                } else {
+                    self.scheduleExpiration(at: expiry)
+                    self.refreshFormattedRemaining()
+                    self.startDisplayTimer()
+                }
+            }
+        }
     }
 
     public func start(durationMinutes: Int?, mode: KeepAwakeMode = .displayAndSystem) {
@@ -210,9 +226,7 @@ public final class KeepAwakeManager {
             }
         }
         timer.tolerance = useMinuteCadence ? 2.0 : 0.25
-        // Intentionally use `.default` (not `.common`) so ticks pause during NSMenu `.eventTracking`.
-        // This keeps the countdown accurate whenever the menu is opened without rebuilding/closing
-        // hovered submenus inside `MenuBarExtraStyle(.menu)`.
+        // The open status menu has a dedicated timer that only redraws its countdown field.
         RunLoop.main.add(timer, forMode: .default)
         displayTimer = timer
     }

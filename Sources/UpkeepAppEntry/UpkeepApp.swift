@@ -1,31 +1,44 @@
 import AppKit
-import SwiftUI
 import UpkeepCore
 
 @main
-struct UpkeepApp: App {
-    @State private var keepAwake = KeepAwakeManager.shared
-    @State private var memoryRecovery = IdleMemoryRecovery.shared
-    private let coordinator = HUDCoordinator.shared
+@MainActor
+enum UpkeepApp {
+    static func main() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
 
-    init() {
-        IdleMemoryRecovery.shared.start()
+        let recovery = IdleMemoryRecovery.shared
+        recovery.start()
+        let coordinator = HUDCoordinator.shared
+        let appDelegate = UpkeepApplicationDelegate(coordinator: coordinator)
+        app.delegate = appDelegate
+        coordinator.installMainMenuIfNeeded()
+        let statusMenu = StatusMenuController(coordinator: coordinator)
+        statusMenu.install()
         Task { @MainActor in
-            await IdleMemoryRecovery.shared.finishRestoration()
+            await recovery.finishRestoration()
             CleaningModeManager.shared.refreshPermissionStatus()
-            HUDCoordinator.shared.trayViewModel.refreshOverview()
+            coordinator.trayViewModel.refreshOverview()
             UpdateManager.shared.checkIfDue()
         }
+
+        withExtendedLifetime((appDelegate, statusMenu)) {
+            app.run()
+        }
+    }
+}
+
+@MainActor
+private final class UpkeepApplicationDelegate: NSObject, NSApplicationDelegate {
+    private let coordinator: HUDCoordinator
+
+    init(coordinator: HUDCoordinator) {
+        self.coordinator = coordinator
     }
 
-    var body: some Scene {
-        MenuBarExtra(isInserted: $memoryRecovery.isStatusItemInserted) {
-            MenuBarView(coordinator: coordinator)
-        } label: {
-            Image(systemName: keepAwake.isActive ? "cup.and.saucer.fill" : "arrow.up.circle")
-                .renderingMode(.template)
-                .accessibilityLabel(keepAwake.isActive ? "Upkeep: Caffeinated" : "Upkeep")
-        }
-        .menuBarExtraStyle(.menu)
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        coordinator.showMainWindow()
+        return false
     }
 }

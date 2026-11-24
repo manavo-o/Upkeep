@@ -1,9 +1,9 @@
 import AppKit
 import SwiftUI
 
-// MARK: - macOS 27 Native Settings Components (Inspired by Canapé, DockDoor, Handy & Apple System Settings)
+// MARK: - Settings preferences
 
-/// Preference key for toggling inline setting descriptions across Upkeep (DockDoor pattern).
+/// Preference for displaying explanations under settings labels.
 public enum UpkeepSettingsPreferences {
     public static let showDescriptionsKey = "UpkeepShowSettingDescriptions"
 }
@@ -73,14 +73,15 @@ public extension PrimitiveButtonStyle where Self == UpkeepPrimaryButtonStyle {
 // MARK: - Native Centered Grouped Settings Form Container (Canapé / DockDoor / Handy Rhythm)
 
 public struct UpkeepSettingsFormView<Header: View, Content: View>: View {
-    @Environment(\.upkeepScrollTarget) private var scrollTarget
+    @Environment(\.upkeepSettingsReveal) private var reveal
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let maxColumnWidth: CGFloat
     let hasHeader: Bool
     let header: Header
     let content: Content
 
     public init(
-        maxColumnWidth: CGFloat = 600,
+        maxColumnWidth: CGFloat = upkeepSettingsColumnWidth,
         @ViewBuilder header: () -> Header,
         @ViewBuilder content: () -> Content
     ) {
@@ -92,13 +93,13 @@ public struct UpkeepSettingsFormView<Header: View, Content: View>: View {
 
     public var body: some View {
         GeometryReader { geo in
-            let sideMargin = max(18, (geo.size.width - maxColumnWidth) / 2)
+            let columnWidth = min(maxColumnWidth, geo.size.width)
             VStack(spacing: 0) {
                 if hasHeader {
                     header
-                        .padding(.horizontal, sideMargin + 4)
+                        .padding(.horizontal, 20)
                         .padding(.top, 14)
-                        .padding(.bottom, 8)
+                        .padding(.bottom, 10)
                 }
 
                 ScrollViewReader { proxy in
@@ -107,35 +108,29 @@ public struct UpkeepSettingsFormView<Header: View, Content: View>: View {
                     }
                     .formStyle(.grouped)
                     .scrollContentBackground(.hidden)
-                    .contentMargins(.horizontal, sideMargin, for: .scrollContent)
-                    .contentMargins(.top, hasHeader ? 2 : 12, for: .scrollContent)
+                    .contentMargins(.horizontal, 0, for: .scrollContent)
+                    .contentMargins(.top, hasHeader ? 0 : 2, for: .scrollContent)
                     .contentMargins(.bottom, 24, for: .scrollContent)
                     .upkeepSoftTopScrollEdge()
-                    .onChange(of: scrollTarget) { _, target in
-                        guard let target else { return }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                            withAnimation(.easeInOut(duration: 0.28)) {
-                                proxy.scrollTo(target, anchor: .center)
-                            }
-                        }
-                    }
-                    .onAppear {
-                        guard let target = scrollTarget else { return }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            withAnimation(.easeInOut(duration: 0.28)) {
-                                proxy.scrollTo(target, anchor: .center)
-                            }
+                    .task(id: reveal) {
+                        guard let reveal else { return }
+                        // Allow the new pane's form to mount its row IDs.
+                        await Task.yield()
+                        guard !Task.isCancelled else { return }
+                        withAnimation(reduceMotion ? nil : .smooth(duration: 0.25)) {
+                            proxy.scrollTo(reveal.target, anchor: .center)
                         }
                     }
                 }
             }
+            .frame(width: columnWidth)
+            .frame(width: geo.size.width, alignment: .top)
         }
-        .ignoresSafeArea(.container, edges: .top)
     }
 }
 
 public extension UpkeepSettingsFormView where Header == EmptyView {
-    init(maxColumnWidth: CGFloat = 600, @ViewBuilder content: () -> Content) {
+    init(maxColumnWidth: CGFloat = upkeepSettingsColumnWidth, @ViewBuilder content: () -> Content) {
         self.maxColumnWidth = maxColumnWidth
         self.hasHeader = false
         self.header = EmptyView()
@@ -143,47 +138,28 @@ public extension UpkeepSettingsFormView where Header == EmptyView {
     }
 }
 
-// MARK: - Canapé-Style Minimalist Pane Header (Floats Directly on Canvas Aligned with Traffic Lights)
+struct UpkeepTaskLabel: View {
+    let title: String
+    let systemImage: String
+    let runningTitle: String
+    let isRunning: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-public struct UpkeepPaneHeader: View {
-    let section: TraySection
-    let subtitle: String?
-    let trailing: AnyView?
-
-    public init(section: TraySection, subtitle: String? = nil) {
-        self.section = section
-        self.subtitle = subtitle
-        self.trailing = nil
-    }
-
-    public init<Trailing: View>(section: TraySection, subtitle: String? = nil, @ViewBuilder trailing: () -> Trailing) {
-        self.section = section
-        self.subtitle = subtitle
-        self.trailing = AnyView(trailing())
-    }
-
-    public var body: some View {
-        HStack(spacing: 10) {
-            UpkeepSectionIcon(section: section, size: 24)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(section.rawValue)
-                    .font(.system(size: 16.5, weight: .semibold))
-                    .foregroundStyle(.primary)
-
-                if let subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+    var body: some View {
+        HStack(spacing: 6) {
+            if isRunning {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: systemImage)
+                    .accessibilityHidden(true)
             }
-
-            Spacer(minLength: 8)
-
-            if let trailing {
-                trailing
-            }
+            Text(isRunning ? runningTitle : title)
         }
+        .lineLimit(1)
+        .contentTransition(.opacity)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: isRunning)
     }
 }
 
@@ -205,8 +181,9 @@ public struct UpkeepSettingsSection<Content: View>: View {
             content
         } header: {
             Text(title)
-                .font(.system(size: 12.5, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .font(.headline)
+                .foregroundStyle(.primary)
+                .accessibilityAddTraits(.isHeader)
         } footer: {
             if let footer {
                 Text(footer)
@@ -237,7 +214,8 @@ public struct UpkeepInfoButton: View {
                 .font(.system(size: 12))
                 .foregroundStyle(.tertiary)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
+        .accessibilityLabel("More information")
         .popover(isPresented: $isPresented, arrowEdge: .bottom) {
             Text(text)
                 .font(.footnote)
@@ -264,15 +242,16 @@ public struct UpkeepSettingsIcon: View {
 
     public var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: size * 0.26, style: .continuous)
-                .fill(color.opacity(0.15))
+            RoundedRectangle(cornerRadius: size * 0.29)
+                .fill(color.opacity(0.12))
 
             Image(systemName: systemName)
-                .font(.system(size: size * 0.50, weight: .semibold))
+                .font(.system(size: size * 0.49, weight: .medium))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(color)
         }
         .frame(width: size, height: size)
+        .accessibilityHidden(true)
     }
 }
 
@@ -295,7 +274,7 @@ public struct UpkeepSettingLabel: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 5) {
                 Text(title)
-                    .font(.system(size: 13, weight: .regular))
+                    .font(.body)
                     .foregroundStyle(.primary)
 
                 if let info {
@@ -463,19 +442,18 @@ public struct UpkeepStatusRow: View {
 
     public var body: some View {
         HStack(spacing: 12) {
+            UpkeepSettingsIcon(systemName: icon, color: isGranted ? .green : .orange, size: 28)
             UpkeepSettingLabel(title, subtitle: description)
 
             Spacer(minLength: 8)
 
             HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(isGranted ? Color.green : Color.orange)
-                        .frame(width: 7, height: 7)
-                    Text(isGranted ? grantedLabel : missingLabel)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(isGranted ? .secondary : Color.orange)
-                }
+                Label(isGranted ? grantedLabel : missingLabel,
+                      systemImage: isGranted ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .font(.footnote.weight(.medium))
+                    .symbolRenderingMode(.multicolor)
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
 
                 if !isGranted, let actionTitle, let action {
                     Button(actionTitle, action: action)
@@ -526,7 +504,7 @@ public struct UpkeepKeycapGroup: View {
         HStack(spacing: 4) {
             ForEach(Array(keys.enumerated()), id: \.offset) { _, key in
                 Text(key)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .font(.system(.caption, design: .monospaced).weight(.medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
@@ -538,4 +516,206 @@ public struct UpkeepKeycapGroup: View {
             }
         }
     }
+}
+
+/// A status and its controls share a single surface at the top of a pane.
+struct UpkeepSettingsFeature<Icon: View, Detail: View, Actions: View>: View {
+    let title: String
+    let tint: Color
+    @ViewBuilder let icon: () -> Icon
+    @ViewBuilder let detail: () -> Detail
+    @ViewBuilder let actions: () -> Actions
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 16) {
+                summary
+                Spacer(minLength: 0)
+                actions().fixedSize(horizontal: true, vertical: false)
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                summary
+                actions()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(16)
+        .background {
+            if #available(macOS 26.0, *) {
+                Color.clear.glassEffect(.regular.tint(tint.opacity(0.15)), in: .rect(cornerRadius: 16))
+            } else {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(tint.opacity(0.08))
+            }
+        }
+    }
+
+    private var summary: some View {
+        HStack(spacing: 12) {
+            icon()
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.headline)
+                detail()
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .layoutPriority(1)
+    }
+}
+
+struct UpkeepSettingsShortcut: View {
+    let title: String
+    let keys: [String]
+
+    var body: some View {
+        LabeledContent(title) {
+            UpkeepKeycapGroup(keys)
+        }
+    }
+}
+
+struct UpkeepPaneSearchField: View {
+    let placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .accessibilityLabel(placeholder)
+                .onExitCommand { text = "" }
+
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .background {
+            if #available(macOS 26.0, *) {
+                Color.clear.glassEffect(.regular.interactive(), in: .capsule)
+            } else {
+                Capsule().fill(.quaternary.opacity(0.45))
+            }
+        }
+    }
+}
+
+public let upkeepSettingsColumnWidth: CGFloat = 800
+
+struct UpkeepReviewFileRow: View {
+    let title: String
+    let detail: String
+    let note: String?
+    let size: String
+    let path: String
+    var isAppRunning = false
+    @Binding var isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Toggle(isOn: $isSelected) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(title)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if isAppRunning {
+                            runningBadge
+                        }
+                    }
+                    Text(detail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let note {
+                        Text(note)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .toggleStyle(.checkbox)
+            .accessibilityLabel(isAppRunning ? "\(title), app is currently running" : title)
+            .accessibilityHint(note ?? detail)
+
+            Spacer(minLength: 0)
+            Text(size)
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize()
+            Button("Reveal in Finder", systemImage: "folder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .help("Reveal in Finder")
+        }
+        .padding(.vertical, 3)
+    }
+
+    private var runningBadge: some View {
+        let blue = Color(nsColor: .systemBlue)
+
+        return HStack(spacing: 4) {
+            Circle()
+                .frame(width: 5, height: 5)
+            Text("Running")
+                .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(blue)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(blue.opacity(0.13), in: Capsule())
+        .fixedSize()
+        .accessibilityHidden(true)
+    }
+}
+
+enum UpkeepSettingsPalette {
+    static let accent = Color(nsColor: NSColor(srgbRed: 0.05, green: 0.43, blue: 0.88, alpha: 1))
+
+    static let selectedSidebarRow = Color(nsColor: NSColor(name: nil) { appearance in
+        if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+            return NSColor(srgbRed: 0.30, green: 0.60, blue: 1.00, alpha: 0.28)
+        }
+        return NSColor(srgbRed: 0.09, green: 0.46, blue: 0.94, alpha: 0.16)
+    })
+
+    static let detail = Color(nsColor: NSColor(name: nil) { appearance in
+        if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+            return NSColor(srgbRed: 0.108, green: 0.108, blue: 0.112, alpha: 1)
+        }
+        return NSColor(srgbRed: 0.985, green: 0.983, blue: 0.977, alpha: 1)
+    })
+}
+
+struct UpkeepSettingsSidebarMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }

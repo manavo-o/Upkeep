@@ -32,6 +32,8 @@ public final class UpdateManager {
 
     public private(set) var isChecking: Bool = false
     public private(set) var isInstalling: Bool = false
+    public private(set) var isUpdatingHomebrew: Bool = false
+    public private(set) var homebrewUpdateMessage: String?
     public private(set) var availableRelease: AppReleaseInfo?
     public private(set) var statusMessage: String?
     public private(set) var errorMessage: String?
@@ -71,7 +73,7 @@ public final class UpdateManager {
     }
 
     public func checkForUpdates() async {
-        guard !isChecking else { return }
+        guard !isChecking, !isInstalling else { return }
         isChecking = true
         errorMessage = nil
         statusMessage = "Checking for updates…"
@@ -87,7 +89,7 @@ public final class UpdateManager {
         guard !trimmedRepo.isEmpty,
               let apiURL = URL(string: "https://api.github.com/repos/\(trimmedRepo)/releases/latest") else {
             availableRelease = nil
-            statusMessage = "v\(currentVersion) · Set a GitHub repo (owner/repo) to check app releases, or update Homebrew below."
+            statusMessage = "v\(currentVersion) · Enter a GitHub repository (owner/repo) to check for releases."
             return
         }
 
@@ -144,7 +146,7 @@ public final class UpdateManager {
     }
 
     public func installAvailableUpdate() async {
-        guard let release = availableRelease, !isInstalling else { return }
+        guard let release = availableRelease, !isChecking, !isInstalling, !isUpdatingHomebrew else { return }
 
         guard let downloadURL = release.downloadURL else {
             if let htmlURL = release.htmlURL {
@@ -228,24 +230,16 @@ public final class UpdateManager {
     }
 
     public func updateCLIUtilities() async {
-        guard !isInstalling else { return }
-        isInstalling = true
-        errorMessage = nil
-        statusMessage = "Updating Homebrew…"
-
-        defer { isInstalling = false }
-
-        guard BrewService.isInstalled() else {
-            statusMessage = "Homebrew CLI not found."
-            return
-        }
+        guard !isInstalling, !isUpdatingHomebrew, BrewService.isInstalled() else { return }
+        isUpdatingHomebrew = true
+        homebrewUpdateMessage = nil
+        defer { isUpdatingHomebrew = false }
 
         do {
             _ = try await BrewService.shared.updateBrew()
-            statusMessage = "Homebrew index updated."
+            homebrewUpdateMessage = "Homebrew package catalog refreshed."
         } catch {
-            errorMessage = error.localizedDescription
-            statusMessage = nil
+            homebrewUpdateMessage = error.localizedDescription
         }
     }
 

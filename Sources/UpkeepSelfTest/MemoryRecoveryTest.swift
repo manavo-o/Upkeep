@@ -6,12 +6,13 @@ import UpkeepCore
 /// An opt-in process-level regression. Run UpkeepSelfTest --memory-recovery.
 /// It exercises deferred recovery, reopening, and the Caffeinate handoff across execs.
 struct MemoryRecoveryTestApp: App {
-    @State private var recovery = IdleMemoryRecovery.shared
-    private let coordinator = HUDCoordinator.shared
+    private let statusMenu: StatusMenuController
 
     init() {
         let isReplacement = ProcessInfo.processInfo.environment["UPKEEP_MEMORY_HANDOFF"] != nil
         IdleMemoryRecovery.shared.start()
+        statusMenu = StatusMenuController(coordinator: HUDCoordinator.shared)
+        statusMenu.install()
         Task { @MainActor in
             if isReplacement && ProcessInfo.processInfo.environment["UPKEEP_MEMORY_TEST_HANDOFF"] == "timeout" {
                 try? await Task.sleep(for: .seconds(15))
@@ -28,11 +29,7 @@ struct MemoryRecoveryTestApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra(isInserted: $recovery.isStatusItemInserted) {
-            MenuBarView(coordinator: coordinator)
-        } label: {
-            Image(systemName: "cup.and.saucer")
-        }.menuBarExtraStyle(.menu)
+        Settings { EmptyView() }
     }
 }
 

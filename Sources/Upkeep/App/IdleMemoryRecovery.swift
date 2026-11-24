@@ -80,7 +80,7 @@ public final class IdleMemoryRecovery: NSObject {
         @MainActor func restore() {
             let vm = HUDCoordinator.shared.trayViewModel
             vm.selectedAwakeMode = KeepAwakeMode(rawValue: selectedAwakeMode) ?? .displayAndSystem
-            vm.activeSection = TraySection(rawValue: activeSection) ?? .controls
+            vm.activeSection = TraySection(rawValue: activeSection) ?? .general
             vm.cleaningDuration = cleaningDuration
             vm.cleaningDimScreen = cleaningDimScreen
             vm.cleaningLockPointer = cleaningLockPointer
@@ -205,10 +205,10 @@ public final class IdleMemoryRecovery: NSObject {
             && !CleaningModeManager.shared.isLocked
             && !CLIExecutor.hasRunningCommands && vm.pendingUninstallApp == nil
             && !BrewLogStore.shared.isRunning && !HUDCoordinator.shared.homebrewModel.isOperating
-            && !vm.isRefreshingBrew && !vm.isUpgradingBrew && !vm.isRunningBrewDoctor
+            && !vm.isRefreshingBrew && !vm.isHomebrewBusy
             && !vm.isScanningClean && !vm.isCleaning && !vm.isLoadingApps && !vm.isUpdatingAppSizes
             && !vm.isInspectingUninstall && !vm.isUninstallingApp
-            && !updater.isChecking && !updater.isInstalling
+            && !updater.isChecking && !updater.isInstalling && !updater.isUpdatingHomebrew
     }
 
     private func replaceProcess() async {
