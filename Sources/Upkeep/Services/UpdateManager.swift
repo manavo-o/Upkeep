@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import Observation
 
-public struct AppReleaseInfo: Sendable, Equatable {
+public struct AppReleaseInfo: Sendable, Equatable, Codable {
     public let version: String
     public let releaseNotes: String
     public let downloadURL: URL?
@@ -54,6 +54,12 @@ public final class UpdateManager {
             self.autoCheckUpdates = UserDefaults.standard.bool(forKey: Self.autoCheckDefaultsKey)
         }
         self.lastCheckedAt = UserDefaults.standard.object(forKey: Self.lastCheckDefaultsKey) as? Date
+    }
+
+    func restorePresentation(release: AppReleaseInfo?, status: String?, error: String?) {
+        availableRelease = release
+        statusMessage = status
+        errorMessage = error
     }
 
     public func checkIfDue() {

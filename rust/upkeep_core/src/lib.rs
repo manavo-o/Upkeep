@@ -1246,7 +1246,12 @@ pub extern "C" fn upkeep_brew_index_free(ptr: *mut BrewSearchIndex) {
     }
 }
 
-/// Immediately evicts all indexed packages and releases slab buffers back to the allocator.
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+}
+
+/// Immediately evicts all indexed packages and releases slab buffers back to macOS.
 #[no_mangle]
 pub extern "C" fn upkeep_brew_index_clear(ptr: *mut BrewSearchIndex) {
     if ptr.is_null() {
@@ -1256,6 +1261,10 @@ pub extern "C" fn upkeep_brew_index_clear(ptr: *mut BrewSearchIndex) {
         let index = unsafe { &*ptr };
         if let Ok(mut guard) = index.slab.write() {
             *guard = BrewCatalogSlab::default();
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
         }
     });
 }

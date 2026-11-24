@@ -19,6 +19,15 @@ struct UpkeepSelfTest {
     }
 
     static func main() async {
+        if ProcessInfo.processInfo.arguments.contains("--memory-recovery") || ProcessInfo.processInfo.environment["UPKEEP_MEMORY_SELF_TEST"] == "1" {
+            let path = ProcessInfo.processInfo.environment["UPKEEP_MEMORY_TEST_DIRECTORY"]
+                ?? FileManager.default.temporaryDirectory.appendingPathComponent("upkeep-recovery-test-\(UUID().uuidString)").path
+            try! FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+            setenv("UPKEEP_MEMORY_SELF_TEST", "1", 1)
+            setenv("UPKEEP_MEMORY_TEST_DIRECTORY", path, 1)
+            MemoryRecoveryTestApp.main()
+            return
+        }
         print("=== Upkeep Extensive Self-Test Suite (macOS 27, v1.4.3) ===")
         print("  Engine: \(UpkeepEngine.isUsingRustCore ? "Rust upkeep_core C-ABI" : "Swift fallback")")
         let env = ProcessInfo.processInfo.environment
@@ -129,6 +138,12 @@ struct UpkeepSelfTest {
             let hits = try await BrewService.shared.searchRemote(query: "git")
             let searchMs = Date().timeIntervalSince(searchStart) * 1000.0
             check("15k Brew catalog search ('git') benchmark", !hits.isEmpty && hits.first?.name == "git", String(format: "%d hits in %.1fms (top=%@)", hits.count, searchMs, hits.first?.name ?? "nil"))
+            if await BrewService.shared.hasWarmRemoteIndex() {
+                try await Task.sleep(for: .seconds(6))
+                check("Homebrew search index expires while idle", await !BrewService.shared.hasWarmRemoteIndex())
+                let reloaded = try await BrewService.shared.searchRemote(query: "git")
+                check("Homebrew search reloads after idle eviction", reloaded.first?.name == "git")
+            }
         } catch {
             check("BrewService.loadInstalledAndOutdated() resilient", false, error.localizedDescription)
         }

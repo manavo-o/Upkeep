@@ -114,7 +114,7 @@ public struct CleanerScanResult: Sendable, Equatable {
     }
 }
 
-public struct CleanFailedItem: Identifiable, Sendable, Hashable {
+public struct CleanFailedItem: Identifiable, Sendable, Hashable, Codable {
     public var id: String { path }
     public let path: String
     public let error: String
@@ -125,7 +125,7 @@ public struct CleanFailedItem: Identifiable, Sendable, Hashable {
     }
 }
 
-public struct CleanExecutionResult: Sendable, Equatable {
+public struct CleanExecutionResult: Sendable, Equatable, Codable {
     public let reclaimedBytes: Int64
     public let removedCount: Int
     public let failedItems: [CleanFailedItem]

@@ -4,12 +4,9 @@ import SwiftUI
 /// Borderless, non-activating floating NSPanel configured for macOS 27 Golden Gate Liquid Glass.
 @MainActor
 public final class LiquidGlassPanel: NSPanel {
-    public init<Content: View>(
-        contentRect: NSRect,
-        level: NSWindow.Level = .floating,
-        useWindowGlass: Bool = false,
-        @ViewBuilder rootView: () -> Content
-    ) {
+    var hudShortcut: ((NSEvent) -> Bool)?
+
+    init(contentRect: NSRect, level: NSWindow.Level = .floating, useWindowGlass: Bool = false, content: NSView) {
         super.init(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -26,14 +23,10 @@ public final class LiquidGlassPanel: NSPanel {
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         self.animationBehavior = .utilityWindow
 
-        let hosting = NSHostingView(rootView: rootView())
-        hosting.sizingOptions = []
-        hosting.translatesAutoresizingMaskIntoConstraints = false
-
         if useWindowGlass {
             if #available(macOS 26.0, *) {
                 let glass = NSGlassEffectView(frame: contentRect)
-                glass.contentView = hosting
+                glass.contentView = content
                 self.contentView = glass
             } else {
                 let visual = NSVisualEffectView(frame: contentRect)
@@ -43,18 +36,41 @@ public final class LiquidGlassPanel: NSPanel {
                 visual.wantsLayer = true
                 visual.layer?.cornerRadius = 20
                 visual.layer?.masksToBounds = true
-                visual.addSubview(hosting)
+                content.translatesAutoresizingMaskIntoConstraints = false
+                visual.addSubview(content)
                 NSLayoutConstraint.activate([
-                    hosting.leadingAnchor.constraint(equalTo: visual.leadingAnchor),
-                    hosting.trailingAnchor.constraint(equalTo: visual.trailingAnchor),
-                    hosting.topAnchor.constraint(equalTo: visual.topAnchor),
-                    hosting.bottomAnchor.constraint(equalTo: visual.bottomAnchor)
+                    content.leadingAnchor.constraint(equalTo: visual.leadingAnchor),
+                    content.trailingAnchor.constraint(equalTo: visual.trailingAnchor),
+                    content.topAnchor.constraint(equalTo: visual.topAnchor),
+                    content.bottomAnchor.constraint(equalTo: visual.bottomAnchor)
                 ])
                 self.contentView = visual
             }
         } else {
-            self.contentView = hosting
+            self.contentView = content
         }
+    }
+
+    public convenience init<Content: View>(
+        contentRect: NSRect,
+        level: NSWindow.Level = .floating,
+        useWindowGlass: Bool = false,
+        @ViewBuilder rootView: () -> Content
+    ) {
+        let hosting = NSHostingView(rootView: rootView())
+        hosting.sizingOptions = []
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        self.init(contentRect: contentRect, level: level, useWindowGlass: useWindowGlass, content: hosting)
+    }
+
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command), hudShortcut?(event) == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    public override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, hudShortcut?(event) == true { return }
+        super.sendEvent(event)
     }
 
     public override var canBecomeKey: Bool { true }

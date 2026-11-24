@@ -37,7 +37,7 @@ jobs:
 
       - name: Build Upkeep.app
         env:
-          UPKEEP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '1.4.2' }}
+          UPKEEP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           UPKEEP_REQUIRE_RUST: "1"
         run: |
           export UPKEEP_VERSION="${UPKEEP_VERSION#v}"
@@ -51,7 +51,7 @@ jobs:
 
       - name: Package Release Archive
         run: |
-          VERSION="${GITHUB_REF_NAME:-v1.4.2}"
+          VERSION="v$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/Upkeep.app/Contents/Info.plist)"
           mkdir -p release
           ditto -c -k --sequesterRsrc --keepParent dist/Upkeep.app "release/Upkeep-${VERSION}.zip"
 

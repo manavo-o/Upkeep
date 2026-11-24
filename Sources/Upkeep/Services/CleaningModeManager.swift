@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Foundation
 import Observation
+import Synchronization
 
 @MainActor
 @Observable
@@ -23,13 +24,15 @@ public final class CleaningModeManager {
         return max(0, min(1, Double(remainingSeconds) / Double(totalDurationSeconds)))
     }
 
+    private nonisolated static let ownsPointerLock = Atomic<Bool>(false)
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var countdownTask: Task<Void, Never>?
     private var holdUnlockTask: Task<Void, Never>?
     private var holdStartDate: Date?
     private var lastCommandTapTime: Date = .distantPast
-    private var hasPromptedThisSession: Bool = false
+    private(set) var hasPromptedThisSession: Bool = false
     private var onStateChange: (@MainActor (Bool) -> Void)?
 
     private init() {
@@ -57,13 +60,15 @@ public final class CleaningModeManager {
             }
         }
 
-        // Install process termination signal safety net
+        // Initialize the atomic before installing signal handlers.
+        Self.ownsPointerLock.store(false, ordering: .relaxed)
+        // A cancelled replacement must leave another process's pointer lock alone.
         signal(SIGINT) { _ in
-            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            CleaningModeManager.releasePointerIfOwned()
             Foundation.exit(0)
         }
         signal(SIGTERM) { _ in
-            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            CleaningModeManager.releasePointerIfOwned()
             Foundation.exit(0)
         }
     }
@@ -116,6 +121,11 @@ public final class CleaningModeManager {
                 }
             }
         }
+    }
+
+    func restorePromptState(prompted: Bool, denied: Bool) {
+        hasPromptedThisSession = prompted
+        permissionDenied = denied && !hasAccessibility
     }
 
     public func openAccessibilitySettings() {
@@ -204,6 +214,7 @@ public final class CleaningModeManager {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         if lockPointer {
+            Self.ownsPointerLock.store(true, ordering: .relaxed)
             CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
         }
 
@@ -226,7 +237,7 @@ public final class CleaningModeManager {
         countdownTask?.cancel()
         countdownTask = nil
         cancelHoldUnlock()
-        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        Self.releasePointerIfOwned()
 
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -243,6 +254,12 @@ public final class CleaningModeManager {
             isLocked = false
             onStateChange?(false)
         }
+    }
+
+    private nonisolated static func releasePointerIfOwned() {
+        guard ownsPointerLock.load(ordering: .relaxed) else { return }
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        ownsPointerLock.store(false, ordering: .relaxed)
     }
 
     private func handleInterceptedEvent(type: CGEventType, keyCode: Int64, flags: CGEventFlags, isRepeat: Bool) {

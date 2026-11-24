@@ -1,4 +1,15 @@
-## What's New in v1.4.3
+## What's New in v1.4.4
+
+- Rebuilt the Homebrew HUD with native AppKit search, reusable table cells, Liquid Glass surfaces, and a native Actions menu. Existing package actions and keyboard shortcuts remain available.
+- First queries, pasted searches, and scope changes now run immediately. Rapid input bursts use a short, one-frame debounce to limit redundant work.
+- Balanced search-index reuse and memory use with a two-second grace period after the HUD closes. Idle catalog data can also be released while Settings stays open, and the next search reloads the disk-backed index automatically.
+- Added macOS's supported security-code AutoFill opt-out for ordinary search fields, preventing an unnecessary AutoFill helper from starting during Homebrew searches.
+- Added automatic idle process recovery to release long-lived UI framework caches after all windows close. The replacement restores preferences, recent operation results, and active Caffeinate mode and expiry before the original process exits. Recovery waits for maintenance jobs, Clean Keys, menus, and open or minimized windows.
+- Enabled per-app space-efficient allocation and simplified the Settings pane boundary to reduce retained UI memory. HUD panels, field editors, results, and search tasks are released when dismissed.
+- Improved background-job tracking, cancelled-handoff cleanup, and pointer-lock ownership so recovery preserves ongoing work and input-control state.
+- Added cache-expiry/reload checks and process-level regression tests for active and inactive Caffeinate, reopening and minimizing Settings, long-running commands, and failed replacement startup.
+
+### Included from v1.4.3
 
 - **Rust `upkeep_core` v0.5.0 — Low-RSS Contiguous Slab, Streaming JSON & Bounded Thread Pool**:
   - Replaced `BrewSearchIndex`'s per-package `String` structs (~90k `malloc` chunks for ~15k Homebrew packages) with a contiguous UTF-8 byte slab (`BrewCatalogSlab`) using 2 allocations (`strings` + `entries`), eliminating duplicate `name_lower` and `api_version` strings and serializing search/installed hits via zero-copy `BrewPackageRef<'a>`.

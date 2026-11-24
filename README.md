@@ -204,6 +204,12 @@ Upkeep runs **100% locally** with zero telemetry, zero analytics, and zero backg
 - `https://formulae.brew.sh/api/formula.json` & `cask.json` — refreshes the local Homebrew catalog index (using HTTP `ETag` / `304 Not Modified`).
 - `https://api.github.com/repos/manavo-o/Upkeep/releases/latest` — checks for new Upkeep releases when you check for updates.
 
+## Idle Memory Recovery
+
+Upkeep releases the Homebrew search index after a short close/reopen grace period and can trim idle catalog data while Settings remains open. Searches reload the on-disk index as needed.
+
+Once all windows are closed and background work has finished, Upkeep can quietly restart its idle process to release macOS UI framework caches. It transfers active Caffeinate assertions before the original process exits and restores the session's preferences and recent results. Open or minimized windows, menus, Clean Keys, and maintenance operations defer recovery.
+
 ## FAQ
 
 <details>

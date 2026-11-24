@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Observation
 
@@ -137,9 +138,17 @@ public final class BrewLogStore {
         } else {
             combined = cleanOut + "\n\n" + cleanErr
         }
+        let boundedOutput: String
+        if combined.utf8.count > Self.maxLiveBufferUTF8Bytes {
+            let dropCount = combined.utf8.count - Self.maxLiveBufferUTF8Bytes
+            let cutIdx = combined.utf8.index(combined.utf8.startIndex, offsetBy: dropCount)
+            boundedOutput = "… (earlier output truncated)\n" + String(combined[cutIdx...])
+        } else {
+            boundedOutput = combined
+        }
         let entry = BrewOperationLog(
             command: command,
-            output: combined,
+            output: boundedOutput,
             succeeded: exitCode == 0,
             exitCode: exitCode,
             timestamp: Date()
@@ -357,6 +366,9 @@ public actor BrewService {
     /// Loads installed and outdated packages with 30s TTL caching and in-flight task coalescing
     /// to prevent redundant Ruby `brew` subprocess spawns.
     public func loadInstalledAndOutdated(forceRefresh: Bool = false) async throws -> [BrewPackageItem] {
+        defer {
+            if !Task.isCancelled { scheduleIdleEviction() }
+        }
         if !forceRefresh,
            !catalog.isEmpty,
            let last = lastLoadedAt,
@@ -520,21 +532,35 @@ public actor BrewService {
         }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 10
+        request.timeoutInterval = 15
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let etag = try? String(contentsOf: etagURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            !etag.isEmpty {
             request.setValue(etag, forHTTPHeaderField: "If-None-Match")
         }
 
+        // Use a cacheless ephemeral session + download(for:) so 30 MB formula/cask JSON never enters URLCache or Swift RAM.
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
+
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (tempFileURL, response) = try await session.download(for: request)
+            defer { try? fm.removeItem(at: tempFileURL) }
             if let http = response as? HTTPURLResponse {
                 if http.statusCode == 304 {
                     try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: dataURL.path)
                     return (fm.fileExists(atPath: dataURL.path) ? dataURL : nil, true)
                 }
-                if (200..<300).contains(http.statusCode), !data.isEmpty {
-                    try? data.write(to: dataURL, options: .atomic)
+                if (200..<300).contains(http.statusCode),
+                   let attrs = try? fm.attributesOfItem(atPath: tempFileURL.path),
+                   let size = attrs[.size] as? NSNumber, size.intValue > 0 {
+                    _ = try? fm.replaceItemAt(dataURL, withItemAt: tempFileURL)
+                    if !fm.fileExists(atPath: dataURL.path) {
+                        try? fm.moveItem(at: tempFileURL, to: dataURL)
+                    }
                     if let etag = http.value(forHTTPHeaderField: "ETag") {
                         try? etag.write(to: etagURL, atomically: true, encoding: .utf8)
                     }
@@ -549,8 +575,12 @@ public actor BrewService {
     }
 
     /// Pre-warms the 15k-package Rust Homebrew index on demand.
+    var hasPendingCatalogWork: Bool {
+        inFlightLoadTask != nil || inFlightRemoteCatalogTask != nil
+    }
+
     public func prewarmIfNeeded() async {
-        guard Self.isInstalled() else { return }
+        guard !Task.isCancelled, Self.isInstalled() else { return }
         cancelIdleEviction()
         _ = await ensureRemoteCatalogLoaded()
     }
@@ -562,8 +592,8 @@ public actor BrewService {
     }
 
     /// Schedules automatic RAM eviction of the 15k-package catalog after `afterSeconds` of inactivity.
-    /// Reloading `catalog.bin` takes <5ms on the next open, keeping menu-bar idle RSS near zero.
-    public func scheduleIdleEviction(afterSeconds seconds: Int = 120) {
+    /// Reloading `catalog.bin` takes ~3ms on the next open, keeping menu-bar idle RSS near zero.
+    public func scheduleIdleEviction(afterSeconds seconds: Int = 5) {
         idleEvictionTask?.cancel()
         idleEvictionTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
@@ -572,17 +602,22 @@ public actor BrewService {
         }
     }
 
-    /// Immediately frees the in-memory 15k Homebrew catalog slab back to the OS.
+    /// Immediately frees the in-memory 15k Homebrew catalog slab and returns freed pages to macOS.
     public func evictRemoteCatalogIfIdle() {
         idleEvictionTask?.cancel()
         idleEvictionTask = nil
-        guard inFlightRemoteCatalogTask == nil else { return }
+        guard inFlightRemoteCatalogTask == nil && inFlightLoadTask == nil else {
+            scheduleIdleEviction(afterSeconds: 5)
+            return
+        }
         #if USE_RUST_UPKEEP_CORE
         rustRemoteIndex.clear()
         rustLocalIndex.clear()
         #endif
         remoteCatalog.removeAll()
         lastRemoteCatalogFetch = nil
+        URLCache.shared.removeAllCachedResponses()
+        malloc_zone_pressure_relief(nil, 0)
     }
 
     /// Returns true when the remote Homebrew catalog is already warm in memory (zero debounce needed).
@@ -594,6 +629,7 @@ public actor BrewService {
     }
 
     private func ensureRemoteCatalogLoaded() async -> Bool {
+        guard !Task.isCancelled else { return false }
         cancelIdleEviction()
         #if USE_RUST_UPKEEP_CORE
         if rustRemoteIndex.count > 0,
@@ -730,17 +766,22 @@ public actor BrewService {
     }
 
     public func searchRemote(query: String, filterCasks: Bool? = nil) async throws -> [BrewPackageItem] {
+        try Task.checkCancellation()
+        defer {
+            if !Task.isCancelled { scheduleIdleEviction() }
+        }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return fuzzySearchLocal(query: "", filterCasks: filterCasks) }
 
         // Fast path: search cached Homebrew JSON API in-memory (Rust nucleo when linked, zero-alloc Swift otherwise)
         let hasRemote = await ensureRemoteCatalogLoaded()
+        try Task.checkCancellation()
         if hasRemote {
             #if USE_RUST_UPKEEP_CORE
-            let rustHits = rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 80)
+            let rustHits = rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 40)
             if !rustHits.isEmpty { return rustHits }
             #else
-            let hits = scorePool(remoteCatalog, query: trimmed, filterCasks: filterCasks, limit: 80)
+            let hits = scorePool(remoteCatalog, query: trimmed, filterCasks: filterCasks, limit: 40)
             if !hits.isEmpty { return hits }
             #endif
         }

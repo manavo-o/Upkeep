@@ -27,6 +27,18 @@ public enum CLIError: LocalizedError, Sendable {
 }
 
 public enum CLIExecutor {
+    private final class CommandActivity: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        func begin() { lock.withLock { count += 1 } }
+        func end() { lock.withLock { count -= 1 } }
+        var isRunning: Bool { lock.withLock { count > 0 } }
+    }
+
+    private static let activity = CommandActivity()
+    static var hasRunningCommands: Bool { activity.isRunning }
+
     public static let searchPaths: [String] = [
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin",
@@ -128,6 +140,9 @@ public enum CLIExecutor {
         environment: [String: String] = [:],
         onLine: (@Sendable (String) -> Void)?
     ) async throws -> CLIResult {
+        activity.begin()
+        defer { activity.end() }
+
         guard let executablePath = resolveBinary(binary) else {
             throw CLIError.binaryNotFound(binary)
         }

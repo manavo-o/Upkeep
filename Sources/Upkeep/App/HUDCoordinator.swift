@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 
 @MainActor
@@ -10,6 +11,8 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
 
     private var mainWindowController: NSWindowController?
     private var homebrewPanel: LiquidGlassPanel?
+    private var homebrewHUD: HomebrewHUDView?
+    private var homebrewPrewarmTask: Task<Void, Never>?
     private var homebrewGlobalClickMonitor: Any?
     private var homebrewLocalClickMonitor: Any?
     private var cleaningPanel: LiquidGlassPanel?
@@ -31,18 +34,23 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
                 self?.hideCleaningHUD()
             }
         }
-        // Evict any initial launch-check catalog slab after 30s so idle menu-bar RSS stays minimal.
+        // Evict any initial launch-check catalog slab after 10s so idle menu-bar RSS stays minimal.
         Task(priority: .background) {
-            try? await Task.sleep(for: .seconds(30))
+            try? await Task.sleep(for: .seconds(10))
             if self.mainWindowController == nil && self.homebrewPanel?.isVisible != true {
                 await BrewService.shared.evictRemoteCatalogIfIdle()
             }
         }
     }
 
+    var hasOpenUserWindows: Bool {
+        mainWindowController != nil || homebrewPanel != nil || cleaningPanel != nil
+    }
+
     // MARK: - Dedicated macOS 27 Native Window (Upkeep)
 
     public func showMainWindow(section: TraySection? = nil, triggerUpdateCheck: Bool = false) {
+        IdleMemoryRecovery.shared.cancel()
         if let section {
             trayViewModel.activeSection = section
         }
@@ -157,12 +165,8 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
 
     public func windowDidResignKey(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
-        if window == homebrewPanel {
-            // Keep open if the ⌘K action popover is currently presented as a child window
-            let hasVisibleChildPopover = !(window.childWindows ?? []).filter(\.isVisible).isEmpty
-            if !hasVisibleChildPopover {
-                hideHomebrewHUD()
-            }
+        if window == homebrewPanel, homebrewHUD?.isTrackingActions != true {
+            hideHomebrewHUD()
         }
     }
 
@@ -170,15 +174,20 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         guard let window = notification.object as? NSWindow,
               window == mainWindowController?.window else { return }
         // Release NSWindow, NSHostingController, Retina backing layers, and transient scan caches.
+        window.makeFirstResponder(nil)
         window.delegate = nil
         window.contentViewController = nil
         mainWindowController = nil
         trayViewModel.releaseTransientCaches()
         AppIconView.clearCache()
         if homebrewPanel?.isVisible != true {
-            Task { await BrewService.shared.scheduleIdleEviction(afterSeconds: 60) }
+            Task { await BrewService.shared.scheduleIdleEviction(afterSeconds: 5) }
         }
         NSApp.setActivationPolicy(.accessory)
+        IdleMemoryRecovery.shared.schedule()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            malloc_zone_pressure_relief(nil, 0)
+        }
     }
 
     // MARK: - NSToolbarDelegate
@@ -227,81 +236,73 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
     // MARK: - Homebrew Floating HUD (Click-Outside Dismissal + Settings Handoff)
 
     public func showHomebrewHUD(initialQuery: String? = nil, initialTab: BrewHUDTab? = nil) {
-        Task { await BrewService.shared.cancelIdleEviction() }
-        if let query = initialQuery {
-            homebrewModel.query = query
-            homebrewModel.activeTab = initialTab
-        } else if let initialTab {
-            homebrewModel.query = ""
-            homebrewModel.activeTab = initialTab
-        } else {
-            homebrewModel.query = ""
-            homebrewModel.activeTab = nil
-            homebrewModel.packages = []
-            homebrewModel.selectedID = nil
-            homebrewModel.statusBanner = nil
-            homebrewModel.errorBanner = nil
-            homebrewModel.showActionMenu = false
-        }
+        IdleMemoryRecovery.shared.cancel()
+        // Pre-warm catalog.bin (~3-5ms) immediately on HUD open so the first keystroke is instant.
+        homebrewPrewarmTask?.cancel()
+        homebrewPrewarmTask = Task(priority: .userInitiated) { await BrewService.shared.prewarmIfNeeded() }
+        homebrewModel.prepareForShow(query: initialQuery ?? "", tab: initialTab)
         if homebrewPanel == nil {
+            let hud = HomebrewHUDView(model: homebrewModel) { [weak self] in
+                self?.hideHomebrewHUD()
+            } onCategoryChange: { [weak self] isCategory in
+                self?.updateHomebrewPanelHeight(isCategoryMenu: isCategory)
+            }
             let panel = LiquidGlassPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
                 level: .floating,
-                useWindowGlass: false
-            ) {
-                HomebrewHUDView(model: self.homebrewModel) { [weak self] in
-                    self?.hideHomebrewHUD()
-                }
-            }
+                content: hud
+            )
+            panel.hudShortcut = { [weak hud] event in hud?.handleShortcut(event) ?? false }
             panel.delegate = self
+            homebrewHUD = hud
             homebrewPanel = panel
         }
-        updateHomebrewPanelHeight(isCategoryMenu: homebrewModel.isShowingCategoryMenu)
+        homebrewHUD?.prepareForShow()
         homebrewPanel?.presentCenteredAtHUDHeight()
+        homebrewHUD?.focusSearch()
         installHomebrewClickOutsideMonitors()
-        if (initialQuery != nil && !(initialQuery?.isEmpty ?? true)) || initialTab != nil {
-            homebrewModel.onQueryChanged()
-        }
     }
 
     public func hideHomebrewHUD() {
+        guard let panel = homebrewPanel, let hud = homebrewHUD, hud.isPresented else { return }
+        // Detach ownership before ending editing or closing, which can re-enter window delegates.
+        homebrewPanel = nil
+        homebrewHUD = nil
+        homebrewPrewarmTask?.cancel()
+        homebrewPrewarmTask = nil
         removeHomebrewClickOutsideMonitors()
-        homebrewModel.showActionMenu = false
-        homebrewModel.packages = []
-        homebrewModel.selectedID = nil
-        homebrewPanel?.orderOut(nil)
-        if mainWindowController == nil {
-            Task { await BrewService.shared.scheduleIdleEviction(afterSeconds: 120) }
-        }
+        homebrewModel.resetForHide()
+        hud.prepareForHide()
+        panel.endEditing(for: nil)
+        panel.makeFirstResponder(nil)
+        panel.orderOut(nil)
+        panel.hudShortcut = nil
+        panel.delegate = nil
+        panel.contentView = nil
+        panel.isReleasedWhenClosed = false
+        panel.close()
+        IdleMemoryRecovery.shared.schedule()
+
+        // Reuse the index for quick reopenings, then reclaim it even while Settings remains open.
+        Task { await BrewService.shared.scheduleIdleEviction(afterSeconds: 2) }
     }
 
     private func installHomebrewClickOutsideMonitors() {
-        removeHomebrewClickOutsideMonitors()
-
-        homebrewGlobalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.dismissHomebrewIfClickOutside()
-            }
+        guard homebrewLocalClickMonitor == nil else { return }
+        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown]
+        homebrewGlobalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: clicks) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.dismissHomebrewIfClickOutside() }
         }
 
-        homebrewLocalClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-            guard let self, let panel = self.homebrewPanel, panel.isVisible else { return event }
-            let screenPoint = NSEvent.mouseLocation
-            let insidePanel = panel.frame.contains(screenPoint)
-            let insideChild = (panel.childWindows ?? []).contains { $0.isVisible && $0.frame.contains(screenPoint) }
-            if !insidePanel && !insideChild {
-                self.hideHomebrewHUD()
-            }
+        homebrewLocalClickMonitor = NSEvent.addLocalMonitorForEvents(matching: clicks) { [weak self] event in
+            self?.dismissHomebrewIfClickOutside()
             return event
         }
     }
 
     private func dismissHomebrewIfClickOutside() {
-        guard let panel = homebrewPanel, panel.isVisible else { return }
-        let screenPoint = NSEvent.mouseLocation
-        let insidePanel = panel.frame.contains(screenPoint)
-        let insideChild = (panel.childWindows ?? []).contains { $0.isVisible && $0.frame.contains(screenPoint) }
-        if !insidePanel && !insideChild {
+        guard let panel = homebrewPanel, panel.isVisible, homebrewHUD?.isTrackingActions != true else { return }
+        if !panel.frame.contains(NSEvent.mouseLocation) {
             hideHomebrewHUD()
         }
     }
@@ -325,7 +326,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
             let dy = frame.height - targetHeight
             frame.origin.y += dy
             frame.size.height = targetHeight
-            panel.setFrame(frame, display: true, animate: true)
+            panel.setFrame(frame, display: true, animate: false)
         }
     }
 
@@ -340,6 +341,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
     // MARK: - Cleaning Mode Lock HUD
 
     public func showCleaningHUD() {
+        IdleMemoryRecovery.shared.cancel()
         hideDimmingWindows()
         let manager = CleaningModeManager.shared
         if manager.dimScreen {
@@ -388,6 +390,7 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         cleaningPanel?.contentView = nil
         cleaningPanel = nil
         hideDimmingWindows()
+        IdleMemoryRecovery.shared.schedule()
     }
 
     private func hideDimmingWindows() {

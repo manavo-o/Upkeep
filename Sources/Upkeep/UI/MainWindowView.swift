@@ -211,19 +211,19 @@ public struct MainWindowView: View {
         }
     }
 
-    @ViewBuilder
-    private func sectionView(for section: TraySection) -> some View {
+    private func sectionView(for section: TraySection) -> AnyView {
+        // Keep inactive panes out of the enclosing view's generic type graph.
         switch section {
         case .controls:
-            PowerAndInputSettingsPane(vm: vm, keepAwake: keepAwake, cleaning: cleaning)
+            AnyView(PowerAndInputSettingsPane(vm: vm, keepAwake: keepAwake, cleaning: cleaning))
         case .homebrew:
-            HomebrewSettingsPane(vm: vm, coordinator: coordinator)
+            AnyView(HomebrewSettingsPane(vm: vm, coordinator: coordinator))
         case .cleaner:
-            CleanerWorkspacePane(vm: vm)
+            AnyView(CleanerWorkspacePane(vm: vm))
         case .uninstaller:
-            UninstallerWorkspacePane(vm: vm)
+            AnyView(UninstallerWorkspacePane(vm: vm))
         case .updates:
-            UpdatesSettingsPane(updater: updater, cleaning: cleaning, vm: vm, coordinator: coordinator)
+            AnyView(UpdatesSettingsPane(updater: updater, cleaning: cleaning, vm: vm, coordinator: coordinator))
         }
     }
 

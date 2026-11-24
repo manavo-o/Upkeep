@@ -131,6 +131,7 @@ public final class TrayViewModel {
     public private(set) var filteredApps: [MoleInstalledApp] = []
     public var includePersonalData: Bool = false
     public var isLoadingApps: Bool = false
+    public private(set) var isUpdatingAppSizes: Bool = false
     public var pendingUninstallApp: MoleInstalledApp?
     public var uninstallInspection: UninstallInspection?
     public var isInspectingUninstall: Bool = false
@@ -266,7 +267,7 @@ public final class TrayViewModel {
     }
 
     public func loadApps(force: Bool = false) {
-        guard !isLoadingApps else { return }
+        guard !isLoadingApps && !isUpdatingAppSizes else { return }
         isLoadingApps = true
         uninstallError = nil
         Task {
@@ -279,6 +280,8 @@ public final class TrayViewModel {
                 }
             }
             // Phase 2: populate APFS-accurate bundle sizes in parallel
+            self.isUpdatingAppSizes = true
+            defer { self.isUpdatingAppSizes = false }
             do {
                 self.installedApps = try await MoleService.shared.listInstalledApps(forceRefresh: force)
             } catch {
@@ -344,10 +347,13 @@ public final class TrayViewModel {
     }
 
     public func confirmUninstall(_ app: MoleInstalledApp) {
+        guard !isUninstallingApp else { return }
+        isUninstallingApp = true
         uninstallError = nil
         uninstallStatus = "Removing \(app.name)…"
         pendingUninstallApp = nil
         Task {
+            defer { self.isUninstallingApp = false }
             do {
                 let message = try await MoleService.shared.uninstallApp(app, withData: includePersonalData)
                 self.uninstallStatus = message

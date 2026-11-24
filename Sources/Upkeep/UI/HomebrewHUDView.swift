@@ -1,929 +1,604 @@
 import AppKit
-import SwiftUI
+import Observation
 
-public enum BrewHUDTab: Int, CaseIterable, Identifiable {
-    case installed = 1
-    case formulae = 2
-    case casks = 3
-    case upgrades = 4
-
-    public var id: Int { rawValue }
-
-    public var title: String {
-        switch self {
-        case .installed: return "Installed"
-        case .formulae: return "Formulae"
-        case .casks: return "Casks"
-        case .upgrades: return "Upgrades"
-        }
-    }
-
-    public var icon: String {
-        switch self {
-        case .installed: return "shippingbox"
-        case .formulae: return "terminal"
-        case .casks: return "app.dashed"
-        case .upgrades: return "arrow.up.circle"
-        }
-    }
-
-    public var shortcutLabel: String { "⌘\(rawValue)" }
-}
-
+/// Native HUD with reusable result cells during a presentation. Dismissal releases its view hierarchy.
 @MainActor
-@Observable
-public final class HomebrewHUDModel {
-    public var query: String = ""
-    public var activeTab: BrewHUDTab? = nil
-    public var packages: [BrewPackageItem] = []
-    public var selectedID: String?
-    public var isLoading: Bool = false
-    public var showActionMenu: Bool = false
-    public var statusBanner: String?
-    public var errorBanner: String?
-    public var activeOperationPackageID: String?
-    public var copiedPackageID: String?
-
-    public var onCatalogChanged: (() -> Void)?
-    public var onOpenInSettings: (() -> Void)?
-
-    private var searchTask: Task<Void, Never>?
-    private var loadTask: Task<Void, Never>?
-
-    public var isOperating: Bool {
-        activeOperationPackageID != nil
+final class HomebrewHUDView: NSView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private struct Results: Equatable {
+        var packages: [BrewPackageItem] = []
+        var operationID: String?
     }
 
-    public var isShowingCategoryMenu: Bool {
-        query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && activeTab == nil
-    }
+    private static let trayWidth: CGFloat = 688
+    private static let rowIdentifier = NSUserInterfaceItemIdentifier("HomebrewPackage")
 
-    public var selectedPackage: BrewPackageItem? {
-        packages.first(where: { $0.id == selectedID }) ?? packages.first
-    }
+    private let model: HomebrewHUDModel
+    private let onDismiss: () -> Void
+    private let onCategoryChange: (Bool) -> Void
+    private let search = HomebrewHUDSearchField(frame: .zero)
+    private let scope = NSButton()
+    private let clear = NSButton()
+    private let mug = NSImageView()
+    private let searchProgress = BrewHUDControls.spinner(.small)
+    private let categories = NSStackView()
+    private let resultsPane = NSView()
+    private let table = NSTableView()
+    private let scroll = NSScrollView()
+    private let detail = BrewHUDDetailView()
+    private let placeholder = NSStackView()
+    private let placeholderIcon = NSImageView()
+    private let placeholderTitle = BrewHUDControls.label(size: 16, weight: .semibold)
+    private let placeholderMessage = BrewHUDControls.label(size: 12, color: .secondaryLabelColor)
+    private let errorMessage = BrewHUDControls.label(size: 13, color: .systemRed)
+    private let statusBar = NSStackView()
+    private let statusBarSeparator = BrewHUDControls.separator()
+    private let statusProgress = BrewHUDControls.spinner(.mini)
+    private let statusLabel = BrewHUDControls.label(size: 11, color: .tertiaryLabelColor)
+    private let actions = NSButton()
+    private let actionMenu = NSMenu(title: "Homebrew Actions")
 
-    public func loadInitial() {
-        loadTask?.cancel()
-        isLoading = true
-        errorBanner = nil
-        loadTask = Task {
-            do {
-                let items = try await BrewService.shared.loadInstalledAndOutdated()
-                guard !Task.isCancelled else { return }
-                if self.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    if self.activeTab == .formulae || self.activeTab == .casks {
-                        self.packages = []
-                        self.selectedID = nil
-                    } else {
-                        self.packages = filterForTab(items)
-                        self.selectedID = self.packages.first?.id
-                    }
-                }
-                self.isLoading = false
-            } catch {
-                guard !Task.isCancelled else { return }
-                self.errorBanner = error.localizedDescription
-                self.isLoading = false
-            }
-        }
-    }
+    private var trayHeight: NSLayoutConstraint!
+    private var results = Results()
+    private var isUpdatingTable = false
+    private var observesContent = false
+    private var observesStatus = false
+    private(set) var isPresented = false
+    private(set) var isTrackingActions = false
 
-    public func onQueryChanged() {
-        loadTask?.cancel()
-        searchTask?.cancel()
-        let currentQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if currentQuery.isEmpty {
-            if activeTab == .formulae || activeTab == .casks {
-                self.packages = []
-                self.selectedID = nil
-                self.isLoading = false
-                return
-            }
-            searchTask = Task {
-                let local = await BrewService.shared.fuzzySearchLocal(query: "", filterCasks: caskFilter)
-                guard !Task.isCancelled else { return }
-                self.packages = filterForTab(local)
-                self.selectedID = self.packages.first?.id
-            }
-            return
-        }
-
-        searchTask = Task {
-            // Only seed from local installed packages when searching Installed/Upgrades or before remote index is warm
-            let isWarm = await BrewService.shared.hasWarmRemoteIndex()
-            if !isWarm || activeTab == .installed || activeTab == .upgrades {
-                let local = await BrewService.shared.fuzzySearchLocal(query: currentQuery, filterCasks: caskFilter)
-                guard !Task.isCancelled else { return }
-                if !local.isEmpty {
-                    self.packages = filterForTab(local)
-                    self.selectedID = self.packages.first?.id
-                }
-            }
-
-            // Skip artificial lag when the remote catalog is already warm in memory (~1-3ms search)
-            let debounceMs = isWarm ? 20 : 200
-            try? await Task.sleep(for: .milliseconds(debounceMs))
-            guard !Task.isCancelled else { return }
-
-            if activeTab == .installed || activeTab == .upgrades {
-                self.isLoading = false
-                return
-            }
-
-            if !isWarm {
-                self.isLoading = true
-            }
-            if let remote = try? await BrewService.shared.searchRemote(query: currentQuery, filterCasks: caskFilter), !Task.isCancelled {
-                self.packages = filterForTab(remote)
-                self.selectedID = self.packages.first?.id
-            }
-            self.isLoading = false
-        }
-    }
-
-    public func selectTab(_ tab: BrewHUDTab?) {
-        withAnimation(.snappy(duration: 0.22)) {
-            activeTab = tab
-            showActionMenu = false
-        }
-        onQueryChanged()
-    }
-
-    public func moveSelection(delta: Int) {
-        let count = min(packages.count, 60)
-        guard count > 0 else { return }
-        guard let current = selectedID,
-              let idx = packages.prefix(count).firstIndex(where: { $0.id == current }) else {
-            selectedID = packages.first?.id
-            return
-        }
-        let nextIdx = max(0, min(count - 1, idx + delta))
-        selectedID = packages[nextIdx].id
-    }
-
-    public func performPrimaryAction(for item: BrewPackageItem) {
-        guard !isOperating else { return }
-        showActionMenu = false
-        if item.isInstalled && item.isOutdated {
-            runAsync(packageID: item.id, label: "Upgrading \(item.name)…", success: "Upgraded \(item.name)") {
-                _ = try await BrewService.shared.upgrade(name: item.name)
-            }
-        } else if item.isInstalled {
-            uninstall(item)
-        } else {
-            runAsync(packageID: item.id, label: "Installing \(item.name)…", success: "Installed \(item.name)") {
-                _ = try await BrewService.shared.install(name: item.name, isCask: item.isCask)
-            }
-        }
-    }
-
-    public func uninstall(_ item: BrewPackageItem) {
-        guard !isOperating else { return }
-        showActionMenu = false
-        runAsync(packageID: item.id, label: "Uninstalling \(item.name)…", success: "Uninstalled \(item.name)") {
-            _ = try await BrewService.shared.uninstall(name: item.name, isCask: item.isCask)
-        }
-    }
-
-    public func togglePin(_ item: BrewPackageItem) {
-        guard !isOperating else { return }
-        showActionMenu = false
-        guard !item.isCask else { return }
-        if item.isPinned {
-            runAsync(packageID: item.id, label: "Unpinning \(item.name)…", success: "Unpinned \(item.name)") {
-                _ = try await BrewService.shared.unpin(name: item.name)
-            }
-        } else {
-            runAsync(packageID: item.id, label: "Pinning \(item.name)…", success: "Pinned \(item.name)") {
-                _ = try await BrewService.shared.pin(name: item.name)
-            }
-        }
-    }
-
-    public func copyInstallCommand(_ item: BrewPackageItem) {
-        showActionMenu = false
-        let cmd = item.isCask ? "brew install --cask \(item.name)" : "brew install \(item.name)"
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(cmd, forType: .string)
-        statusBanner = "Copied `\(cmd)`"
-        copiedPackageID = item.id
-        Task {
-            try? await Task.sleep(for: .seconds(1.5))
-            if self.copiedPackageID == item.id {
-                self.copiedPackageID = nil
-            }
-        }
-    }
-
-    public func openHomepage(_ item: BrewPackageItem) {
-        showActionMenu = false
-        if let url = URL(string: item.homepage), !item.homepage.isEmpty {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    public func runBrewDoctor() {
-        guard !isOperating else { return }
-        showActionMenu = false
-        activeOperationPackageID = "__doctor__"
-        statusBanner = "Running `brew doctor`…"
-        errorBanner = nil
-        Task {
-            do {
-                let output = try await BrewService.shared.runDoctor()
-                let firstLine = output.components(separatedBy: .newlines).first(where: { !$0.isEmpty }) ?? "Your system is ready to brew."
-                self.statusBanner = firstLine
-            } catch {
-                self.errorBanner = error.localizedDescription
-                self.statusBanner = nil
-            }
-            self.activeOperationPackageID = nil
-        }
-    }
-
-    private func runAsync(
-        packageID: String,
-        label: String,
-        success: String,
-        operation: @escaping () async throws -> Void
-    ) {
-        activeOperationPackageID = packageID
-        statusBanner = label
-        errorBanner = nil
-        Task {
-            do {
-                try await operation()
-                self.statusBanner = success
-                self.onCatalogChanged?()
-                let trimmed = self.query.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty {
-                    let refreshed = try await BrewService.shared.loadInstalledAndOutdated(forceRefresh: true)
-                    self.packages = filterForTab(refreshed)
-                } else {
-                    _ = try? await BrewService.shared.loadInstalledAndOutdated(forceRefresh: true)
-                    if let remote = try? await BrewService.shared.searchRemote(query: trimmed, filterCasks: caskFilter) {
-                        self.packages = filterForTab(remote)
-                    }
-                }
-            } catch {
-                self.errorBanner = error.localizedDescription
-                self.statusBanner = nil
-            }
-            self.activeOperationPackageID = nil
-        }
-    }
-
-    private var caskFilter: Bool? {
-        switch activeTab {
-        case .formulae: return false
-        case .casks: return true
-        case .installed, .upgrades, .none: return nil
-        }
-    }
-
-    private func filterForTab(_ items: [BrewPackageItem]) -> [BrewPackageItem] {
-        switch activeTab {
-        case .installed, .none: return items
-        case .formulae: return items.filter { !$0.isCask }
-        case .casks: return items.filter { $0.isCask }
-        case .upgrades: return items.filter { $0.isOutdated }
-        }
-    }
-}
-
-/// macOS 27 Golden Gate Liquid Glass Homebrew HUD:
-/// Top 60pt interactive Liquid Glass capsule + detached 20pt-radius Liquid Glass tray
-/// with tiered Rust search, global ⌘1–⌘4 scope shortcuts, larger macOS 27 glass action buttons,
-/// and seamless handoff to the Settings Homebrew manager.
-public struct HomebrewHUDView: View {
-    @Bindable var model: HomebrewHUDModel
-    let onDismiss: () -> Void
-    @FocusState private var isSearchFocused: Bool
-
-    public init(model: HomebrewHUDModel, onDismiss: @escaping () -> Void) {
+    init(model: HomebrewHUDModel, onDismiss: @escaping () -> Void, onCategoryChange: @escaping (Bool) -> Void) {
         self.model = model
         self.onDismiss = onDismiss
+        self.onCategoryChange = onCategoryChange
+        super.init(frame: .zero)
+        setUpView()
     }
 
-    public var body: some View {
-        Group {
-            if #available(macOS 26.0, *) {
-                GlassEffectContainer(spacing: 12) {
-                    hudStack
-                }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func prepareForShow() {
+        isPresented = true
+        if observesContent { renderContent() } else { observeContent() }
+        if observesStatus { renderStatus() } else { observeStatus() }
+    }
+
+    func focusSearch() {
+        window?.makeFirstResponder(search)
+    }
+
+    func prepareForHide() {
+        isPresented = false
+        if isTrackingActions { actionMenu.cancelTracking() }
+        updateTable(with: Results(), selectedID: nil)
+        detail.clear()
+        search.stringValue = ""
+        statusLabel.stringValue = ""
+        errorMessage.stringValue = ""
+        BrewHUDControls.setSpinning(searchProgress, false)
+        BrewHUDControls.setSpinning(statusProgress, false)
+    }
+
+    private func setUpView() {
+        let searchPill = BrewHUDControls.glass(around: makeSearchBar(), radius: 30, interactive: true)
+        let tray = BrewHUDControls.glass(around: makeTray(), radius: 20)
+
+        let stack = NSStackView(views: [searchPill, tray])
+        stack.orientation = .vertical
+        stack.spacing = 12
+        searchPill.heightAnchor.constraint(equalToConstant: 60).isActive = true
+        trayHeight = tray.heightAnchor.constraint(equalToConstant: 210)
+        trayHeight.isActive = true
+        for view in [searchPill, tray] {
+            view.widthAnchor.constraint(equalToConstant: Self.trayWidth).isActive = true
+        }
+
+        let surface: NSView
+        if #available(macOS 26.0, *) {
+            let container = NSGlassEffectContainerView()
+            container.spacing = 12
+            container.contentView = stack
+            surface = container
+        } else {
+            surface = stack
+        }
+        BrewHUDControls.add(surface, to: self)
+        NSLayoutConstraint.activate([
+            surface.centerXAnchor.constraint(equalTo: centerXAnchor),
+            surface.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+        if surface !== stack {
+            BrewHUDControls.pin(stack, inside: surface)
+        }
+
+        actionMenu.autoenablesItems = false
+    }
+
+    private func makeSearchBar() -> NSView {
+        search.font = .systemFont(ofSize: 21)
+        search.isBordered = false
+        search.isBezeled = false
+        search.drawsBackground = false
+        search.focusRingType = .none
+        search.isAutomaticTextCompletionEnabled = false
+        search.delegate = self
+        if let cell = search.cell as? NSSearchFieldCell {
+            cell.searchButtonCell = nil
+            cell.cancelButtonCell = nil
+            cell.maximumRecents = 0
+        }
+        search.setAccessibilityLabel("Search Homebrew")
+        search.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        BrewHUDControls.configure(scope, title: "", target: self, action: #selector(clearScope))
+        BrewHUDControls.configure(clear, title: "", icon: "xmark.circle.fill", target: self, action: #selector(clearQuery))
+        clear.imagePosition = .imageOnly
+        clear.contentTintColor = .secondaryLabelColor
+        clear.setAccessibilityLabel("Clear Search")
+        mug.image = BrewHUDControls.symbol("mug", size: 18)
+        mug.contentTintColor = .secondaryLabelColor
+
+        let trailing = NSView()
+        for view in [mug, clear, searchProgress] {
+            BrewHUDControls.add(view, to: trailing)
+            view.centerXAnchor.constraint(equalTo: trailing.centerXAnchor).isActive = true
+            view.centerYAnchor.constraint(equalTo: trailing.centerYAnchor).isActive = true
+        }
+        trailing.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        trailing.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        let stack = NSStackView(views: [scope, search, trailing])
+        stack.spacing = 12
+        stack.alignment = .centerY
+        let container = NSView()
+        BrewHUDControls.add(stack, to: container)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 26),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -26),
+            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        return container
+    }
+
+    private func makeTray() -> NSView {
+        let container = NSView()
+        categories.orientation = .vertical
+        categories.alignment = .width
+        categories.spacing = 2
+        categories.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        for tab in BrewHUDTab.allCases {
+            let button = NSButton()
+            BrewHUDControls.configure(button, title: tab.title, icon: tab.icon, target: self, action: #selector(selectCategory(_:)))
+            button.tag = tab.rawValue
+            button.alignment = .left
+            button.font = .systemFont(ofSize: 16)
+            button.setAccessibilityHelp(tab.shortcutLabel)
+
+            let shortcut = BrewHUDControls.label(size: 14, color: .tertiaryLabelColor)
+            shortcut.stringValue = tab.shortcutLabel
+            let row = NSView()
+            BrewHUDControls.add(button, to: row)
+            // The whole row is the button. Draw the shortcut above it, within the same hit area.
+            shortcut.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(shortcut, positioned: .above, relativeTo: button)
+            shortcut.setAccessibilityElement(false)
+            NSLayoutConstraint.activate([
+                row.heightAnchor.constraint(equalToConstant: 46),
+                button.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+                button.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
+                button.topAnchor.constraint(equalTo: row.topAnchor),
+                button.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                shortcut.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+                shortcut.centerYAnchor.constraint(equalTo: button.centerYAnchor)
+            ])
+            categories.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: categories.widthAnchor, constant: -24).isActive = true
+        }
+
+        setUpResultsPane()
+        placeholder.orientation = .vertical
+        placeholder.alignment = .centerX
+        placeholder.spacing = 8
+        placeholderIcon.contentTintColor = .tertiaryLabelColor
+        for item in [placeholderIcon, placeholderTitle, placeholderMessage] as [NSView] {
+            placeholder.addArrangedSubview(item)
+        }
+        errorMessage.maximumNumberOfLines = 3
+        errorMessage.lineBreakMode = .byTruncatingTail
+
+        let separator = statusBarSeparator
+        setUpStatusBar()
+
+        for view in [categories, resultsPane, placeholder, errorMessage, separator, statusBar] as [NSView] {
+            BrewHUDControls.add(view, to: container)
+        }
+        NSLayoutConstraint.activate([
+            categories.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            categories.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            categories.topAnchor.constraint(equalTo: container.topAnchor),
+            resultsPane.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            resultsPane.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            resultsPane.topAnchor.constraint(equalTo: container.topAnchor),
+            resultsPane.heightAnchor.constraint(equalToConstant: 336),
+            placeholder.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            placeholder.centerYAnchor.constraint(equalTo: container.centerYAnchor, constant: 20.5),
+            errorMessage.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
+            errorMessage.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
+            errorMessage.centerYAnchor.constraint(equalTo: container.centerYAnchor, constant: 20.5),
+            separator.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            separator.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1),
+            statusBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            statusBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            statusBar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            statusBar.heightAnchor.constraint(equalToConstant: 40)
+        ])
+        return container
+    }
+
+    private func setUpResultsPane() {
+        table.headerView = nil
+        table.rowHeight = 46
+        table.intercellSpacing = NSSize(width: 0, height: 2)
+        table.backgroundColor = .clear
+        table.style = .plain
+        table.selectionHighlightStyle = .regular
+        table.focusRingType = .none
+        table.allowsEmptySelection = false
+        table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        table.dataSource = self
+        table.delegate = self
+        table.setAccessibilityLabel("Homebrew Packages")
+        let column = NSTableColumn(identifier: Self.rowIdentifier)
+        column.resizingMask = .autoresizingMask
+        table.addTableColumn(column)
+
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = table
+
+        let divider = BrewHUDControls.separator()
+        for view in [scroll, divider, detail] as [NSView] {
+            BrewHUDControls.add(view, to: resultsPane)
+        }
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: resultsPane.leadingAnchor, constant: 10),
+            scroll.widthAnchor.constraint(equalToConstant: 380),
+            scroll.topAnchor.constraint(equalTo: resultsPane.topAnchor, constant: 10),
+            scroll.bottomAnchor.constraint(equalTo: resultsPane.bottomAnchor, constant: -10),
+            divider.leadingAnchor.constraint(equalTo: scroll.trailingAnchor, constant: 10),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.topAnchor.constraint(equalTo: resultsPane.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: resultsPane.bottomAnchor),
+            detail.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
+            detail.trailingAnchor.constraint(equalTo: resultsPane.trailingAnchor),
+            detail.topAnchor.constraint(equalTo: resultsPane.topAnchor),
+            detail.bottomAnchor.constraint(equalTo: resultsPane.bottomAnchor)
+        ])
+
+        BrewHUDControls.configure(detail.primary, title: "", target: self, action: #selector(performPrimaryAction))
+        BrewHUDControls.configure(detail.copy, title: "", target: self, action: #selector(copyCommand))
+        BrewHUDControls.configure(detail.homepage, title: "", target: self, action: #selector(openHomepage))
+        BrewHUDControls.configure(detail.homepageIcon, title: "", icon: "safari", target: self, action: #selector(openHomepage))
+        detail.homepageIcon.setAccessibilityLabel("Open Homepage")
+        detail.homepageIcon.toolTip = "Open Homepage"
+        for button in [detail.primary, detail.copy, detail.homepageIcon] {
+            button.isBordered = true
+            button.bezelStyle = .rounded
+            if #available(macOS 26.0, *) { button.bezelStyle = .glass }
+            button.controlSize = .large
+            button.font = .systemFont(ofSize: 13, weight: .semibold)
+        }
+        detail.homepage.alignment = .left
+        detail.homepage.lineBreakMode = .byTruncatingMiddle
+        detail.homepage.contentTintColor = .controlAccentColor
+    }
+
+    private func setUpStatusBar() {
+        let settings = NSButton()
+        BrewHUDControls.configure(settings, title: "Settings", icon: "macwindow", target: self, action: #selector(openSettings))
+        settings.toolTip = "Open Homebrew in Upkeep Settings (⌘,)"
+        BrewHUDControls.configure(actions, title: "Actions  ⌘K", target: self, action: #selector(showActions))
+        actions.setAccessibilityLabel("Actions")
+        for button in [settings, actions] {
+            button.controlSize = .small
+            button.isBordered = true
+            button.bezelStyle = .rounded
+            if #available(macOS 26.0, *) { button.bezelStyle = .glass }
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        statusBar.spacing = 10
+        statusBar.alignment = .centerY
+        statusBar.edgeInsets = NSEdgeInsets(top: 0, left: 18, bottom: 0, right: 18)
+        for view in [statusProgress, statusLabel, settings, actions] as [NSView] {
+            statusBar.addArrangedSubview(view)
+        }
+    }
+
+    // Re-arm the one-shot observation after the model writes finish. A pending observer can
+    // survive a hide/show, so keep at most one registration per part of the HUD.
+    private func observeContent() {
+        guard isPresented else { return }
+        observesContent = true
+        withObservationTracking {
+            renderContent()
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.observesContent = false
+                self.observeContent()
+            }
+        }
+    }
+
+    private func observeStatus() {
+        guard isPresented else { return }
+        observesStatus = true
+        withObservationTracking {
+            renderStatus()
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.observesStatus = false
+                self.observeStatus()
+            }
+        }
+    }
+
+    private func renderContent() {
+        let query = model.query
+        let tab = model.activeTab
+        let loading = model.isLoading
+        let isCategory = model.isShowingCategoryMenu
+        let error = model.errorBanner
+        let currentResults = Results(packages: Array(model.packages.prefix(40)), operationID: model.activeOperationPackageID)
+        let selectedID = model.selectedID
+        let copiedID = model.copiedPackageID
+
+        if search.stringValue != query, (search.currentEditor() as? NSTextView)?.string != query {
+            search.stringValue = query
+        }
+        scope.isHidden = tab == nil
+        if let tab {
+            scope.title = "\(tab.title)  ×"
+            scope.image = BrewHUDControls.symbol(tab.icon, size: 12)
+            scope.setAccessibilityLabel("Clear \(tab.title) scope")
+            search.placeholderString = tab == .formulae || tab == .casks ? "Search \(tab.title)…" : "Filter \(tab.title)…"
+        } else {
+            search.placeholderString = "Search Homebrew"
+        }
+        clear.isHidden = loading || query.isEmpty
+        mug.isHidden = loading || !query.isEmpty
+        BrewHUDControls.setSpinning(searchProgress, loading)
+
+        let showsResults = !isCategory && error == nil && !currentResults.packages.isEmpty
+        categories.isHidden = !isCategory
+        resultsPane.isHidden = !showsResults
+        placeholder.isHidden = isCategory || showsResults || error != nil
+        errorMessage.isHidden = isCategory || error == nil
+        errorMessage.stringValue = error ?? ""
+        statusBar.isHidden = isCategory
+        statusBarSeparator.isHidden = isCategory
+        trayHeight.constant = isCategory ? 210 : (showsResults ? 377 : (error == nil ? 281 : 121))
+        onCategoryChange(isCategory)
+
+        if !placeholder.isHidden {
+            if let tab, (tab == .formulae || tab == .casks),
+               query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                placeholderIcon.image = BrewHUDControls.symbol(tab.icon, size: 28)
+                placeholderTitle.stringValue = "Search Homebrew \(tab.title)"
+                placeholderMessage.stringValue = "Start typing a name or keyword to search Homebrew \(tab.title.lowercased())."
+                placeholderMessage.isHidden = false
             } else {
-                hudStack
+                placeholderIcon.image = BrewHUDControls.symbol("shippingbox", size: 28)
+                placeholderTitle.stringValue = loading ? "Searching Homebrew…" : "No Matching Packages"
+                placeholderMessage.isHidden = true
             }
         }
-        .padding(24)
-        .frame(width: 736)
-        .background {
-            // Global shortcuts active across both category menu and search results
-            Group {
-                Button("") { model.selectTab(.installed) }.keyboardShortcut("1", modifiers: .command)
-                Button("") { model.selectTab(.formulae) }.keyboardShortcut("2", modifiers: .command)
-                Button("") { model.selectTab(.casks) }.keyboardShortcut("3", modifiers: .command)
-                Button("") { model.selectTab(.upgrades) }.keyboardShortcut("4", modifiers: .command)
-                Button("") {
-                    if !model.isShowingCategoryMenu {
-                        model.showActionMenu.toggle()
-                    }
-                }.keyboardShortcut("k", modifiers: .command)
-                Button("") {
-                    model.onOpenInSettings?()
-                }.keyboardShortcut(",", modifiers: .command)
+
+        updateTable(with: showsResults ? currentResults : Results(), selectedID: selectedID)
+        if showsResults, let package = model.selectedPackage {
+            detail.update(for: package, operationID: currentResults.operationID, copiedID: copiedID)
+        } else {
+            detail.clear()
+        }
+    }
+
+    private func renderStatus() {
+        let log = BrewLogStore.shared
+        let live = log.isRunning ? log.liveStatusLine : nil
+        let banner = model.statusBanner
+        let showProgress = live != nil && !model.isShowingCategoryMenu
+        BrewHUDControls.setSpinning(statusProgress, showProgress)
+        statusLabel.textColor = live != nil || banner != nil ? .secondaryLabelColor : .tertiaryLabelColor
+        statusLabel.stringValue = (live ?? banner)?.replacingOccurrences(of: "`", with: "")
+            ?? "⌘1 Installed · ⌘2 Formulae · ⌘3 Casks · ⌘4 Upgrades"
+    }
+
+    private func updateTable(with updated: Results, selectedID: String?) {
+        isUpdatingTable = true
+        defer { isUpdatingTable = false }
+        if results != updated {
+            let packagesChanged = results.packages != updated.packages
+            results = updated
+            table.reloadData()
+            if packagesChanged {
+                scroll.contentView.scroll(to: .zero)
+                scroll.reflectScrolledClipView(scroll.contentView)
             }
-            .opacity(0)
-            .allowsHitTesting(false)
         }
-        .onAppear {
-            isSearchFocused = true
-            model.loadInitial()
-            HUDCoordinator.shared.updateHomebrewPanelHeight(isCategoryMenu: model.isShowingCategoryMenu)
+        let row = results.packages.firstIndex { $0.id == selectedID } ?? (results.packages.isEmpty ? -1 : 0)
+        if row != table.selectedRow {
+            if row >= 0 {
+                table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                table.scrollRowToVisible(row)
+            } else {
+                table.deselectAll(nil)
+            }
         }
-        .onChange(of: model.isShowingCategoryMenu) { _, isCat in
-            HUDCoordinator.shared.updateHomebrewPanelHeight(isCategoryMenu: isCat)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { results.packages.count }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let identifier = NSUserInterfaceItemIdentifier("HomebrewSelection")
+        if let view = tableView.makeView(withIdentifier: identifier, owner: nil) as? BrewHUDTableRow { return view }
+        let view = BrewHUDTableRow()
+        view.identifier = identifier
+        return view
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let cell = (tableView.makeView(withIdentifier: Self.rowIdentifier, owner: nil) as? BrewHUDPackageCell)
+            ?? BrewHUDPackageCell()
+        cell.identifier = Self.rowIdentifier
+        let package = results.packages[row]
+        cell.update(for: package, isOperating: package.id == results.operationID)
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !isUpdatingTable, results.packages.indices.contains(table.selectedRow) else { return }
+        model.selectedID = results.packages[table.selectedRow].id
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard isPresented else { return }
+        let query = (search.currentEditor() as? NSTextView)?.string ?? search.stringValue
+        guard model.query != query else { return }
+        model.query = query
+        model.onQueryChanged()
+    }
+
+    func handleShortcut(_ event: NSEvent) -> Bool {
+        guard isPresented, !isTrackingActions else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if modifiers == .command {
+            let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            if let number = Int(key), let tab = BrewHUDTab(rawValue: number) {
+                model.selectTab(tab)
+                focusSearch()
+                return true
+            }
+            switch key {
+            case "k": showActions()
+            case ",": openSettings()
+            default: return false
+            }
+            return true
         }
-        .onKeyPress(.upArrow) {
-            model.moveSelection(delta: -1)
-            return .handled
-        }
-        .onKeyPress(.downArrow) {
-            model.moveSelection(delta: 1)
-            return .handled
-        }
-        .onExitCommand {
-            if model.showActionMenu {
-                model.showActionMenu = false
-                isSearchFocused = true
-            } else if model.activeTab != nil || !model.query.isEmpty {
-                model.query = ""
+
+        guard modifiers.isEmpty, (search.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return false }
+        switch event.keyCode {
+        case 125, 126: // Down and up arrows
+            guard !model.isShowingCategoryMenu else { return false }
+            model.moveSelection(delta: event.keyCode == 125 ? 1 : -1)
+        case 36, 76: // Return and keypad Enter
+            guard window?.firstResponder === search.currentEditor() || window?.firstResponder === table else { return false }
+            if !event.isARepeat { performPrimaryAction() }
+        case 53: // Escape
+            if model.activeTab != nil || !model.query.isEmpty {
+                replaceQuery("")
                 model.selectTab(nil)
-                isSearchFocused = true
+                focusSearch()
             } else {
                 onDismiss()
             }
+        default: return false
+        }
+        return true
+    }
+
+    private func replaceQuery(_ query: String) {
+        if let editor = search.currentEditor() as? NSTextView {
+            editor.string = query
+        }
+        search.stringValue = query
+        model.query = query
+    }
+
+    @objc private func selectCategory(_ sender: NSButton) {
+        model.selectTab(BrewHUDTab(rawValue: sender.tag))
+        focusSearch()
+    }
+
+    @objc private func clearScope() {
+        model.selectTab(nil)
+        focusSearch()
+    }
+
+    @objc private func clearQuery() {
+        replaceQuery("")
+        model.onQueryChanged()
+        focusSearch()
+    }
+
+    @objc private func performPrimaryAction() {
+        guard model.errorBanner == nil, !model.isShowingCategoryMenu, let package = model.selectedPackage else { return }
+        model.performPrimaryAction(for: package)
+    }
+
+    @objc private func copyCommand() {
+        if let package = model.selectedPackage { model.copyInstallCommand(package) }
+    }
+
+    @objc private func openHomepage() {
+        if let package = model.selectedPackage { model.openHomepage(package) }
+    }
+
+    @objc private func openSettings() { model.onOpenInSettings?() }
+
+    @objc private func uninstallPackage() {
+        if let package = model.selectedPackage { model.uninstall(package) }
+    }
+
+    @objc private func togglePin() {
+        if let package = model.selectedPackage { model.togglePin(package) }
+    }
+
+    @objc private func runDoctor() { model.runBrewDoctor() }
+
+    @objc private func showActions() {
+        guard isPresented, !model.isShowingCategoryMenu, !isTrackingActions else { return }
+        actionMenu.removeAllItems()
+        if resultsPane.isHidden == false, let package = model.selectedPackage {
+            addMenuItem("\(BrewHUDControls.actionTitle(for: package)) \(package.name)", icon: BrewHUDControls.actionIcon(for: package),
+                        action: #selector(performPrimaryAction), key: "\r", modifiers: [], enabled: !model.isOperating)
+            if package.isInstalled && !package.isCask {
+                addMenuItem(package.isPinned ? "Unpin Formula" : "Pin Formula", icon: package.isPinned ? "pin.slash" : "pin",
+                            action: #selector(togglePin), key: "p", enabled: !model.isOperating)
+            }
+            if package.isInstalled && package.isOutdated {
+                addMenuItem("Uninstall \(package.name)", icon: "trash", action: #selector(uninstallPackage),
+                            key: "\u{8}", enabled: !model.isOperating)
+            }
+            actionMenu.addItem(.separator())
+            addMenuItem("Copy Install Command", icon: "doc.on.doc", action: #selector(copyCommand), key: "c")
+            if !package.homepage.isEmpty {
+                addMenuItem("Open Homepage", icon: "safari", action: #selector(openHomepage), key: "o")
+            }
+        }
+        addMenuItem("Open in Upkeep Settings", icon: "macwindow", action: #selector(openSettings), key: ",")
+        addMenuItem("Run Brew Doctor", icon: "stethoscope", action: #selector(runDoctor), key: "d", enabled: !model.isOperating)
+        isTrackingActions = true
+        actionMenu.popUp(positioning: nil, at: NSPoint(x: actions.bounds.minX, y: actions.bounds.maxY), in: actions)
+        isTrackingActions = false
+        actionMenu.removeAllItems()
+        if isPresented {
+            if window?.isKeyWindow == true { focusSearch() } else { onDismiss() }
         }
     }
 
-    private var hudStack: some View {
-        VStack(spacing: 12) {
-            searchPill
-            resultsTray
-        }
-    }
-
-    private var searchPlaceholder: String {
-        guard let tab = model.activeTab else { return "Search Homebrew" }
-        switch tab {
-        case .formulae, .casks:
-            return "Search \(tab.title)…"
-        case .installed, .upgrades:
-            return "Filter \(tab.title)…"
-        }
-    }
-
-    private var searchPill: some View {
-        HStack(spacing: 12) {
-            if let tab = model.activeTab {
-                Button {
-                    model.selectTab(nil)
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: tab.icon)
-                            .font(.system(size: 12, weight: .medium))
-                        Text(tab.title)
-                            .font(.system(size: 13, weight: .medium))
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 6)
-                    .background(.quaternary, in: Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-
-            TextField(
-                searchPlaceholder,
-                text: $model.query
-            )
-            .textFieldStyle(.plain)
-            .font(.system(size: 21, weight: .regular))
-            .focused($isSearchFocused)
-            .onChange(of: model.query) { _, _ in
-                model.onQueryChanged()
-            }
-            .onSubmit {
-                if let selected = model.selectedPackage {
-                    model.performPrimaryAction(for: selected)
-                }
-            }
-
-            if model.isLoading {
-                ProgressView()
-                    .controlSize(.small)
-            } else if !model.query.isEmpty {
-                Button {
-                    model.query = ""
-                    model.onQueryChanged()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 17, weight: .regular))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            } else {
-                Image(systemName: "mug")
-                    .font(.system(size: 18, weight: .regular))
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 26)
-        .frame(height: 60)
-        .upkeepGlass(in: Capsule(), interactive: true)
-    }
-
-    private var resultsTray: some View {
-        VStack(spacing: 0) {
-            if model.isShowingCategoryMenu {
-                VStack(spacing: 2) {
-                    ForEach(BrewHUDTab.allCases) { tab in
-                        Button {
-                            model.selectTab(tab)
-                        } label: {
-                            HStack(spacing: 16) {
-                                Image(systemName: tab.icon)
-                                    .font(.system(size: 18, weight: .regular))
-                                    .frame(width: 24)
-                                    .foregroundStyle(.primary)
-
-                                Text(tab.title)
-                                    .font(.system(size: 16, weight: .regular))
-                                    .foregroundStyle(.primary)
-
-                                Spacer()
-
-                                Text(tab.shortcutLabel)
-                                    .font(.system(size: 14, weight: .regular, design: .rounded))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(.horizontal, 22)
-                            .frame(height: 46)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.vertical, 10)
-            } else {
-                if let error = model.errorBanner {
-                    Text(error)
-                        .font(.callout)
-                        .foregroundStyle(.red)
-                        .padding(20)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else if model.packages.isEmpty {
-                    if let tab = model.activeTab,
-                       (tab == .formulae || tab == .casks),
-                       model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        ContentUnavailableView {
-                            Label("Search Homebrew \(tab.title)", systemImage: tab.icon)
-                        } description: {
-                            Text("Start typing a name or keyword to search Homebrew \(tab.title.lowercased()).")
-                        }
-                        .frame(height: 240)
-                    } else {
-                        ContentUnavailableView(
-                            model.isLoading ? "Searching Homebrew…" : "No Matching Packages",
-                            systemImage: "shippingbox"
-                        )
-                        .frame(height: 240)
-                    }
-                } else {
-                    // 58/42 Split List + Roomy Detail Pane with macOS 27 Large Glass Buttons
-                    HStack(spacing: 0) {
-                        ScrollView {
-                            LazyVStack(spacing: 2) {
-                                ForEach(model.packages.prefix(60)) { pkg in
-                                    packageRow(pkg)
-                                }
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 10)
-                        }
-                        .frame(width: 400, height: 336)
-
-                        Divider().opacity(0.25)
-
-                        if let pkg = model.selectedPackage {
-                            detailPane(for: pkg)
-                                .frame(width: 288, height: 336)
-                        } else {
-                            VStack(spacing: 8) {
-                                Image(systemName: "shippingbox")
-                                    .font(.system(size: 28))
-                                    .foregroundStyle(.tertiary)
-                                Text("Select a package")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(width: 288, height: 336)
-                        }
-                    }
-                }
-
-                // Bottom Action & Live Transfer Strip with ⌘K Popover Anchor
-                Divider().opacity(0.2)
-                HStack(spacing: 10) {
-                    HomebrewHUDStatusStrip(statusBanner: model.statusBanner)
-
-                    Spacer()
-
-                    Button {
-                        model.onOpenInSettings?()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "macwindow")
-                            Text("Settings")
-                        }
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .background(.quaternary.opacity(0.7), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Open Homebrew in Upkeep Settings (⌘,)")
-
-                    Button {
-                        model.showActionMenu.toggle()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text("Actions")
-                            Text("⌘K")
-                                .foregroundStyle(.tertiary)
-                        }
-                        .font(.caption.weight(.medium))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(.quaternary, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .popover(isPresented: $model.showActionMenu, arrowEdge: .bottom) {
-                        actionMenuPopover
-                    }
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 9)
-            }
-        }
-        .upkeepGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-    }
-
-    private func detailPane(for pkg: BrewPackageItem) -> some View {
-        let isThisOperating = model.activeOperationPackageID == pkg.id
-        let isCopied = model.copiedPackageID == pkg.id
-
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                UpkeepSettingsIcon(
-                    systemName: pkg.isCask ? "app.dashed" : "terminal",
-                    color: pkg.isOutdated ? .orange : MenuBarTheme.Colors.homebrew,
-                    size: 30
-                )
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(pkg.name)
-                        .font(.system(size: 16, weight: .semibold))
-                        .lineLimit(1)
-
-                    HStack(spacing: 6) {
-                        Text(pkg.isCask ? "Cask" : "Formula")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.secondary)
-
-                        if !pkg.displayVersion.isEmpty {
-                            Text("·")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                            Text(pkg.displayVersion)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                }
-            }
-
-            if pkg.isInstalled || pkg.isPinned || pkg.isOutdated {
-                HStack(spacing: 6) {
-                    if pkg.isOutdated {
-                        Label("Update Available", systemImage: "arrow.up.circle.fill")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.orange.opacity(0.16), in: Capsule())
-                    } else if pkg.isInstalled {
-                        Label("Installed", systemImage: "checkmark.circle.fill")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.green)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.green.opacity(0.15), in: Capsule())
-                    }
-
-                    if pkg.isPinned {
-                        Label("Pinned", systemImage: "pin.fill")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.orange.opacity(0.14), in: Capsule())
-                    }
-                }
-            }
-
-            Text(pkg.description.isEmpty ? "No description available." : pkg.description)
-                .font(.system(size: 12.5))
-                .foregroundStyle(.secondary)
-                .lineLimit(4)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !pkg.homepage.isEmpty {
-                Button {
-                    model.openHomepage(pkg)
-                } label: {
-                    Label(pkg.homepage, systemImage: "safari")
-                        .labelStyle(.titleAndIcon)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.tint)
-            }
-
-            Spacer(minLength: 8)
-
-            // Large macOS 27 Liquid Glass Action Buttons
-            VStack(spacing: 8) {
-                Button {
-                    model.performPrimaryAction(for: pkg)
-                } label: {
-                    HStack(spacing: 7) {
-                        if isThisOperating {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Image(systemName: primaryActionIcon(for: pkg))
-                                .font(.system(size: 13.5, weight: .semibold))
-                        }
-                        Text(primaryActionLabel(for: pkg, isOperating: isThisOperating))
-                            .font(.system(size: 13.5, weight: .semibold))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 2)
-                }
-                .buttonStyle(.upkeepPrimary)
-                .tint(primaryActionTint(for: pkg))
-                .controlSize(.large)
-                .disabled(model.isOperating)
-
-                HStack(spacing: 8) {
-                    Button {
-                        model.copyInstallCommand(pkg)
-                    } label: {
-                        Label(isCopied ? "Copied" : "Copy CLI", systemImage: isCopied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 12.5, weight: .medium))
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.upkeepSecondary)
-                    .controlSize(.large)
-
-                    if !pkg.homepage.isEmpty {
-                        Button {
-                            model.openHomepage(pkg)
-                        } label: {
-                            Image(systemName: "safari")
-                                .font(.system(size: 13.5, weight: .medium))
-                        }
-                        .buttonStyle(.upkeepSecondary)
-                        .controlSize(.large)
-                        .help("Open Homepage")
-                    }
-                }
-            }
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func primaryActionLabel(for pkg: BrewPackageItem, isOperating: Bool) -> String {
-        if isOperating {
-            if pkg.isInstalled && pkg.isOutdated { return "Upgrading…" }
-            if pkg.isInstalled { return "Uninstalling…" }
-            return "Installing…"
-        }
-        if pkg.isInstalled && pkg.isOutdated { return "Upgrade" }
-        if pkg.isInstalled { return "Uninstall" }
-        return "Install"
-    }
-
-    private func primaryActionIcon(for pkg: BrewPackageItem) -> String {
-        if pkg.isInstalled && pkg.isOutdated { return "arrow.up.circle.fill" }
-        if pkg.isInstalled { return "trash" }
-        return "arrow.down.circle.fill"
-    }
-
-    private func primaryActionTint(for pkg: BrewPackageItem) -> Color {
-        if pkg.isInstalled && pkg.isOutdated { return .orange }
-        if pkg.isInstalled { return .red }
-        return .accentColor
-    }
-
-    @ViewBuilder
-    private var actionMenuPopover: some View {
-        if let pkg = model.selectedPackage {
-            VStack(alignment: .leading, spacing: 2) {
-                actionMenuRow(
-                    pkg.isInstalled ? (pkg.isOutdated ? "Upgrade \(pkg.name)" : "Uninstall \(pkg.name)") : "Install \(pkg.name)",
-                    icon: pkg.isInstalled ? (pkg.isOutdated ? "arrow.up.circle" : "trash") : "arrow.down.circle",
-                    shortcut: "↩",
-                    destructive: pkg.isInstalled && !pkg.isOutdated
-                ) {
-                    model.performPrimaryAction(for: pkg)
-                }
-
-                if pkg.isInstalled && !pkg.isCask {
-                    actionMenuRow(
-                        pkg.isPinned ? "Unpin Formula" : "Pin Formula",
-                        icon: pkg.isPinned ? "pin.slash" : "pin",
-                        shortcut: "⌘P"
-                    ) {
-                        model.togglePin(pkg)
-                    }
-                }
-
-                if pkg.isInstalled && pkg.isOutdated {
-                    actionMenuRow("Uninstall \(pkg.name)", icon: "trash", shortcut: "⌘⌫", destructive: true) {
-                        model.uninstall(pkg)
-                    }
-                }
-
-                Divider().padding(.vertical, 4)
-
-                actionMenuRow("Copy Install Command", icon: "doc.on.doc", shortcut: "⌘C") {
-                    model.copyInstallCommand(pkg)
-                }
-
-                if !pkg.homepage.isEmpty {
-                    actionMenuRow("Open Homepage", icon: "safari", shortcut: "⌘O") {
-                        model.openHomepage(pkg)
-                    }
-                }
-
-                actionMenuRow("Open in Upkeep Settings", icon: "macwindow", shortcut: "⌘,") {
-                    model.onOpenInSettings?()
-                }
-
-                actionMenuRow("Run Brew Doctor", icon: "stethoscope", shortcut: "⌘D") {
-                    model.runBrewDoctor()
-                }
-            }
-            .padding(8)
-            .frame(width: 248)
-        }
-    }
-
-    private func actionMenuRow(
-        _ title: String,
-        icon: String,
-        shortcut: String,
-        destructive: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .frame(width: 16)
-                Text(title)
-                    .font(.system(size: 12.5))
-                Spacer()
-                Text(shortcut)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            .foregroundStyle(destructive ? Color.red : Color.primary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func packageRow(_ pkg: BrewPackageItem) -> some View {
-        let isSelected = model.selectedID == pkg.id
-        let isOperatingHere = model.activeOperationPackageID == pkg.id
-
-        return Button {
-            model.selectedID = pkg.id
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: pkg.isCask ? "app.dashed" : "terminal")
-                    .font(.system(size: 14.5, weight: .regular))
-                    .frame(width: 22)
-                    .foregroundStyle(isSelected ? .primary : .secondary)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(pkg.name)
-                            .font(.system(size: 13.5, weight: .medium))
-                            .lineLimit(1)
-                        if !pkg.displayVersion.isEmpty {
-                            Text(pkg.displayVersion)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                    if !pkg.description.isEmpty {
-                        Text(pkg.description)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-
-                Spacer()
-
-                if isOperatingHere {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    statusBadge(for: pkg)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(
-                isSelected ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.clear),
-                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    @ViewBuilder
-    private func statusBadge(for pkg: BrewPackageItem) -> some View {
-        if pkg.isOutdated {
-            Text("Update")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.orange)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(.orange.opacity(0.18), in: Capsule())
-        } else if pkg.isInstalled {
-            Text("Installed")
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(.tertiary)
-        } else {
-            Text("Install")
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
-/// Isolated status strip so 40ms `BrewLogStore.liveStatusLine` updates never re-diff `HomebrewHUDView`.
-private struct HomebrewHUDStatusStrip: View {
-    @Bindable var logStore = BrewLogStore.shared
-    let statusBanner: String?
-
-    var body: some View {
-        if logStore.isRunning, let live = logStore.liveStatusLine {
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.mini)
-                Text(live)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-        } else if let status = statusBanner {
-            Text(status)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        } else {
-            Text("⌘1 Installed · ⌘2 Formulae · ⌘3 Casks · ⌘4 Upgrades")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
+    private func addMenuItem(_ title: String, icon: String, action: Selector, key: String,
+                             modifiers: NSEvent.ModifierFlags = .command, enabled: Bool = true) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        item.image = BrewHUDControls.symbol(icon, size: 13)
+        item.keyEquivalentModifierMask = modifiers
+        item.isEnabled = enabled
+        actionMenu.addItem(item)
     }
 }

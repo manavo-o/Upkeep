@@ -116,6 +116,19 @@ public final class KeepAwakeManager {
         }
     }
 
+    func restoreSession(isActive: Bool, mode: KeepAwakeMode, expiresAt: Date?) {
+        self.mode = mode
+        guard isActive else { return }
+        if let expiresAt, expiresAt <= Date() { return }
+        start(durationMinutes: nil, mode: mode)
+        if let expiresAt {
+            self.expiresAt = expiresAt
+            scheduleExpiration(at: expiresAt)
+            refreshFormattedRemaining()
+            startDisplayTimer()
+        }
+    }
+
     public func extend(byMinutes minutes: Int) {
         guard isActive else {
             start(durationMinutes: minutes, mode: mode)
