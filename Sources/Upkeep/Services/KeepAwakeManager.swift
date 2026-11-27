@@ -38,6 +38,7 @@ public final class KeepAwakeManager {
     /// Observable formatted countdown string updated only when its text changes, so menu bar items
     /// refresh live while views using `Text(expiresAt, style: .timer)` avoid 1 Hz invalidation.
     public private(set) var formattedRemaining: String = "Off"
+    let closedLid = ClosedLidSession()
 
     /// Computed on demand so views observing `expiresAt` don't suffer 1 Hz `@Observable` invalidation storms.
     /// Live window countdowns should bind directly to `expiresAt` via `Text(expiresAt, style: .timer)`.
@@ -81,7 +82,7 @@ public final class KeepAwakeManager {
     }
 
     public func start(durationMinutes: Int?, mode: KeepAwakeMode = .displayAndSystem) {
-        stop()
+        clearIdleSleepSession()
 
         let reason = "Upkeep Caffeinated Mac"
         var newID: IOPMAssertionID = 0
@@ -159,6 +160,22 @@ public final class KeepAwakeManager {
     }
 
     public func stop() {
+        closedLid.stop()
+        clearIdleSleepSession()
+    }
+
+    func toggleClosedLid(mode: KeepAwakeMode) {
+        if closedLid.isEngaged {
+            closedLid.stop()
+        } else {
+            closedLid.start { [weak self] in
+                guard let self, !self.isActive else { return }
+                self.start(durationMinutes: 60, mode: mode)
+            }
+        }
+    }
+
+    private func clearIdleSleepSession() {
         expirationTask?.cancel()
         expirationTask = nil
         displayTimer?.invalidate()

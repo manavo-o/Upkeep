@@ -169,7 +169,19 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
                 controller.keepAwake.restoreSession(isActive: true, mode: mode, expiresAt: controller.keepAwake.expiresAt)
             }
         }
-        return [primary, .separator()] + choices + [.separator(), displayAwake]
+        let closedLid = keepAwake.closedLid.state
+        let lidCommand = command(
+            closedLid == .active ? "Keep Awake With Lid Closed" : "Keep Awake With Lid Closed…",
+            enabled: closedLid != .authorizing && closedLid != .stopping,
+            checked: closedLid == .active
+        ) { controller in
+            controller.keepAwake.toggleClosedLid(mode: controller.vm.selectedAwakeMode)
+        }
+        var options = [displayAwake, lidCommand]
+        if case .failed(let message) = closedLid {
+            options.append(command(message, enabled: false) { _ in })
+        }
+        return [primary, .separator()] + choices + [.separator()] + options
     }
 
     private func startCaffeinate(minutes: Int?) {

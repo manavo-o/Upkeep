@@ -12,10 +12,7 @@ struct CaffeinateSettingsPane: View {
             sessionStatus
                 .upkeepSearchTarget("power.keepAwake")
         } content: {
-            UpkeepSettingsSection(
-                "Session Options",
-                footer: "For closed-lid use, connect your Mac to power and an external display, keyboard, and mouse."
-            ) {
+            UpkeepSettingsSection("Session Options") {
                 Picker(selection: awakeMode) {
                     Text("Mac & Display").tag(KeepAwakeMode.displayAndSystem)
                     Text("Mac Only").tag(KeepAwakeMode.systemOnly)
@@ -25,6 +22,16 @@ struct CaffeinateSettingsPane: View {
                 .pickerStyle(.segmented)
                 .tint(UpkeepSettingsPalette.accent)
                 .upkeepSearchTarget("power.assertionMode")
+
+                Toggle(isOn: Binding(
+                    get: { keepAwake.closedLid.state == .active },
+                    set: { _ in keepAwake.toggleClosedLid(mode: vm.selectedAwakeMode) }
+                )) {
+                    UpkeepSettingLabel("Keep Awake With Lid Closed", subtitle: closedLidSubtitle)
+                }
+                .tint(UpkeepSettingsPalette.accent)
+                .disabled(keepAwake.closedLid.state == .authorizing || keepAwake.closedLid.state == .stopping)
+                .upkeepSearchTarget("power.closedLid")
 
                 LabeledContent("Start a Session") {
                     HStack(spacing: 6) {
@@ -36,6 +43,16 @@ struct CaffeinateSettingsPane: View {
                 }
                 .upkeepSearchTarget("power.quickDuration")
             }
+        }
+    }
+
+    private var closedLidSubtitle: String {
+        switch keepAwake.closedLid.state {
+        case .off: "Requires administrator approval. Starts a 1-hour session if Caffeinate is off."
+        case .authorizing: "Waiting for administrator approval…"
+        case .active: "System sleep is disabled until you turn this off or the session ends."
+        case .stopping: "Restoring the previous sleep setting…"
+        case .failed(let message): message
         }
     }
 

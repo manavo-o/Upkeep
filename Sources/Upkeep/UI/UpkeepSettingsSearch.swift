@@ -40,6 +40,7 @@ public enum UpkeepSearchCatalog {
         items(for: .controls, in: "", [
             ("power.keepAwake", "Keep Mac Awake", "cup.and.saucer.fill", ["prevent sleep", "idle", "power", "stop", "extend"]),
             ("power.assertionMode", "Keep Awake", "display", ["screen", "mac only", "display sleep", "power & input"]),
+            ("power.closedLid", "Keep Awake With Lid Closed", "laptopcomputer", ["clamshell", "sleep", "caffeinate"]),
             ("power.quickDuration", "Start a Session", "timer", ["30m", "1h", "2h", "indefinite", "duration"]),
         ]) +
         items(for: .cleanKeys, in: "", [

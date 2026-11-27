@@ -203,6 +203,7 @@ public final class IdleMemoryRecovery: NSObject {
         return !hasWindow && !HUDCoordinator.shared.hasOpenUserWindows
             && trackingMenus == 0 && NSApp.modalWindow == nil
             && !CleaningModeManager.shared.isLocked
+            && !KeepAwakeManager.shared.closedLid.isEngaged
             && !CLIExecutor.hasRunningCommands && vm.pendingUninstallApp == nil
             && !BrewLogStore.shared.isRunning && !HUDCoordinator.shared.homebrewModel.isOperating
             && !vm.isRefreshingBrew && !vm.isHomebrewBusy

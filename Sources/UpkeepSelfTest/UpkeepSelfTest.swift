@@ -44,6 +44,7 @@ struct UpkeepSelfTest {
 
         // 1. CLIExecutor & ANSI tests
         check("Resolve `brew` binary", CLIExecutor.resolveBinary("brew") != nil, CLIExecutor.resolveBinary("brew") ?? "nil")
+        check("Resolve system AppleScript by absolute path", CLIExecutor.resolveBinary("/usr/bin/osascript") == "/usr/bin/osascript")
         check("Missing binary returns nil", CLIExecutor.resolveBinary("nonexistent_bin_xyz_999") == nil)
         let stripped = CLIExecutor.stripANSI("\u{001B}[32m✓ User app cache · 18 items, 2.4GB\u{001B}[0m")
         check("ANSI escape stripping", stripped == "✓ User app cache · 18 items, 2.4GB", stripped)

@@ -90,7 +90,10 @@ public enum CLIExecutor {
     private static let binaryCache = BinaryCache()
 
     public static func resolveBinary(_ name: String) -> String? {
-        binaryCache.resolve(name)
+        if name.hasPrefix("/") {
+            return FileManager.default.isExecutableFile(atPath: name) ? name : nil
+        }
+        return binaryCache.resolve(name)
     }
 
     public static func invalidateBinaryCache() {
