@@ -1,7 +1,7 @@
 import AppKit
 import Observation
 
-/// Rebuilds commands when the menu opens. Only the fixed-width status row updates during tracking.
+/// Rebuilds commands on open and updates Caffeinate in place while the menu tracks.
 @MainActor
 public final class StatusMenuController: NSObject, NSMenuDelegate {
     private let coordinator: HUDCoordinator
@@ -12,6 +12,8 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
     private let recovery = IdleMemoryRecovery.shared
     private var vm: TrayViewModel { coordinator.trayViewModel }
     private var countdownField: NSTextField?
+    private var durationControl: CaffeinateDurationControl?
+    private weak var caffeinatePrimary: NSMenuItem?
     private var countdownTimer: Timer?
     private var isTracking = false
 
@@ -47,18 +49,28 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
     public func menuNeedsUpdate(_ menu: NSMenu) {
         guard !isTracking else { return }
         menu.removeAllItems()
-        let identity = NSMenuItem(title: "Upkeep v\(updater.currentVersion)", action: nil, keyEquivalent: "")
-        identity.isEnabled = false
-        menu.addItem(identity)
         countdownField = nil
-        if keepAwake.isActive {
+        durationControl = nil
+        if #available(macOS 27.0, *) {
+            let control = makeDurationControl()
+            durationControl = control
+            let item = NSMenuItem(title: "Caffeinate duration", action: nil, keyEquivalent: "")
+            item.view = control
+            menu.addItem(item)
+            menu.addItem(.separator())
+        } else if keepAwake.isActive {
             menu.addItem(makeCountdownItem())
         }
-        if !cleaning.hasAccessibility || cleaning.permissionDenied {
-            menu.addItem(command("Grant Accessibility Access…") { controller in
-                controller.cleaning.openAccessibilitySettings()
-            })
+        caffeinatePrimary = nil
+        if durationControl == nil {
+            let primary = command(caffeinatePrimaryTitle) { controller in
+                controller.applyCaffeinateDuration(controller.keepAwake.isActive ? 0 : 60)
+            }
+            caffeinatePrimary = primary
+            menu.addItem(primary)
         }
+        menu.addItem(cleanKeysPrimaryCommand())
+        menu.addItem(command("Search Homebrew…") { controller in controller.coordinator.showHomebrewHUD() })
         if let release = updater.availableRelease {
             menu.addItem(command("Update Available (v\(release.version))…") { controller in
                 controller.coordinator.showMainWindow(section: .updates)
@@ -66,10 +78,7 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        menu.addItem(submenu("Caffeinate", items: caffeinateCommands()))
-        let cleanKeysTitle = cleaning.isLocked ? "Clean Keys (\(cleaning.remainingSeconds)s)" : "Clean Keys"
-        menu.addItem(submenu(cleanKeysTitle, items: cleanKeysCommands()))
-        menu.addItem(command("Search Homebrew…") { controller in controller.coordinator.showHomebrewHUD() })
+        menu.addItem(submenu("Clean Keys Options", items: cleanKeysCommands()))
         if vm.isUpgradingBrew {
             menu.addItem(command("View Homebrew Upgrade…") { controller in
                 controller.coordinator.showMainWindowForHomebrewActivity()
@@ -79,8 +88,6 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
                 controller.coordinator.showHomebrewUpgrade()
             })
         }
-        menu.addItem(.separator())
-
         menu.addItem(command("Cleaner…") { controller in controller.coordinator.showMainWindow(section: .cleaner) })
         menu.addItem(command("Uninstaller…") { controller in controller.coordinator.showMainWindow(section: .uninstaller) })
         menu.addItem(.separator())
@@ -100,11 +107,23 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
     public func menuWillOpen(_ menu: NSMenu) {
         isTracking = true
         recovery.cancel()
-        guard countdownField != nil, keepAwake.expiresAt != nil else { return }
         updateCountdown()
-        countdownTimer?.invalidate()
+        updateCountdownTimer()
+    }
+
+    private func updateCountdownTimer() {
+        let needsTimer = isTracking && keepAwake.expiresAt != nil
+        guard needsTimer else {
+            countdownTimer?.invalidate()
+            countdownTimer = nil
+            return
+        }
+        guard countdownTimer == nil else { return }
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updateCountdown() }
+            MainActor.assumeIsolated {
+                self?.updateCountdown()
+                self?.updateCountdownTimer()
+            }
         }
         RunLoop.main.add(timer, forMode: .eventTracking)
         RunLoop.main.add(timer, forMode: .default)
@@ -112,9 +131,8 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
     }
 
     public func menuDidClose(_ menu: NSMenu) {
-        countdownTimer?.invalidate()
-        countdownTimer = nil
         isTracking = false
+        updateCountdownTimer()
         recovery.schedule()
     }
 
@@ -134,81 +152,75 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
     }
 
     private func updateCountdown() {
-        guard let countdownField else { return }
-        let title: String
-        if !keepAwake.isActive || keepAwake.remainingSeconds == 0 {
-            title = "Caffeinate ended"
-        } else if let seconds = keepAwake.remainingSeconds {
-            title = String(format: "Awake for %02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
-        } else {
-            title = "Awake indefinitely"
-        }
-        if countdownField.stringValue != title {
+        let title = caffeinateStatus
+        if let countdownField, countdownField.stringValue != title {
             countdownField.stringValue = title
         }
+        durationControl?.setStatus(title, isActive: keepAwake.isActive)
+        if let caffeinatePrimary, caffeinatePrimary.title != caffeinatePrimaryTitle {
+            caffeinatePrimary.title = caffeinatePrimaryTitle
+        }
     }
 
-    private func caffeinateCommands() -> [NSMenuItem] {
-        let primary = keepAwake.isActive
-            ? command("Turn Off Caffeinate") { controller in controller.keepAwake.stop() }
-            : command("Start Caffeinate (1 Hour)") { controller in controller.startCaffeinate(minutes: 60) }
-        let durations: [(String, Int?)] = [("30 Minutes", 30), ("1 Hour", 60), ("2 Hours", 120), ("Indefinitely", nil)]
-        let choices = durations.map { title, minutes in
-            let selected: Bool
-            if let minutes, let seconds = keepAwake.remainingSeconds {
-                selected = abs(seconds - minutes * 60) <= 60
-            } else {
-                selected = keepAwake.isActive && minutes == nil && keepAwake.expiresAt == nil
-            }
-            return command(title, checked: selected) { controller in controller.startCaffeinate(minutes: minutes) }
-        }
-        let displayAwake = command("Keep Display Awake", checked: vm.selectedAwakeMode == .displayAndSystem) { controller in
-            let mode: KeepAwakeMode = controller.vm.selectedAwakeMode == .displayAndSystem ? .systemOnly : .displayAndSystem
-            controller.vm.selectedAwakeMode = mode
-            if controller.keepAwake.isActive {
-                controller.keepAwake.restoreSession(isActive: true, mode: mode, expiresAt: controller.keepAwake.expiresAt)
-            }
-        }
-        let closedLid = keepAwake.closedLid.state
-        let lidCommand = command(
-            closedLid == .active ? "Keep Awake With Lid Closed" : "Keep Awake With Lid Closed…",
-            enabled: closedLid != .authorizing && closedLid != .stopping,
-            checked: closedLid == .active
-        ) { controller in
-            controller.keepAwake.toggleClosedLid(mode: controller.vm.selectedAwakeMode)
-        }
-        var options = [displayAwake, lidCommand]
-        if case .failed(let message) = closedLid {
-            options.append(command(message, enabled: false) { _ in })
-        }
-        return [primary, .separator()] + choices + [.separator()] + options
+    private var caffeinatePrimaryTitle: String {
+        keepAwake.isActive ? "Turn Off Caffeinate" : "Start Caffeinate (1 Hour)"
     }
 
-    private func startCaffeinate(minutes: Int?) {
-        keepAwake.start(durationMinutes: minutes, mode: vm.selectedAwakeMode)
+    private var caffeinateStatus: String {
+        if !keepAwake.isActive || keepAwake.remainingSeconds == 0 {
+            return "Off"
+        } else if let seconds = keepAwake.remainingSeconds {
+            return String(format: "Awake for %02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+        } else {
+            return "Awake indefinitely"
+        }
+    }
+
+    private func makeDurationControl() -> CaffeinateDurationControl {
+        let control = CaffeinateDurationControl(currentMinutes: { [weak self] in
+            guard let awake = self?.keepAwake, awake.isActive else { return 0 }
+            return awake.remainingSeconds.map { max(15, ($0 + 59) / 60) } ?? 60
+        }) { [weak self] minutes in
+            guard let self, self.isTracking else { return }
+            self.applyCaffeinateDuration(minutes)
+        }
+        control.setStatus(caffeinateStatus, isActive: keepAwake.isActive)
+        return control
+    }
+
+    private func applyCaffeinateDuration(_ minutes: Int) {
+        if minutes == 0 {
+            keepAwake.stop()
+        } else {
+            keepAwake.applyDuration(minutes: minutes, mode: vm.selectedAwakeMode)
+        }
+        updateCountdown()
+        updateCountdownTimer()
+    }
+
+    private func cleanKeysPrimaryCommand() -> NSMenuItem {
+        if cleaning.isLocked {
+            return command("Unlock Keyboard") { controller in controller.cleaning.stop() }
+        }
+        if cleaning.permissionDenied || !cleaning.hasAccessibility {
+            return command("Grant Accessibility Access…") { controller in controller.cleaning.openAccessibilitySettings() }
+        }
+        let duration = vm.cleaningDuration == 120 ? "2m" : "\(vm.cleaningDuration)s"
+        return command("Lock Keyboard (\(duration))") { controller in
+            controller.cleaning.start(
+                durationSeconds: controller.vm.cleaningDuration,
+                dimScreen: controller.vm.cleaningDimScreen,
+                lockPointer: controller.vm.cleaningLockPointer
+            )
+        }
     }
 
     private func cleanKeysCommands() -> [NSMenuItem] {
-        let primary: NSMenuItem
-        if cleaning.permissionDenied || !cleaning.hasAccessibility {
-            primary = command("Grant Accessibility Access…") { controller in controller.cleaning.openAccessibilitySettings() }
-        } else if cleaning.isLocked {
-            primary = command("Unlock Keyboard") { controller in controller.cleaning.stop() }
-        } else {
-            let duration = vm.cleaningDuration == 120 ? "2m" : "\(vm.cleaningDuration)s"
-            primary = command("Lock Keyboard (\(duration))") { controller in
-                controller.cleaning.start(
-                    durationSeconds: controller.vm.cleaningDuration,
-                    dimScreen: controller.vm.cleaningDimScreen,
-                    lockPointer: controller.vm.cleaningLockPointer
-                )
-            }
-        }
         let durations = [("30 Seconds", 30), ("60 Seconds", 60), ("2 Minutes", 120)]
         let choices = durations.map { title, seconds in
             command(title, checked: vm.cleaningDuration == seconds) { controller in controller.vm.cleaningDuration = seconds }
         }
-        return [primary, .separator()] + choices + [
+        return choices + [
             .separator(),
             command("Dim Screen While Locked", checked: vm.cleaningDimScreen) { controller in controller.vm.cleaningDimScreen.toggle() },
             command("Lock Pointer", checked: vm.cleaningLockPointer) { controller in controller.vm.cleaningLockPointer.toggle() }

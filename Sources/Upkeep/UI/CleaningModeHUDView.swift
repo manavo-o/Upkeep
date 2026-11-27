@@ -2,13 +2,14 @@ import SwiftUI
 
 public struct CleaningModeHUDView: View {
     @Bindable var manager: CleaningModeManager
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(manager: CleaningModeManager) {
         self.manager = manager
     }
 
     private var activeProgress: Double {
-        manager.holdUnlockProgress > 0 ? manager.holdUnlockProgress : manager.remainingFraction
+        manager.isHoldingToUnlock ? manager.holdUnlockProgress : manager.remainingFraction
     }
 
     public var body: some View {
@@ -22,20 +23,21 @@ public struct CleaningModeHUDView: View {
                     Circle()
                         .trim(from: 0, to: activeProgress)
                         .stroke(
-                            manager.holdUnlockProgress > 0 ? AnyShapeStyle(Color.green.gradient) : AnyShapeStyle(Color.blue.gradient),
+                            manager.isHoldingToUnlock ? AnyShapeStyle(Color.green.gradient) : AnyShapeStyle(Color.blue.gradient),
                             style: StrokeStyle(lineWidth: 3, lineCap: .round)
                         )
                         .rotationEffect(.degrees(-90))
-                        .animation(.linear(duration: manager.holdUnlockProgress > 0 ? 0.05 : 0.25), value: activeProgress)
+                        .animation(reduceMotion || manager.isHoldingToUnlock ? nil : UpkeepMotion.paneEntrance, value: manager.remainingFraction)
+                        .animation(nil, value: manager.isHoldingToUnlock)
 
-                    Image(systemName: manager.holdUnlockProgress > 0 ? "lock.open.fill" : "keyboard.badge.ellipsis")
+                    Image(systemName: manager.isHoldingToUnlock ? "lock.open.fill" : "keyboard.badge.ellipsis")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(manager.holdUnlockProgress > 0 ? .green : .primary)
+                        .foregroundStyle(manager.isHoldingToUnlock ? .green : .primary)
                 }
                 .frame(width: 36, height: 36)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(manager.holdUnlockProgress > 0 ? "Hold to Unlock…" : "Cleaning Mode")
+                    Text(manager.isHoldingToUnlock ? "Hold to Unlock…" : "Cleaning Mode")
                         .font(.system(size: 16, weight: .semibold))
                     Text(manager.lockPointer ? "Keyboard & Pointer Locked" : "Keyboard Locked")
                         .font(.caption)

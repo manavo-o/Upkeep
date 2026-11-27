@@ -141,10 +141,34 @@ struct UpkeepSelfTest {
             let loadMs = Date().timeIntervalSince(loadStart) * 1000.0
             check("BrewService.loadInstalledAndOutdated() benchmark", !loaded.isEmpty, String(format: "%d packages in %.1fms", loaded.count, loadMs))
 
+            let outdated = try await CLIExecutor.run(
+                binary: "brew", arguments: ["outdated", "--json=v2"],
+                environment: ["HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"]
+            )
+            if outdated.succeeded, let data = BrewService.extractJSONObject(from: outdated.stdout),
+               let json = try JSONSerialization.jsonObject(with: data) as? [String: [[String: Any]]] {
+                let expected = Set(["formulae", "casks"].flatMap { kind in
+                    (json[kind] ?? []).compactMap { package -> String? in
+                        guard package["pinned"] as? Bool != true,
+                              let name = (package["name"] ?? package["token"]) as? String else { return nil }
+                        return "\(kind):\(name)"
+                    }
+                })
+                let actual = Set(loaded.filter(\.isOutdated).map { package in
+                    package.isCask ? "casks:\(package.name)" : "formulae:\(package.commandName)"
+                })
+                check("Upkeep shows the same unpinned upgrades as brew outdated", actual == expected, "\(actual.count) packages")
+            } else {
+                check("Read Homebrew's upgrade list for comparison", false, outdated.stderr)
+            }
+
             let searchStart = Date()
             let hits = try await BrewService.shared.searchRemote(query: "git")
             let searchMs = Date().timeIntervalSince(searchStart) * 1000.0
             check("15k Brew catalog search ('git') benchmark", !hits.isEmpty && hits.first?.name == "git", String(format: "%d hits in %.1fms (top=%@)", hits.count, searchMs, hits.first?.name ?? "nil"))
+            if let git = loaded.first(where: { !$0.isCask && $0.name == "git" }) {
+                check("Homebrew search preserves installed package status", hits.first == git)
+            }
             if await BrewService.shared.hasWarmRemoteIndex() {
                 try await Task.sleep(for: .seconds(6))
                 check("Homebrew search index expires while idle", await !BrewService.shared.hasWarmRemoteIndex())
@@ -242,34 +266,101 @@ struct UpkeepSelfTest {
         let coordinator = HUDCoordinator.shared
         let controller = StatusMenuController(coordinator: coordinator)
         let menu = NSMenu()
+        let awake = KeepAwakeManager.shared
+        awake.stop()
+        defer { awake.stop() }
         controller.menuNeedsUpdate(menu)
 
-        guard let start = menu.item(withTitle: "Caffeinate")?.submenu?.items.first,
-              let action = start.action else {
-            check("Caffeinate has a native start command", false)
-            return
+        check("Caffeinate Options is absent from the menu", menu.item(withTitle: "Caffeinate Options") == nil)
+        if #available(macOS 27.0, *) {
+            check("The inline slider replaces the separate start command", menu.item(withTitle: "Start Caffeinate (1 Hour)") == nil)
+        } else {
+            guard let start = menu.item(withTitle: "Start Caffeinate (1 Hour)"), let action = start.action else {
+                check("Caffeinate has a native start command", false)
+                return
+            }
+            check("The native menu dispatches Caffeinate", app.sendAction(action, to: start.target, from: start))
+            check("Caffeinate started", awake.isActive)
+            check("The same quick action now stops Caffeinate", start.title == "Turn Off Caffeinate")
         }
-        defer { KeepAwakeManager.shared.stop() }
-        check("The native menu dispatches Caffeinate", app.sendAction(action, to: start.target, from: start))
-        check("Caffeinate started", KeepAwakeManager.shared.isActive)
+        let cleaning = CleaningModeManager.shared
+        if !cleaning.hasAccessibility || cleaning.permissionDenied {
+            check("The permission command replaces the lock action", menu.items.filter { $0.title == "Grant Accessibility Access…" }.count == 1)
+        }
+
+        awake.start(durationMinutes: 30, mode: .systemOnly)
 
         controller.menuNeedsUpdate(menu)
-        guard let row = menu.item(withTitle: "Caffeinate status")?.view,
-              let field = row.subviews.first as? NSTextField else {
+        let rowTitle: String
+        if #available(macOS 27.0, *) { rowTitle = "Caffeinate duration" } else { rowTitle = "Caffeinate status" }
+        guard let row = menu.item(withTitle: rowTitle)?.view,
+              let field = row.subviews.compactMap({ $0 as? NSTextField }).first(where: { $0.stringValue.hasPrefix("Awake for") }) else {
             check("The active session has a countdown row", false)
             return
         }
-        let initialTitle = field.stringValue
-        let initialFrame = row.frame
+        let collapsedHeight = row.frame.height
         let initialItems = menu.items
         controller.menuWillOpen(menu)
         defer { controller.menuDidClose(menu) }
+        let disclosure = row.subviews.compactMap { $0 as? NSButton }.first
+        let slider = row.subviews.flatMap(\.subviews).compactMap { $0 as? NSSlider }.first
+        if #available(macOS 27.0, *) {
+            if let disclosure, let slider, let action = slider.action {
+                check("The Caffeinate slider starts collapsed", slider.isHiddenOrHasHiddenAncestor)
+                check("The collapsed Caffeinate label is secondary", disclosure.contentTintColor == .secondaryLabelColor)
+                let collapsedTitleX = disclosure.cell?.titleRect(forBounds: disclosure.bounds).minX
+                let collapsedChevronSize = disclosure.image?.size
+                awake.start(durationMinutes: 60, mode: .systemOnly)
+                disclosure.performClick(nil)
+                check("The disclosure reveals the current duration inline", row.frame.height > collapsedHeight && !slider.isHiddenOrHasHiddenAncestor && slider.doubleValue == 3)
+                check("The expanded Caffeinate label uses the primary color", disclosure.contentTintColor == .labelColor)
+                check("Changing the chevron keeps the Caffeinate title horizontally anchored",
+                      collapsedTitleX != nil && collapsedTitleX == disclosure.cell?.titleRect(forBounds: disclosure.bounds).minX
+                      && collapsedChevronSize != nil && collapsedChevronSize == disclosure.image?.size)
+                let startTime = Date()
+                let initialAssertionSource = awake.usingIOKitAssertion
+                check("The logarithmic midpoint is 30 minutes and 1 hour is at three quarters",
+                      slider.minValue == 0 && slider.maxValue == 4 && slider.doubleValue == 3)
+                slider.doubleValue = 3.45
+                check("The native slider dispatches a duration change", app.sendAction(action, to: slider.target, from: slider))
+                let expiryInterval = awake.expiresAt?.timeIntervalSince(startTime) ?? 0
+                check("The slider resets the timer in five-minute steps", (4800...4802).contains(expiryInterval))
+                check("The duration edit preserves the active mode and assertion source", awake.isActive && awake.mode == .systemOnly && awake.usingIOKitAssertion == initialAssertionSource)
+            } else {
+                check("The status menu embeds a native slider", false)
+            }
+        }
+        let initialFrame = row.frame
+        let titleAfterSlider = field.stringValue
         let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline && field.stringValue == initialTitle {
+        while Date() < deadline && field.stringValue == titleAfterSlider {
             RunLoop.main.run(mode: .eventTracking, before: deadline)
         }
-        check("Countdown updates during menu tracking", field.stringValue != initialTitle, "\(initialTitle) → \(field.stringValue)")
+        check("Countdown updates during menu tracking", field.stringValue != titleAfterSlider, "\(titleAfterSlider) → \(field.stringValue)")
         check("Countdown keeps the menu row the same size", row.frame == initialFrame)
         check("Countdown keeps the same submenu items", menu.items == initialItems)
+        if #available(macOS 27.0, *), let slider, let action = slider.action {
+            slider.doubleValue = slider.minValue
+            _ = app.sendAction(action, to: slider.target, from: slider)
+            check("The Off stop ends Caffeinate immediately", !awake.isActive && awake.expiresAt == nil && field.stringValue == "Off")
+            let offLabels = (row.subviews + row.subviews.flatMap(\.subviews)).compactMap { $0 as? NSTextField }
+                .filter { $0.stringValue == "Off" }
+            check("The expanded slider shows Off once at the left stop", field.isHidden && offLabels.filter { !$0.isHiddenOrHasHiddenAncestor }.count == 1)
+
+            let startTime = Date()
+            slider.doubleValue = 1
+            _ = app.sendAction(action, to: slider.target, from: slider)
+            let expiryInterval = awake.expiresAt?.timeIntervalSince(startTime) ?? 0
+            check("The first timed stop starts a 15-minute session", awake.isActive && (900...902).contains(expiryInterval))
+
+            slider.doubleValue = 0.96
+            _ = app.sendAction(action, to: slider.target, from: slider)
+            check("A small keyboard step left from 15 minutes switches Off", slider.doubleValue == 0 && !awake.isActive)
+
+            disclosure?.performClick(nil)
+            check("Collapsing hides the controls without replacing the menu row", slider.isHiddenOrHasHiddenAncestor && row.frame.height == collapsedHeight && menu.items == initialItems)
+            check("Collapsing restores the secondary label color", disclosure?.contentTintColor == .secondaryLabelColor)
+            check("The collapsed row shows Off once in the header", !field.isHidden && offLabels.filter { !$0.isHiddenOrHasHiddenAncestor }.count == 1)
+        }
     }
 }

@@ -184,6 +184,7 @@ public final class BrewLogStore {
 public struct BrewPackageItem: Identifiable, Sendable, Hashable {
     public let id: String
     public let name: String
+    public let commandName: String
     public let description: String
     public let version: String
     public let isCask: Bool
@@ -210,10 +211,12 @@ public struct BrewPackageItem: Identifiable, Sendable, Hashable {
         isInstalled: Bool = false,
         isOutdated: Bool = false,
         isPinned: Bool = false,
-        homepage: String = ""
+        homepage: String = "",
+        commandName: String? = nil
     ) {
         self.id = "\(isCask ? "cask" : "formula"):\(name)"
         self.name = name
+        self.commandName = commandName ?? name
         self.description = description
         self.version = version
         self.isCask = isCask
@@ -238,15 +241,16 @@ public actor BrewService {
     private var lastLoadedAt: Date?
     private var isRunningCommand = false
     private var inFlightLoadTask: Task<[BrewPackageItem], Error>?
+    private var installedCatalogRevision = 0
 
     // Cached full Homebrew API catalog (~15k formulae + casks) for sub-ms remote search without spawning Ruby `brew search`
     private var remoteCatalog: [BrewPackageItem] = []
     private var lastRemoteCatalogFetch: Date?
     private var inFlightRemoteCatalogTask: Task<[BrewPackageItem], Never>?
+    private var remoteCatalogRevision = 0
     private var idleEvictionTask: Task<Void, Never>?
 
     #if USE_RUST_UPKEEP_CORE
-    private let rustLocalIndex = UpkeepEngine.RustBrewIndex()
     private let rustRemoteIndex = UpkeepEngine.RustBrewIndex()
     #endif
 
@@ -360,140 +364,125 @@ public actor BrewService {
         }
         catalogLookup = map
         lastLoadedAt = Date()
-        #if USE_RUST_UPKEEP_CORE
-        // Skip double JSON round-trip when rustRemoteIndex is loaded; keep rustLocalIndex only as offline fallback.
-        if rustRemoteIndex.count == 0 {
-            rustLocalIndex.load(items: items)
-        }
-        #endif
     }
 
-    /// Loads installed and outdated packages with 30s TTL caching and in-flight task coalescing
-    /// to prevent redundant Ruby `brew` subprocess spawns.
+    private struct InstalledPackages: Decodable {
+        struct Formula: Decodable {
+            struct Keg: Decodable { let version: String }
+
+            let name: String
+            let fullName: String?
+            let desc: String?
+            let installed: [Keg]
+            let linkedKeg: String?
+            let pinned: Bool
+            let homepage: String?
+        }
+
+        struct Cask: Decodable {
+            let token: String
+            let fullToken: String?
+            let desc: String?
+            let installed: String?
+            let pinned: Bool?
+            let homepage: String?
+        }
+
+        let formulae: [Formula]
+        let casks: [Cask]
+    }
+
+    private struct OutdatedPackages: Decodable {
+        struct Package: Decodable {
+            let name: String
+            let pinned: Bool?
+        }
+
+        let formulae: [Package]
+        let casks: [Package]
+    }
+
+    private static func brewJSON<T: Decodable>(_ type: T.Type, arguments: [String]) async throws -> T {
+        let command = "brew " + arguments.joined(separator: " ")
+        let result = try await CLIExecutor.run(binary: "brew", arguments: arguments, environment: brewEnv)
+        guard result.succeeded else {
+            throw CLIError.executionFailed(command: command, exitCode: result.exitCode, stderr: result.stderr)
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let data = extractJSONObject(from: result.stdout),
+              let decoded = try? decoder.decode(type, from: data) else {
+            throw CLIError.invalidOutput(command: command)
+        }
+        return decoded
+    }
+
+    /// Uses Homebrew's own revision, HEAD, pin and cask upgrade rules.
     public func loadInstalledAndOutdated(forceRefresh: Bool = false) async throws -> [BrewPackageItem] {
         defer {
             if !Task.isCancelled { scheduleIdleEviction() }
         }
-        if !forceRefresh,
-           !catalog.isEmpty,
-           let last = lastLoadedAt,
-           Date().timeIntervalSince(last) < 30 {
-            return catalog
-        }
 
-        if !forceRefresh, let existing = inFlightLoadTask {
-            return try await existing.value
-        }
-
-        let task = Task<[BrewPackageItem], Error> {
-            #if USE_RUST_UPKEEP_CORE
-            // Fast path: zero Ruby subprocess spawns when Rust API + local Cellar/Caskroom merge succeeds.
-            if await self.ensureRemoteCatalogLoaded() {
-                if forceRefresh {
-                    // 5ms in-place Cellar/Caskroom rescan without re-parsing formula.json/cask.json
-                    self.rustRemoteIndex.refreshLocal()
-                }
-                let fastInstalled = self.rustRemoteIndex.installedPackages()
-                if !fastInstalled.isEmpty {
-                    return fastInstalled
-                }
-            }
-            #endif
-
-            async let installedTask = CLIExecutor.run(
-                binary: "brew",
-                arguments: ["info", "--json=v2", "--installed"],
-                environment: Self.brewEnv
-            )
-            async let outdatedTask = CLIExecutor.run(
-                binary: "brew",
-                arguments: ["outdated", "--json=v2"],
-                environment: Self.brewEnv
-            )
-
-            var outdatedNames = Set<String>()
-            if let outRes = try? await outdatedTask,
-               outRes.succeeded,
-               let outData = Self.extractJSONObject(from: outRes.stdout),
-               let outObj = try? JSONSerialization.jsonObject(with: outData) as? [String: Any] {
-                if let f = outObj["formulae"] as? [[String: Any]] {
-                    for item in f {
-                        if let name = item["name"] as? String { outdatedNames.insert(name) }
-                    }
-                }
-                if let c = outObj["casks"] as? [[String: Any]] {
-                    for item in c {
-                        if let token = (item["token"] as? String) ?? (item["name"] as? String) {
-                            outdatedNames.insert(token)
-                        }
-                    }
-                }
+        let revision = installedCatalogRevision
+        let task: Task<[BrewPackageItem], Error>
+        if let existing = inFlightLoadTask {
+            task = existing
+        } else {
+            if !forceRefresh, let lastLoadedAt, Date().timeIntervalSince(lastLoadedAt) < 30 {
+                return catalog
             }
 
-            if let installedRes = try? await installedTask,
-               installedRes.succeeded,
-               let jsonData = Self.extractJSONObject(from: installedRes.stdout),
-               let root = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
-                var items: [BrewPackageItem] = []
-                if let formulae = root["formulae"] as? [[String: Any]] {
-                    for f in formulae {
-                        let name = f["name"] as? String ?? ""
-                        let fullName = f["full_name"] as? String ?? ""
-                        let desc = f["desc"] as? String ?? ""
-                        let versions = f["versions"] as? [String: Any]
-                        let version = versions?["stable"] as? String ?? ""
-                        let pinned = f["pinned"] as? Bool ?? false
-                        let homepage = f["homepage"] as? String ?? ""
-                        let isOutdated = outdatedNames.contains(name) || outdatedNames.contains(fullName) || (f["outdated"] as? Bool == true)
-                        items.append(BrewPackageItem(
-                            name: name,
-                            description: desc,
-                            version: version,
-                            isCask: false,
-                            isInstalled: true,
-                            isOutdated: isOutdated,
-                            isPinned: pinned,
-                            homepage: homepage
-                        ))
+            task = Task {
+                defer {
+                    if installedCatalogRevision == revision { inFlightLoadTask = nil }
+                }
+
+                async let installed = Self.brewJSON(InstalledPackages.self, arguments: ["info", "--json=v2", "--installed"])
+                async let outdated = Self.brewJSON(OutdatedPackages.self, arguments: ["outdated", "--json=v2"])
+                let (packages, upgrades) = try await (installed, outdated)
+                let outdatedFormulae = Set(upgrades.formulae.filter { $0.pinned != true }.map(\.name))
+                let outdatedCasks = Set(upgrades.casks.filter { $0.pinned != true }.map(\.name))
+
+                let formulae = packages.formulae.map { formula in
+                    let commandName = formula.fullName ?? formula.name
+                    let installedVersion = formula.linkedKeg ?? formula.installed.map(\.version).max {
+                        $0.localizedStandardCompare($1) == .orderedAscending
                     }
+                    return BrewPackageItem(
+                        name: formula.name, description: formula.desc ?? "", version: installedVersion ?? "",
+                        isCask: false, isInstalled: true,
+                        isOutdated: !formula.pinned && outdatedFormulae.contains(commandName),
+                        isPinned: formula.pinned, homepage: formula.homepage ?? "", commandName: commandName
+                    )
                 }
-                if let casks = root["casks"] as? [[String: Any]] {
-                    for c in casks {
-                        let token = c["token"] as? String ?? ""
-                        let desc = c["desc"] as? String ?? ""
-                        let version = c["version"] as? String ?? ""
-                        let homepage = c["homepage"] as? String ?? ""
-                        let isOutdated = outdatedNames.contains(token) || (c["outdated"] as? Bool == true)
-                        items.append(BrewPackageItem(
-                            name: token,
-                            description: desc,
-                            version: version,
-                            isCask: true,
-                            isInstalled: true,
-                            isOutdated: isOutdated,
-                            isPinned: false,
-                            homepage: homepage
-                        ))
-                    }
+                let casks = packages.casks.map { cask in
+                    BrewPackageItem(
+                        name: cask.token, description: cask.desc ?? "", version: cask.installed ?? "",
+                        isCask: true, isInstalled: true,
+                        isOutdated: cask.pinned != true && outdatedCasks.contains(cask.token),
+                        isPinned: cask.pinned == true, homepage: cask.homepage ?? "", commandName: cask.fullToken
+                    )
                 }
-                if !items.isEmpty {
-                    return items.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                let items = (formulae + casks).sorted {
+                    $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
                 }
+                if installedCatalogRevision == revision { updateLocalCatalog(items) }
+                return items
             }
-
-            return Self.scanInstalledDirectories()
+            inFlightLoadTask = task
         }
 
-        inFlightLoadTask = task
-        do {
-            let items = try await task.value
-            inFlightLoadTask = nil
-            updateLocalCatalog(items)
-            return items
-        } catch {
-            inFlightLoadTask = nil
-            throw error
-        }
+        let result = await task.result
+        try Task.checkCancellation()
+        if installedCatalogRevision != revision { return try await loadInstalledAndOutdated() }
+        return try result.get()
+    }
+
+    private func invalidateInstalledCatalog() {
+        installedCatalogRevision += 1
+        inFlightLoadTask?.cancel()
+        inFlightLoadTask = nil
+        lastLoadedAt = nil
     }
 
     // MARK: - Fast Disk-Cached Homebrew Public JSON API Index
@@ -617,7 +606,6 @@ public actor BrewService {
         }
         #if USE_RUST_UPKEEP_CORE
         rustRemoteIndex.clear()
-        rustLocalIndex.clear()
         #endif
         remoteCatalog.removeAll()
         lastRemoteCatalogFetch = nil
@@ -650,8 +638,10 @@ public actor BrewService {
         }
         #endif
 
+        let revision = remoteCatalogRevision
         if let inFlight = inFlightRemoteCatalogTask {
             let items = await inFlight.value
+            guard revision == remoteCatalogRevision else { return false }
             #if USE_RUST_UPKEEP_CORE
             return rustRemoteIndex.count > 0 || !items.isEmpty
             #else
@@ -659,7 +649,6 @@ public actor BrewService {
             #endif
         }
 
-        let localMap = catalogLookup
         #if USE_RUST_UPKEEP_CORE
         let rustIndex = self.rustRemoteIndex
         #endif
@@ -716,34 +705,24 @@ public actor BrewService {
 
             if let fData, let formulae = try? decoder.decode([APIFormula].self, from: fData) {
                 for f in formulae {
-                    let key = "formula:\(f.name)"
-                    let existing = localMap[key]
                     merged.append(BrewPackageItem(
                         name: f.name,
                         description: f.desc ?? "",
-                        version: existing?.version ?? f.versions?.stable ?? "",
+                        version: f.versions?.stable ?? "",
                         isCask: false,
-                        isInstalled: existing?.isInstalled ?? false,
-                        isOutdated: existing?.isOutdated ?? false,
-                        isPinned: existing?.isPinned ?? false,
-                        homepage: f.homepage ?? existing?.homepage ?? ""
+                        homepage: f.homepage ?? ""
                     ))
                 }
             }
 
             if let cData, let casks = try? decoder.decode([APICask].self, from: cData) {
                 for c in casks {
-                    let key = "cask:\(c.token)"
-                    let existing = localMap[key]
                     merged.append(BrewPackageItem(
                         name: c.token,
                         description: c.desc ?? "",
-                        version: existing?.version ?? c.version ?? "",
+                        version: c.version ?? "",
                         isCask: true,
-                        isInstalled: existing?.isInstalled ?? false,
-                        isOutdated: existing?.isOutdated ?? false,
-                        isPinned: false,
-                        homepage: c.homepage ?? existing?.homepage ?? ""
+                        homepage: c.homepage ?? ""
                     ))
                 }
             }
@@ -753,6 +732,7 @@ public actor BrewService {
 
         inFlightRemoteCatalogTask = task
         let loaded = await task.value
+        guard revision == remoteCatalogRevision else { return false }
         inFlightRemoteCatalogTask = nil
 
         #if USE_RUST_UPKEEP_CORE
@@ -778,23 +758,23 @@ public actor BrewService {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return fuzzySearchLocal(query: "", filterCasks: filterCasks) }
 
-        // Fast path: search cached Homebrew JSON API in-memory (Rust nucleo when linked, zero-alloc Swift otherwise)
-        let hasRemote = await ensureRemoteCatalogLoaded()
+        async let remoteReady = ensureRemoteCatalogLoaded()
+        _ = try await loadInstalledAndOutdated()
+        let hasRemote = await remoteReady
         try Task.checkCancellation()
         if hasRemote {
             #if USE_RUST_UPKEEP_CORE
-            let rustHits = rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 40)
-            if !rustHits.isEmpty { return rustHits }
+            let hits = rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 40)
             #else
             let hits = scorePool(remoteCatalog, query: trimmed, filterCasks: filterCasks, limit: 40)
-            if !hits.isEmpty { return hits }
             #endif
+            if !hits.isEmpty { return hits.map(withInstalledState) }
         }
 
-        // Offline fallback when API cache is unavailable: shell out to `brew search --desc`
+        // The description search also covers packages in locally configured taps.
         let result = try await CLIExecutor.run(
             binary: "brew",
-            arguments: ["search", "--desc", trimmed],
+            arguments: ["search", "--desc", "--", trimmed],
             environment: Self.brewEnv
         )
         if !result.succeeded {
@@ -816,18 +796,12 @@ public actor BrewService {
             guard let colon = clean.firstIndex(of: ":") else { continue }
             let name = String(clean[..<colon]).trimmingCharacters(in: .whitespaces)
             let desc = String(clean[clean.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-            let key = "\(isCaskSection ? "cask" : "formula"):\(name)"
-            let existing = catalogLookup[key]
-            results.append(BrewPackageItem(
-                name: name,
-                description: desc,
-                version: existing?.version ?? "latest",
-                isCask: isCaskSection,
-                isInstalled: existing?.isInstalled ?? false,
-                isOutdated: existing?.isOutdated ?? false,
-                isPinned: existing?.isPinned ?? false,
-                homepage: existing?.homepage ?? ""
-            ))
+            let packageName = name.split(separator: "/").last.map(String.init) ?? name
+            let item = BrewPackageItem(
+                name: packageName, description: desc, version: "",
+                isCask: isCaskSection, commandName: name
+            )
+            results.append(withInstalledState(item))
         }
 
         let filtered = results.filter { item in
@@ -835,6 +809,36 @@ public actor BrewService {
             return item.isCask == filterCasks
         }
         return filtered.isEmpty ? fuzzySearchLocal(query: trimmed, filterCasks: filterCasks) : filtered
+    }
+
+    private func withInstalledState(_ package: BrewPackageItem) -> BrewPackageItem {
+        if let installed = catalogLookup[package.id],
+           package.commandName == package.name || package.commandName == installed.commandName {
+            return installed
+        }
+        // The Rust search index can carry a snapshot of an earlier local scan.
+        return BrewPackageItem(
+            name: package.name, description: package.description,
+            version: package.isInstalled ? "" : package.version,
+            isCask: package.isCask, homepage: package.homepage, commandName: package.commandName
+        )
+    }
+
+    private func invalidateRemoteCatalog() async {
+        remoteCatalogRevision += 1
+        _ = await inFlightRemoteCatalogTask?.value
+        inFlightRemoteCatalogTask = nil
+        remoteCatalog.removeAll()
+        lastRemoteCatalogFetch = nil
+        #if USE_RUST_UPKEEP_CORE
+        rustRemoteIndex.clear()
+        #endif
+        for file in ["formula.json", "cask.json", "catalog.bin"] {
+            try? FileManager.default.setAttributes(
+                [.modificationDate: Date.distantPast],
+                ofItemAtPath: Self.cacheDirURL.appendingPathComponent(file).path
+            )
+        }
     }
 
     private func scorePool(_ pool: [BrewPackageItem], query: String, filterCasks: Bool?, limit: Int) -> [BrewPackageItem] {
@@ -875,35 +879,31 @@ public actor BrewService {
         return Array(scored.prefix(limit).map(\.0))
     }
 
-    public func fuzzySearchLocal(query: String, filterCasks: Bool?) -> [BrewPackageItem] {
+    public func fuzzySearchLocal(query: String, filterCasks: Bool?, outdatedOnly: Bool = false) -> [BrewPackageItem] {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
+        let pool = outdatedOnly ? catalog.filter(\.isOutdated) : catalog
         if trimmed.isEmpty {
-            guard let filterCasks else { return catalog }
-            return catalog.filter { $0.isCask == filterCasks }
+            guard let filterCasks else { return pool }
+            return pool.filter { $0.isCask == filterCasks }
         }
-        #if USE_RUST_UPKEEP_CORE
-        if rustRemoteIndex.count > 0 {
-            return rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 120, installedOnly: true)
-        }
-        return rustLocalIndex.search(query: trimmed, filterCasks: filterCasks, limit: 120)
-        #else
-        return scorePool(catalog, query: trimmed, filterCasks: filterCasks, limit: 120)
-        #endif
+        return scorePool(pool, query: trimmed, filterCasks: filterCasks, limit: 120)
     }
 
     private struct CommandInProgress: LocalizedError {
         var errorDescription: String? { "Wait for the current Homebrew command to finish." }
     }
 
-    private func runBrewStreaming(arguments: [String], commandLabel: String) async throws -> CLIResult {
+    private func runBrewStreaming(arguments: [String]) async throws -> CLIResult {
         guard !isRunningCommand else { throw CommandInProgress() }
         isRunningCommand = true
         defer { isRunningCommand = false }
 
+        let command = "brew " + arguments.joined(separator: " ")
         let operationID = UUID()
-        await BrewLogStore.shared.beginLive(command: commandLabel, operationID: operationID)
+        await BrewLogStore.shared.beginLive(command: command, operationID: operationID)
+        let result: CLIResult
         do {
-            let result = try await CLIExecutor.runStreaming(
+            result = try await CLIExecutor.runStreaming(
                 binary: "brew",
                 arguments: arguments,
                 environment: Self.brewEnv
@@ -912,128 +912,66 @@ public actor BrewService {
                     BrewLogStore.shared.appendLiveLine(line, operationID: operationID)
                 }
             }
-            await BrewLogStore.shared.record(
-                command: commandLabel, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode
-            )
-            return result
         } catch {
             await BrewLogStore.shared.record(
-                command: commandLabel, stdout: "", stderr: error.localizedDescription, exitCode: 1
+                command: command, stdout: "", stderr: error.localizedDescription, exitCode: 1
             )
             throw error
         }
+
+        // A failed bulk operation can still have changed some installed packages.
+        if arguments.first != "doctor" { invalidateInstalledCatalog() }
+        if arguments.first == "update", result.succeeded { await invalidateRemoteCatalog() }
+        await BrewLogStore.shared.record(
+            command: command, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode
+        )
+        return result
+    }
+
+    private func runPackageCommand(_ arguments: [String]) async throws -> String {
+        let result = try await runBrewStreaming(arguments: arguments)
+        guard result.succeeded else {
+            let command = "brew " + arguments.joined(separator: " ")
+            let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw CLIError.executionFailed(command: command, exitCode: result.exitCode, stderr: CLIExecutor.stripANSI(detail))
+        }
+        return CLIExecutor.stripANSI(result.stdout)
     }
 
     public func install(name: String, isCask: Bool) async throws -> String {
-        var args = ["install"]
-        if isCask { args.append("--cask") }
-        args.append(name)
-        let cmd = "brew " + args.joined(separator: " ")
-        let res = try await runBrewStreaming(arguments: args, commandLabel: cmd)
-        guard res.succeeded else {
-            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
-        }
-        _ = try? await loadInstalledAndOutdated(forceRefresh: true)
-        return CLIExecutor.stripANSI(res.stdout)
+        try await runPackageCommand(["install", isCask ? "--cask" : "--formula", name])
     }
 
     public func uninstall(name: String, isCask: Bool, zap: Bool = false) async throws -> String {
-        var args = ["uninstall"]
-        if isCask {
-            args.append("--cask")
-            if zap { args.append("--zap") }
-        }
+        var args = ["uninstall", isCask ? "--cask" : "--formula"]
+        if isCask && zap { args.append("--zap") }
         args.append(name)
-        let cmd = "brew " + args.joined(separator: " ")
-        let res = try await runBrewStreaming(arguments: args, commandLabel: cmd)
-        guard res.succeeded else {
-            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
-        }
-        let updated = catalog.filter { !($0.name == name && $0.isCask == isCask) }
-        #if USE_RUST_UPKEEP_CORE
-        if rustRemoteIndex.count > 0 { rustRemoteIndex.refreshLocal() }
-        #endif
-        updateLocalCatalog(updated)
-        return CLIExecutor.stripANSI(res.stdout)
+        return try await runPackageCommand(args)
     }
 
-    public func upgrade(name: String? = nil) async throws -> String {
+    public func upgrade(name: String? = nil, isCask: Bool? = nil) async throws -> String {
         var args = ["upgrade"]
-        if let name { args.append(name) }
-        let cmd = "brew " + args.joined(separator: " ")
-        let res = try await runBrewStreaming(arguments: args, commandLabel: cmd)
-        guard res.succeeded else {
-            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
+        if let name {
+            if let isCask { args.append(isCask ? "--cask" : "--formula") }
+            args.append(name)
         }
-        _ = try? await loadInstalledAndOutdated(forceRefresh: true)
-        return CLIExecutor.stripANSI(res.stdout)
+        return try await runPackageCommand(args)
     }
 
     public func pin(name: String) async throws -> String {
-        let cmd = "brew pin \(name)"
-        let res = try await runBrewStreaming(arguments: ["pin", name], commandLabel: cmd)
-        guard res.succeeded else {
-            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
-        }
-        // Update in-memory immediately instead of spawning two Ruby brew processes
-        let updated = catalog.map { item -> BrewPackageItem in
-            guard item.name == name && !item.isCask else { return item }
-            return BrewPackageItem(
-                name: item.name,
-                description: item.description,
-                version: item.version,
-                isCask: false,
-                isInstalled: item.isInstalled,
-                isOutdated: false,
-                isPinned: true,
-                homepage: item.homepage
-            )
-        }
-        #if USE_RUST_UPKEEP_CORE
-        if rustRemoteIndex.count > 0 { rustRemoteIndex.refreshLocal() }
-        #endif
-        updateLocalCatalog(updated)
-        return CLIExecutor.stripANSI(res.stdout)
+        try await runPackageCommand(["pin", name])
     }
 
     public func unpin(name: String) async throws -> String {
-        let cmd = "brew unpin \(name)"
-        let res = try await runBrewStreaming(arguments: ["unpin", name], commandLabel: cmd)
-        guard res.succeeded else {
-            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
-        }
-        let updated = catalog.map { item -> BrewPackageItem in
-            guard item.name == name && !item.isCask else { return item }
-            return BrewPackageItem(
-                name: item.name,
-                description: item.description,
-                version: item.version,
-                isCask: false,
-                isInstalled: item.isInstalled,
-                isOutdated: item.isOutdated,
-                isPinned: false,
-                homepage: item.homepage
-            )
-        }
-        #if USE_RUST_UPKEEP_CORE
-        if rustRemoteIndex.count > 0 { rustRemoteIndex.refreshLocal() }
-        #endif
-        updateLocalCatalog(updated)
-        return CLIExecutor.stripANSI(res.stdout)
+        try await runPackageCommand(["unpin", name])
     }
 
     public func updateBrew() async throws -> String {
-        let cmd = "brew update"
-        let res = try await runBrewStreaming(arguments: ["update"], commandLabel: cmd)
-        guard res.succeeded else {
-            throw CLIError.executionFailed(command: cmd, exitCode: res.exitCode, stderr: res.stderr)
-        }
-        return CLIExecutor.stripANSI(res.stdout)
+        try await runPackageCommand(["update"])
     }
 
     public func runDoctor() async throws -> String {
-        let cmd = "brew doctor"
-        let res = try await runBrewStreaming(arguments: ["doctor"], commandLabel: cmd)
+        let res = try await runBrewStreaming(arguments: ["doctor"])
         return CLIExecutor.stripANSI(res.stdout + "\n" + res.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -24,11 +24,13 @@ public struct MainWindowView: View {
         NavigationSplitView(columnVisibility: .constant(.all)) {
             sidebar
         } detail: {
-            sectionView(for: vm.activeSection)
-                .environment(\.upkeepSettingsReveal, search.reveal(for: vm.activeSection))
-                .id(vm.activeSection)
-                .transition(.asymmetric(insertion: .opacity, removal: .identity))
-                .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: vm.activeSection)
+            ZStack {
+                sectionView(for: vm.activeSection)
+                    .environment(\.upkeepSettingsReveal, search.reveal(for: vm.activeSection))
+                    .id(vm.activeSection)
+                    .transition(.asymmetric(insertion: .opacity, removal: .identity))
+            }
+                .animation(reduceMotion ? nil : UpkeepMotion.paneEntrance, value: vm.activeSection)
                 .opacity(search.isSearching ? 0 : 1)
                 .accessibilityHidden(search.isSearching)
                 .allowsHitTesting(!search.isSearching)

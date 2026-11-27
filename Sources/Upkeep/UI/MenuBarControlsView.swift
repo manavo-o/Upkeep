@@ -701,7 +701,7 @@ public struct MenuBarUpdaterPanel: View {
 
                 Spacer()
 
-                Button("Update Brew") {
+                Button(updater.isUpdatingHomebrew ? "Refreshing…" : "Update Brew") {
                     Task {
                         await updater.updateCLIUtilities()
                         vm?.refreshOverview()
@@ -710,7 +710,14 @@ public struct MenuBarUpdaterPanel: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(updater.isInstalling)
+                .disabled(updater.isInstalling || updater.isUpdatingHomebrew || vm?.isHomebrewBusy == true || !BrewService.isInstalled())
+            }
+
+            if let homebrewMessage = updater.homebrewUpdateMessage {
+                Text(homebrewMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if let status = updater.statusMessage {

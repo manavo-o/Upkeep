@@ -11,6 +11,7 @@ public struct CLIResult: Sendable {
 public enum CLIError: LocalizedError, Sendable {
     case binaryNotFound(String)
     case executionFailed(command: String, exitCode: Int32, stderr: String)
+    case invalidOutput(command: String)
     case cancelled
 
     public var errorDescription: String? {
@@ -20,6 +21,8 @@ public enum CLIError: LocalizedError, Sendable {
         case .executionFailed(let command, let code, let stderr):
             let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return "'\(command)' exited with status \(code)\(detail.isEmpty ? "" : ": \(detail)")"
+        case .invalidOutput(let command):
+            return "'\(command)' returned unreadable package information."
         case .cancelled:
             return "Command was cancelled."
         }

@@ -120,17 +120,27 @@ public final class KeepAwakeManager {
 
         self.mode = mode
         self.isActive = true
+        setExpiration(durationMinutes.flatMap { $0 > 0 ? Date().addingTimeInterval(TimeInterval($0) * 60) : nil })
+    }
 
-        if let minutes = durationMinutes, minutes > 0 {
-            let target = Date().addingTimeInterval(TimeInterval(minutes * 60))
-            self.expiresAt = target
-            scheduleExpiration(at: target)
-            refreshFormattedRemaining()
-            startDisplayTimer()
-        } else {
-            self.expiresAt = nil
-            refreshFormattedRemaining()
+    func applyDuration(minutes: Int?, mode: KeepAwakeMode) {
+        guard isActive else {
+            start(durationMinutes: minutes, mode: mode)
+            return
         }
+        setExpiration(minutes.map { Date().addingTimeInterval(TimeInterval($0) * 60) })
+    }
+
+    private func setExpiration(_ date: Date?) {
+        expiresAt = date
+        if let date {
+            scheduleExpiration(at: date)
+        } else {
+            expirationTask?.cancel()
+            expirationTask = nil
+        }
+        startDisplayTimer()
+        refreshFormattedRemaining()
     }
 
     func restoreSession(isActive: Bool, mode: KeepAwakeMode, expiresAt: Date?) {
@@ -139,10 +149,7 @@ public final class KeepAwakeManager {
         if let expiresAt, expiresAt <= Date() { return }
         start(durationMinutes: nil, mode: mode)
         if let expiresAt {
-            self.expiresAt = expiresAt
-            scheduleExpiration(at: expiresAt)
-            refreshFormattedRemaining()
-            startDisplayTimer()
+            setExpiration(expiresAt)
         }
     }
 
@@ -152,11 +159,7 @@ public final class KeepAwakeManager {
             return
         }
         let base = expiresAt ?? Date()
-        let target = base.addingTimeInterval(TimeInterval(minutes * 60))
-        expiresAt = target
-        scheduleExpiration(at: target)
-        refreshFormattedRemaining()
-        startDisplayTimer()
+        setExpiration(base.addingTimeInterval(TimeInterval(minutes * 60)))
     }
 
     public func stop() {

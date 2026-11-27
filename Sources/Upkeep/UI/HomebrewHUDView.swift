@@ -14,7 +14,6 @@ final class HomebrewHUDView: NSView, NSSearchFieldDelegate, NSTableViewDataSourc
 
     private let model: HomebrewHUDModel
     private let onDismiss: () -> Void
-    private let onCategoryChange: (Bool) -> Void
     private let search = HomebrewHUDSearchField(frame: .zero)
     private let scope = NSButton()
     private let clear = NSButton()
@@ -38,6 +37,8 @@ final class HomebrewHUDView: NSView, NSSearchFieldDelegate, NSTableViewDataSourc
     private let actionMenu = NSMenu(title: "Homebrew Actions")
 
     private var trayHeight: NSLayoutConstraint!
+    private var targetTrayHeight: CGFloat = 210
+    private var targetPanelHeight: CGFloat = 520
     private var results = Results()
     private var isUpdatingTable = false
     private var observesContent = false
@@ -45,10 +46,9 @@ final class HomebrewHUDView: NSView, NSSearchFieldDelegate, NSTableViewDataSourc
     private(set) var isPresented = false
     private(set) var isTrackingActions = false
 
-    init(model: HomebrewHUDModel, onDismiss: @escaping () -> Void, onCategoryChange: @escaping (Bool) -> Void) {
+    init(model: HomebrewHUDModel, onDismiss: @escaping () -> Void) {
         self.model = model
         self.onDismiss = onDismiss
-        self.onCategoryChange = onCategoryChange
         super.init(frame: .zero)
         setUpView()
     }
@@ -281,6 +281,8 @@ final class HomebrewHUDView: NSView, NSSearchFieldDelegate, NSTableViewDataSourc
         BrewHUDControls.configure(detail.copy, title: "", target: self, action: #selector(copyCommand))
         BrewHUDControls.configure(detail.homepage, title: "", target: self, action: #selector(openHomepage))
         BrewHUDControls.configure(detail.homepageIcon, title: "", icon: "safari", target: self, action: #selector(openHomepage))
+        detail.homepageIcon.imagePosition = .imageOnly
+        detail.homepageIcon.alignment = .center
         detail.homepageIcon.setAccessibilityLabel("Open Homepage")
         detail.homepageIcon.toolTip = "Open Homepage"
         for button in [detail.primary, detail.copy, detail.homepageIcon] {
@@ -382,8 +384,6 @@ final class HomebrewHUDView: NSView, NSSearchFieldDelegate, NSTableViewDataSourc
         errorMessage.stringValue = error ?? ""
         statusBar.isHidden = isCategory
         statusBarSeparator.isHidden = isCategory
-        trayHeight.constant = isCategory ? 210 : (showsResults ? 377 : (error == nil ? 281 : 121))
-        onCategoryChange(isCategory)
 
         if !placeholder.isHidden {
             if let tab, (tab == .formulae || tab == .casks),
@@ -404,6 +404,28 @@ final class HomebrewHUDView: NSView, NSSearchFieldDelegate, NSTableViewDataSourc
             detail.update(for: package, operationID: currentResults.operationID, copiedID: copiedID)
         } else {
             detail.clear()
+        }
+
+        let nextTrayHeight: CGFloat = isCategory ? 210 : (showsResults ? 377 : (error == nil ? 281 : 121))
+        let nextPanelHeight: CGFloat = isCategory ? 344 : 520
+        if targetTrayHeight != nextTrayHeight || targetPanelHeight != nextPanelHeight {
+            targetTrayHeight = nextTrayHeight
+            targetPanelHeight = nextPanelHeight
+            updateGeometry(animated: error == nil && window?.isVisible == true && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        }
+    }
+
+    func updateGeometry(animated: Bool) {
+        guard let window else { return }
+        var frame = window.frame
+        frame.origin.y = frame.maxY - targetPanelHeight
+        frame.size.height = targetPanelHeight
+        UpkeepMotion.animateAppKit(duration: animated ? UpkeepMotion.resizeDuration : 0) {
+            trayHeight.animator().constant = targetTrayHeight
+            if window.frame != frame {
+                window.animator().setFrame(frame, display: true)
+            }
+            layoutSubtreeIfNeeded()
         }
     }
 

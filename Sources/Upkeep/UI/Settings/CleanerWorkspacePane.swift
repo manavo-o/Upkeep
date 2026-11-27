@@ -5,6 +5,7 @@ struct CleanerWorkspacePane: View {
     @Bindable var vm: TrayViewModel
     @State private var collapsedCategories: Set<String> = []
     @State private var copiedError = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isBusy: Bool { vm.isScanningClean || vm.isCleaning }
 
@@ -107,10 +108,12 @@ struct CleanerWorkspacePane: View {
         let isExpanded = Binding(
             get: { !collapsedCategories.contains(category.id) },
             set: { expanded in
-                if expanded {
-                    collapsedCategories.remove(category.id)
-                } else {
-                    collapsedCategories.insert(category.id)
+                withAnimation(reduceMotion ? nil : UpkeepMotion.disclosure) {
+                    if expanded {
+                        collapsedCategories.remove(category.id)
+                    } else {
+                        collapsedCategories.insert(category.id)
+                    }
                 }
             }
         )

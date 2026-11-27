@@ -19,6 +19,8 @@ public final class CleaningModeManager {
     public private(set) var permissionDenied: Bool = false
     public private(set) var hasAccessibility: Bool = false
 
+    var isHoldingToUnlock: Bool { holdStartDate != nil }
+
     public var remainingFraction: Double {
         guard totalDurationSeconds > 0 else { return 0 }
         return max(0, min(1, Double(remainingSeconds) / Double(totalDurationSeconds)))

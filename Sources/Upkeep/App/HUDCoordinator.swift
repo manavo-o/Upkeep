@@ -26,6 +26,10 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
 
     private override init() {
         super.init()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(accessibilityDisplayChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: NSWorkspace.shared
+        )
         homebrewModel.onCatalogChanged = { [weak self] in
             self?.trayViewModel.refreshOverview(force: true)
         }
@@ -51,6 +55,16 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
 
     var hasOpenUserWindows: Bool {
         mainWindowController != nil || homebrewPanel != nil || cleaningPanel != nil
+    }
+
+    @objc private func accessibilityDisplayChanged() {
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        mainWindowController?.window?.animationBehavior = reduceMotion ? .none : .utilityWindow
+        guard reduceMotion else { return }
+        homebrewHUD?.updateGeometry(animated: false)
+        if let homebrewPanel {
+            UpkeepMotion.animateAppKit(duration: 0) { homebrewPanel.animator().alphaValue = 1 }
+        }
     }
 
     // MARK: - Dedicated macOS 27 Native Window (Upkeep)
@@ -443,23 +457,28 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         if homebrewPanel == nil {
             let hud = HomebrewHUDView(model: homebrewModel) { [weak self] in
                 self?.hideHomebrewHUD()
-            } onCategoryChange: { [weak self] isCategory in
-                self?.updateHomebrewPanelHeight(isCategoryMenu: isCategory)
             }
             let panel = LiquidGlassPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
                 level: .floating,
                 content: hud
             )
+            panel.animationBehavior = .none
             panel.hudShortcut = { [weak hud] event in hud?.handleShortcut(event) ?? false }
             panel.delegate = self
             homebrewHUD = hud
             homebrewPanel = panel
         }
+        guard let panel = homebrewPanel else { return }
+        let animateEntrance = !panel.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if animateEntrance { panel.alphaValue = 0 }
         homebrewHUD?.prepareForShow()
-        homebrewPanel?.presentCenteredAtHUDHeight()
+        panel.presentCenteredAtHUDHeight()
         homebrewHUD?.focusSearch()
         installHomebrewClickOutsideMonitors()
+        if animateEntrance {
+            UpkeepMotion.animateAppKit(duration: UpkeepMotion.entranceDuration) { panel.animator().alphaValue = 1 }
+        }
     }
 
     public func hideHomebrewHUD() {
@@ -514,18 +533,6 @@ public final class HUDCoordinator: NSObject, NSWindowDelegate, NSToolbarDelegate
         if let monitor = homebrewLocalClickMonitor {
             NSEvent.removeMonitor(monitor)
             homebrewLocalClickMonitor = nil
-        }
-    }
-
-    public func updateHomebrewPanelHeight(isCategoryMenu: Bool) {
-        guard let panel = homebrewPanel else { return }
-        let targetHeight: CGFloat = isCategoryMenu ? 344 : 520
-        var frame = panel.frame
-        if frame.height != targetHeight {
-            let dy = frame.height - targetHeight
-            frame.origin.y += dy
-            frame.size.height = targetHeight
-            panel.setFrame(frame, display: true, animate: false)
         }
     }
 

@@ -233,11 +233,11 @@ public final class TrayViewModel {
             do {
                 _ = try await BrewService.shared.upgrade(name: nil)
                 self.brewStatusText = "Package upgrade finished"
-                self.refreshOverview()
             } catch {
                 self.brewStatusText = nil
                 self.brewErrorText = error.localizedDescription
             }
+            self.refreshOverview()
             self.isUpgradingBrew = false
         }
     }

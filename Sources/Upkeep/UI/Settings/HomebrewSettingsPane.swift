@@ -325,22 +325,41 @@ struct HomebrewSettingsPane: View {
                 }
 
                 if let log = logStore.lastLog, logStore.isRunning || !isOperating {
-                    DisclosureGroup("Command Output", isExpanded: $showFullLog) {
-                        ScrollView([.vertical, .horizontal]) {
-                            Text(log.output)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .padding(10)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Button {
+                            showFullLog.toggle()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: showFullLog ? "chevron.down" : "chevron.right")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .frame(width: 9)
+                                    .accessibilityHidden(true)
+                                Text("Command Output")
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 2)
+                            .contentShape(Rectangle())
                         }
-                        .frame(maxWidth: .infinity, maxHeight: 150, alignment: .leading)
-                        .background(.quaternary.opacity(0.35), in: .rect(cornerRadius: 8))
-                        .padding(.top, 6)
+                        .buttonStyle(.plain)
+                        .accessibilityValue(showFullLog ? Text("Expanded") : Text("Collapsed"))
+
+                        if showFullLog {
+                            ScrollView([.vertical, .horizontal]) {
+                                Text(log.output)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .padding(10)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: 150, alignment: .leading)
+                            .background(.quaternary.opacity(0.35), in: .rect(cornerRadius: 8))
+                            .padding(.top, 6)
+                        }
                     }
                     .font(.callout)
                 }
             }
             .padding(.vertical, 3)
-            .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: showFullLog)
+            .animation(reduceMotion ? nil : UpkeepMotion.disclosure, value: showFullLog)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: isOperating)
             .upkeepSearchTarget("brew.log")
 
@@ -557,9 +576,13 @@ struct HomebrewSettingsPane: View {
             }
 
             if currentScope == .installed || currentScope == .upgrades {
-                let local = await BrewService.shared.fuzzySearchLocal(query: trimmed, filterCasks: nil)
+                _ = try? await BrewService.shared.loadInstalledAndOutdated()
                 guard !Task.isCancelled else { return }
-                self.packages = currentScope == .upgrades ? local.filter(\.isOutdated) : local
+                let local = await BrewService.shared.fuzzySearchLocal(
+                    query: trimmed, filterCasks: nil, outdatedOnly: currentScope == .upgrades
+                )
+                guard !Task.isCancelled else { return }
+                self.packages = local
                 self.isSearching = false
                 return
             }
@@ -583,17 +606,16 @@ struct HomebrewSettingsPane: View {
         Task {
             do {
                 if pkg.isInstalled && pkg.isOutdated {
-                    _ = try await BrewService.shared.upgrade(name: pkg.name)
+                    _ = try await BrewService.shared.upgrade(name: pkg.commandName, isCask: pkg.isCask)
                 } else if pkg.isInstalled {
-                    _ = try await BrewService.shared.uninstall(name: pkg.name, isCask: pkg.isCask)
+                    _ = try await BrewService.shared.uninstall(name: pkg.commandName, isCask: pkg.isCask)
                 } else {
-                    _ = try await BrewService.shared.install(name: pkg.name, isCask: pkg.isCask)
+                    _ = try await BrewService.shared.install(name: pkg.commandName, isCask: pkg.isCask)
                 }
-                vm.refreshOverview()
-                runSearch()
             } catch {
                 vm.brewErrorText = error.localizedDescription
             }
+            vm.refreshOverview()
             vm.brewActivePackageID = nil
         }
     }

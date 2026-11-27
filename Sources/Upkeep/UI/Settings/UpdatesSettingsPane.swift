@@ -53,7 +53,7 @@ struct UpdatesSettingsPane: View {
                                 .frame(maxHeight: 160)
                                 .padding(.vertical, 6)
                             }
-                            .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: showReleaseNotes)
+                            .animation(reduceMotion ? nil : UpkeepMotion.disclosure, value: showReleaseNotes)
                         }
                     }
                 }

@@ -86,10 +86,10 @@ public final class HomebrewHUDModel {
         onQueryChanged(resetResults: false)
     }
 
-    private func onQueryChanged(resetResults: Bool) {
+    private func onQueryChanged(resetResults: Bool, operationError: String? = nil) {
         searchTask?.cancel()
         searchTask = nil
-        errorBanner = nil
+        errorBanner = operationError
         let currentQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let now = ContinuousClock.now
         let isRapidInput = !resetResults && lastQueryChange.map {
@@ -127,34 +127,30 @@ public final class HomebrewHUDModel {
             let isWarm = await BrewService.shared.hasWarmRemoteIndex()
             guard !Task.isCancelled else { return }
             let localOnly = activeTab == .installed || activeTab == .upgrades
-            if !isWarm || localOnly {
-                if localOnly {
-                    _ = try? await BrewService.shared.loadInstalledAndOutdated()
-                    guard !Task.isCancelled else { return }
-                }
-                let local = await BrewService.shared.fuzzySearchLocal(query: currentQuery, filterCasks: caskFilter)
-                guard !Task.isCancelled else { return }
-                packages = filterForTab(local)
-                selectedID = packages.first?.id
-            }
+            isLoading = localOnly || !isWarm
 
-            if localOnly {
-                isLoading = false
-                return
-            }
-
-            // Coalesce only sub-frame input bursts. First queries, pastes, and scope changes run immediately.
-            isLoading = !isWarm
-            if isWarm && isRapidInput {
+            // Coalesce only sub-frame input bursts when the catalog is warm.
+            if !localOnly && isWarm && isRapidInput {
                 try? await Task.sleep(for: .milliseconds(16))
-                guard !Task.isCancelled else { return }
             }
-
-            let remote = try? await BrewService.shared.searchRemote(query: currentQuery, filterCasks: caskFilter)
             guard !Task.isCancelled else { return }
-            if let remote {
-                packages = filterForTab(remote)
+
+            do {
+                let matches: [BrewPackageItem]
+                if localOnly {
+                    _ = try await BrewService.shared.loadInstalledAndOutdated()
+                    matches = await BrewService.shared.fuzzySearchLocal(
+                        query: currentQuery, filterCasks: caskFilter, outdatedOnly: activeTab == .upgrades
+                    )
+                } else {
+                    matches = try await BrewService.shared.searchRemote(query: currentQuery, filterCasks: caskFilter)
+                }
+                guard !Task.isCancelled else { return }
+                packages = matches
                 selectedID = packages.first?.id
+            } catch {
+                guard !Task.isCancelled else { return }
+                errorBanner = error.localizedDescription
             }
             isLoading = false
         }
@@ -181,13 +177,13 @@ public final class HomebrewHUDModel {
         guard !isOperating else { return }
         if item.isInstalled && item.isOutdated {
             runAsync(packageID: item.id, label: "Upgrading \(item.name)…", success: "Upgraded \(item.name)") {
-                _ = try await BrewService.shared.upgrade(name: item.name)
+                _ = try await BrewService.shared.upgrade(name: item.commandName, isCask: item.isCask)
             }
         } else if item.isInstalled {
             uninstall(item)
         } else {
             runAsync(packageID: item.id, label: "Installing \(item.name)…", success: "Installed \(item.name)") {
-                _ = try await BrewService.shared.install(name: item.name, isCask: item.isCask)
+                _ = try await BrewService.shared.install(name: item.commandName, isCask: item.isCask)
             }
         }
     }
@@ -195,7 +191,7 @@ public final class HomebrewHUDModel {
     public func uninstall(_ item: BrewPackageItem) {
         guard !isOperating else { return }
         runAsync(packageID: item.id, label: "Uninstalling \(item.name)…", success: "Uninstalled \(item.name)") {
-            _ = try await BrewService.shared.uninstall(name: item.name, isCask: item.isCask)
+            _ = try await BrewService.shared.uninstall(name: item.commandName, isCask: item.isCask)
         }
     }
 
@@ -204,17 +200,18 @@ public final class HomebrewHUDModel {
         guard !item.isCask else { return }
         if item.isPinned {
             runAsync(packageID: item.id, label: "Unpinning \(item.name)…", success: "Unpinned \(item.name)") {
-                _ = try await BrewService.shared.unpin(name: item.name)
+                _ = try await BrewService.shared.unpin(name: item.commandName)
             }
         } else {
             runAsync(packageID: item.id, label: "Pinning \(item.name)…", success: "Pinned \(item.name)") {
-                _ = try await BrewService.shared.pin(name: item.name)
+                _ = try await BrewService.shared.pin(name: item.commandName)
             }
         }
     }
 
     public func copyInstallCommand(_ item: BrewPackageItem) {
-        let cmd = item.isCask ? "brew install --cask \(item.name)" : "brew install \(item.name)"
+        let kind = item.isCask ? "--cask" : "--formula"
+        let cmd = "brew install \(kind) \(item.commandName)"
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(cmd, forType: .string)
         statusBanner = "Copied `\(cmd)`"
@@ -261,17 +258,18 @@ public final class HomebrewHUDModel {
         statusBanner = label
         errorBanner = nil
         Task {
+            let operationError: String?
             do {
                 try await operation()
                 self.statusBanner = success
-                self.onCatalogChanged?()
-                _ = try await BrewService.shared.loadInstalledAndOutdated(forceRefresh: true)
-                if self.isPresented {
-                    self.onQueryChanged()
-                }
+                operationError = nil
             } catch {
-                self.errorBanner = error.localizedDescription
                 self.statusBanner = nil
+                operationError = error.localizedDescription
+            }
+            self.onCatalogChanged?()
+            if self.isPresented {
+                self.onQueryChanged(resetResults: true, operationError: operationError)
             }
             self.activeOperationPackageID = nil
         }

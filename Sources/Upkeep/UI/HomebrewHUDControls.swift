@@ -169,6 +169,7 @@ final class BrewHUDDetailView: NSView {
         secondary.alignment = .centerY
         copy.setContentHuggingPriority(.defaultLow, for: .horizontal)
         homepageIcon.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        homepageIcon.heightAnchor.constraint(equalTo: copy.heightAnchor).isActive = true
         let buttons = NSStackView(views: [primaryRow, secondary])
         buttons.orientation = .vertical
         buttons.alignment = .width

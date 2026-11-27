@@ -1,10 +1,10 @@
-## What’s new in Upkeep v1.5
+## What’s new in Upkeep v1.6
 
-- Rebuilt Settings with native Liquid Glass controls, an Upkeep-blue palette, a translucent sidebar, and separate Caffeinate and Clean Keys panes.
-- Added Back and Forward navigation and toolbar search with keyboard selection, highlighted destinations, and VoiceOver announcements.
-- Reworked Cleaner and Uninstaller review, with grouped file selection, clearer removal confirmations, and blue **Running** badges for app caches held back by the scan.
-- Refreshed the Homebrew package browser and activity view. Package commands report progress in one place and run one at a time so their output stays separate.
-- Rebuilt the menu bar menu with native AppKit controls. The Caffeinate countdown updates while the menu is open and refreshes after the Mac wakes.
+- Fixed Homebrew upgrade detection, including formula revisions and cask upgrade rules. Install, upgrade, and uninstall actions use the selected package type.
+- Refresh Catalog updates the package list and search cache. Click anywhere on the Command Output row to expand or collapse it.
+- Centered the Safari icon in the floating Homebrew search and matched its button height to Copy CLI.
+- Added a Caffeinate duration slider and direct keyboard lock and unlock actions to the macOS 27 menu bar menu. Caffeinate can also keep the Mac awake with the lid closed.
+- Updated HUD and Settings animations to respect Reduce Motion.
 
 The release archive supports Apple silicon Macs running macOS 26 or later. The Homebrew package browser uses native tabs on macOS 27.
 
