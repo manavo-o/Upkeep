@@ -231,7 +231,7 @@ public final class TrayViewModel {
         brewStatusText = "Upgrading packages…"
         Task {
             do {
-                _ = try await BrewService.shared.upgrade(name: nil)
+                _ = try await BrewService.shared.upgrade(name: nil, retainOutput: false)
                 self.brewStatusText = "Package upgrade finished"
             } catch {
                 self.brewStatusText = nil
@@ -306,23 +306,19 @@ public final class TrayViewModel {
         isLoadingApps = true
         uninstallError = nil
         Task {
-            // Phase 1: instant app list (<15ms) when empty so UI never blocks on large bundles like Xcode
-            if self.installedApps.isEmpty {
-                let quickApps = await UpkeepEngine.scanInstalledApplicationsMetadata()
-                if !quickApps.isEmpty {
-                    self.installedApps = quickApps
+            defer {
+                self.isLoadingApps = false
+                self.isUpdatingAppSizes = false
+            }
+            do {
+                self.installedApps = try await MoleService.shared.listInstalledApps(forceRefresh: force) { apps in
+                    if self.installedApps.isEmpty { self.installedApps = apps }
+                    self.isUpdatingAppSizes = true
                     self.isLoadingApps = false
                 }
-            }
-            // Phase 2: populate APFS-accurate bundle sizes in parallel
-            self.isUpdatingAppSizes = true
-            defer { self.isUpdatingAppSizes = false }
-            do {
-                self.installedApps = try await MoleService.shared.listInstalledApps(forceRefresh: force)
             } catch {
                 self.uninstallError = error.localizedDescription
             }
-            self.isLoadingApps = false
         }
     }
 

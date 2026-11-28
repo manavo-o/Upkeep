@@ -26,6 +26,13 @@ Upkeep starts in the menu bar without opening a window or adding a Dock icon. Th
 
 Homebrew is optional and enables package browsing, package commands, and Homebrew cask removal. Cleaner and Uninstaller’s native removal workflow work with the bundled engine, without installing Mole or Rust separately.
 
+## New in 1.6.2
+
+- Caffeinate updates the countdown only where it’s visible. Idle memory recovery waits for active work to finish without polling.
+- Homebrew cancels searches as you change the query and keeps just the recent output in memory during interactive package operations.
+- Uninstaller shows app names before calculating bundle sizes and shares the scan when requests overlap.
+- Building from source requires the Rust toolchain. The download already includes the Rust core.
+
 ## What you can do
 
 | Feature | Where to start | What it does |
@@ -131,7 +138,7 @@ Use an Apple silicon Mac, **Xcode 27** with the macOS 27 SDK to build the curren
 ```sh
 git clone https://github.com/manavo-o/Upkeep.git
 cd Upkeep
-UPKEEP_REQUIRE_RUST=1 ./Scripts/build-app.sh
+./Scripts/build-app.sh
 codesign --verify --deep --strict dist/Upkeep.app
 codesign -dv --verbose=4 dist/Upkeep.app
 ```
@@ -140,7 +147,7 @@ The script builds the Rust static library into `Frameworks/lib/`, compiles the S
 
 For repeatable local builds, look for `Authority=Apple Development: …` or `Authority=Upkeep Local Signing` in the signature details, then run `open dist/Upkeep.app`. The script can create a persistent local signing identity when a development identity is unavailable. If it falls back to ad-hoc signing, rebuild with keychain access before replacing your running copy. After switching from an ad-hoc build to a persistent signature, toggle Upkeep off and on once in **System Settings → Privacy & Security → Accessibility** if Clean Keys still asks for access.
 
-A local development build can use the Swift fallback when `Frameworks/lib/libupkeep_core.a` is absent and Rust is unavailable. The fallback has narrower Cleaner coverage and uses Swift implementations of other engine operations. CI and release builds require the Rust core.
+Upkeep requires the Rust core for every build. When invoking SwiftPM directly, run `./Scripts/build-rust-cabi.sh` first to build `Frameworks/lib/libupkeep_core.a`.
 
 ### Run the checks
 
@@ -148,7 +155,7 @@ Run these from the repository root after building. The main Swift self-test expe
 
 ```sh
 cargo test --manifest-path rust/upkeep_core/Cargo.toml
-UPKEEP_REQUIRE_RUST=1 ./.build/release/UpkeepSelfTest
+./.build/release/UpkeepSelfTest
 ./.build/release/UpkeepSelfTest --status-menu
 ```
 
@@ -161,7 +168,7 @@ UPKEEP_MEMORY_TEST_DIRECTORY="$recovery_results" ./.build/release/UpkeepSelfTest
 
 The replacement process writes `result.json` shortly after the original command exits. Check `"$recovery_results/result.json"` for `"passed": true`.
 
-The [release workflow](.github/workflows/release.yml) tests the Rust core, builds Upkeep with Rust enabled, runs the main Swift self-test, and packages `Upkeep-v*.zip`. Builds from `v*` tags publish the archive to GitHub Releases. CI uses ad-hoc signing.
+The [release workflow](.github/workflows/release.yml) tests the Rust core, builds Upkeep, runs the main Swift self-test, and packages `Upkeep-v*.zip`. Builds from `v*` tags publish the archive to GitHub Releases. CI uses ad-hoc signing.
 
 ## Architecture
 

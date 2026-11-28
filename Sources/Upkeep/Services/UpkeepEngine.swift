@@ -1,21 +1,9 @@
 import Foundation
-#if USE_RUST_UPKEEP_CORE
 import CUpkeepCore
-#endif
 
-/// Unified high-performance dual-engine: bridges to the Rust `upkeep_core` C-ABI
-/// when linked (`USE_RUST_UPKEEP_CORE`), with fast zero-allocation Swift fallbacks.
+/// Swift bindings for the Rust `upkeep_core` C ABI.
 public enum UpkeepEngine {
 
-    public static var isUsingRustCore: Bool {
-        #if USE_RUST_UPKEEP_CORE
-        return true
-        #else
-        return false
-        #endif
-    }
-
-    #if USE_RUST_UPKEEP_CORE
     /// Decodes a NUL-terminated UTF-8 JSON buffer returned by Rust without intermediate String/Data copies.
     @inline(__always)
     fileprivate static func decodeRustJSON<T: Decodable>(
@@ -58,11 +46,9 @@ public enum UpkeepEngine {
             )
         }
     }
-    #endif
 
     // MARK: - Persistent Rust Brew Search Index
 
-    #if USE_RUST_UPKEEP_CORE
     public final class RustBrewIndex: @unchecked Sendable {
         private let itemsLock = NSLock()
         private let ptr: OpaquePointer?
@@ -233,10 +219,20 @@ public enum UpkeepEngine {
             limit: Int = 80,
             installedOnly: Bool = false
         ) -> [BrewPackageItem] {
+            searchJSON(query: query, filterCasks: filterCasks, limit: limit, installedOnly: installedOnly, token: nil)
+        }
+
+        private func searchJSON(
+            query: String,
+            filterCasks: Bool?,
+            limit: Int,
+            installedOnly: Bool,
+            token: OpaquePointer?
+        ) -> [BrewPackageItem] {
             guard let ptr else { return [] }
             let filterMode: Int32 = filterCasks == nil ? -1 : (filterCasks! ? 1 : 0)
             let rawPtr: UnsafeMutablePointer<CChar>? = query.withCString { qPtr in
-                upkeep_brew_index_search_scoped_json(ptr, qPtr, UInt32(max(1, limit)), filterMode, installedOnly)
+                upkeep_brew_index_search_cancellable_json(ptr, qPtr, UInt32(max(1, limit)), filterMode, installedOnly, token)
             }
             guard let rawPtr else { return [] }
             defer { upkeep_string_free(rawPtr) }
@@ -244,6 +240,27 @@ public enum UpkeepEngine {
                 return []
             }
             return decoded.map { $0.toItem() }
+        }
+
+        private final class SearchCancellation: @unchecked Sendable {
+            let token = upkeep_brew_search_cancellation_new()
+            func cancel() { upkeep_brew_search_cancel(token) }
+            deinit { upkeep_brew_search_cancellation_free(token) }
+        }
+
+        func searchCancellable(query: String, filterCasks: Bool?, limit: Int) async throws -> [BrewPackageItem] {
+            let cancellation = SearchCancellation()
+            return try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                let hits = await Task.detached(priority: .userInitiated) {
+                    self.searchJSON(query: query, filterCasks: filterCasks, limit: limit,
+                                    installedOnly: false, token: cancellation.token)
+                }.value
+                try Task.checkCancellation()
+                return hits
+            } onCancel: {
+                cancellation.cancel()
+            }
         }
 
         /// Zero-allocation index search when Swift already holds the matching `items` slice.
@@ -273,104 +290,19 @@ public enum UpkeepEngine {
             return results
         }
     }
-    #endif
 
     // MARK: - Zero-Allocation Fuzzy Matcher
 
-    @inline(__always)
-    private static func toLowerAscii(_ b: UInt8) -> UInt8 {
-        (b >= 65 && b <= 90) ? (b | 0x20) : b
-    }
-
-    /// Zero-allocation UTF-8 fuzzy matcher (or Rust thread-local nucleo when linked).
+    /// UTF-8 fuzzy matching with Rust’s thread-local nucleo matcher.
     public static func scoreFuzzy(query: String, candidate: String) -> Int? {
         if query.isEmpty { return 0 }
 
-        #if USE_RUST_UPKEEP_CORE
         let s = query.withCString { qPtr in
             candidate.withCString { cPtr in
                 upkeep_fuzzy_score(qPtr, cPtr)
             }
         }
         return s >= 0 ? Int(s) : nil
-        #else
-        let qView = query.utf8
-        let cView = candidate.utf8
-        let qCount = qView.count
-        let cCount = cView.count
-
-        if qCount > cCount { return nil }
-
-        // Fast path: Exact match
-        if qCount == cCount {
-            var equal = true
-            var qIt = qView.makeIterator()
-            var cIt = cView.makeIterator()
-            while let qb = qIt.next(), let cb = cIt.next() {
-                if toLowerAscii(qb) != toLowerAscii(cb) {
-                    equal = false
-                    break
-                }
-            }
-            if equal { return 10_000 }
-        }
-
-        // Fast path: Prefix match
-        var isPrefix = true
-        var qIt = qView.makeIterator()
-        var cIt = cView.makeIterator()
-        while let qb = qIt.next(), let cb = cIt.next() {
-            if toLowerAscii(qb) != toLowerAscii(cb) {
-                isPrefix = false
-                break
-            }
-        }
-        if isPrefix {
-            return 5_000 - (cCount - qCount)
-        }
-
-        // Subsequence matching with word boundary and consecutive character bonuses
-        var qi = qView.startIndex
-        var ci = cView.startIndex
-        let qEnd = qView.endIndex
-        let cEnd = cView.endIndex
-
-        var score = 0
-        var consecutive = 0
-        var prevMatched = false
-        var prevChar: UInt8 = 0
-
-        while qi < qEnd && ci < cEnd {
-            let qb = toLowerAscii(qView[qi])
-            let cb = toLowerAscii(cView[ci])
-
-            if qb == cb {
-                score += 10
-                if prevMatched {
-                    consecutive += 1
-                    score += consecutive * 15
-                } else {
-                    consecutive = 0
-                }
-
-                if ci == cView.startIndex {
-                    score += 25
-                } else if prevChar == 45 || prevChar == 95 || prevChar == 32 || prevChar == 47 || prevChar == 46 {
-                    score += 20
-                }
-
-                prevMatched = true
-                qi = qView.index(after: qi)
-            } else {
-                prevMatched = false
-            }
-
-            prevChar = cView[ci]
-            ci = cView.index(after: ci)
-        }
-
-        return qi == qEnd ? score : nil
-        #endif
     }
 
     // MARK: - Fast Byte-Stream ANSI Escape Stripper
@@ -379,42 +311,16 @@ public enum UpkeepEngine {
         // Fast path: zero allocations and zero FFI overhead when no ESC (0x1B) byte is present.
         guard input.utf8.contains(0x1B) else { return input }
 
-        #if USE_RUST_UPKEEP_CORE
         return input.withCString { cstr in
             guard let out = upkeep_strip_ansi(cstr) else { return input }
             defer { upkeep_string_free(out) }
             return String(cString: out)
         }
-        #else
-        var result = [UInt8]()
-        result.reserveCapacity(input.utf8.count)
-
-        var iterator = input.utf8.makeIterator()
-        while let byte = iterator.next() {
-            if byte == 0x1B { // ESC
-                guard let next = iterator.next() else { break }
-                if next == 0x5B { // '[' (CSI)
-                    while let c = iterator.next() {
-                        if (0x40...0x7E).contains(c) { break }
-                    }
-                } else if next == 0x5D { // ']' (OSC)
-                    while let c = iterator.next() {
-                        if c == 0x07 || c == 0x1B { break }
-                    }
-                }
-            } else {
-                result.append(byte)
-            }
-        }
-
-        return String(decoding: result, as: UTF8.self)
-        #endif
     }
 
     // MARK: - Mole Clean Parser (Dual Delimiters: '·' and '|')
 
     public static func parseMoleCleanOutput(_ raw: String, isDryRun: Bool) -> MoleCleanSummary {
-        #if USE_RUST_UPKEEP_CORE
         struct WireSummary: Decodable {
             let total_reclaimed: String
             let item_count: Int
@@ -434,7 +340,6 @@ public enum UpkeepEngine {
                 isDryRun: decoded.is_dry_run
             )
         }
-        #endif
 
         let cleaned = stripANSI(raw)
         var lines: [String] = []
@@ -493,165 +398,69 @@ public enum UpkeepEngine {
     /// Phase 1 instant app discovery (<15ms): reads app names, paths, and Info.plist bundle IDs
     /// without blocking on recursive directory size walks.
     public static func scanInstalledApplicationsMetadata() async -> [MoleInstalledApp] {
-        #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
-            var capacity = 256
-            var records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
-            var count = records.withUnsafeMutableBufferPointer { buf in
-                upkeep_scan_applications_metadata(buf.baseAddress, UInt32(buf.count))
+            struct AppMetadata: Decodable {
+                let name: String
+                let bundle_id: String
+                let path: String
             }
-            if Int(count) == capacity {
-                capacity = 1024
-                records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
-                count = records.withUnsafeMutableBufferPointer { buf in
-                    upkeep_scan_applications_metadata(buf.baseAddress, UInt32(buf.count))
-                }
-            }
-            var apps: [MoleInstalledApp] = []
-            apps.reserveCapacity(Int(count))
-            for i in 0..<Int(count) {
-                var rec = records[i]
-                let name = withUnsafePointer(to: &rec.name.0) { String(cString: $0) }
-                let bundleIdStr = withUnsafePointer(to: &rec.bundle_id.0) { String(cString: $0) }
-                let path = withUnsafePointer(to: &rec.path.0) { String(cString: $0) }
-                apps.append(MoleInstalledApp(
-                    name: name,
-                    bundleId: bundleIdStr.isEmpty ? nil : bundleIdStr,
-                    source: "Applications",
-                    uninstallName: name,
-                    path: path,
-                    size: nil
-                ))
-            }
-            return apps
-        }.value
-        #else
-        return await Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
-            let dirs = ["/Applications", (NSHomeDirectory() as NSString).appendingPathComponent("Applications")]
-            var apps: [MoleInstalledApp] = []
 
-            for dir in dirs {
-                guard let items = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-                for item in items where item.hasSuffix(".app") {
-                    let fullPath = (dir as NSString).appendingPathComponent(item)
-                    let name = (item as NSString).deletingPathExtension
-                    let bundleId = Bundle(path: fullPath)?.bundleIdentifier
-                    apps.append(MoleInstalledApp(
-                        name: name,
-                        bundleId: bundleId,
-                        source: "Applications",
-                        uninstallName: name,
-                        path: fullPath,
-                        size: nil
-                    ))
-                }
+            guard let raw = upkeep_scan_applications_metadata_json() else { return [] }
+            defer { upkeep_string_free(raw) }
+            return (decodeRustJSON([AppMetadata].self, from: raw) ?? []).map { app in
+                MoleInstalledApp(
+                    name: app.name,
+                    bundleId: app.bundle_id.isEmpty ? nil : app.bundle_id,
+                    source: "Applications",
+                    uninstallName: app.name,
+                    path: app.path,
+                    size: nil
+                )
             }
-            return apps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         }.value
-        #endif
     }
 
     /// Full parallel scanner of /Applications and ~/Applications with APFS-accurate bundle sizes.
     public static func scanInstalledApplications() async -> [MoleInstalledApp] {
-        #if USE_RUST_UPKEEP_CORE
-        return await Task.detached(priority: .userInitiated) {
-            var capacity = 256
-            var records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
-            var count = records.withUnsafeMutableBufferPointer { buf in
-                upkeep_scan_applications(buf.baseAddress, UInt32(buf.count))
-            }
-            if Int(count) == capacity {
-                capacity = 1024
-                records = [UpkeepAppRecord](repeating: UpkeepAppRecord(), count: capacity)
-                count = records.withUnsafeMutableBufferPointer { buf in
-                    upkeep_scan_applications(buf.baseAddress, UInt32(buf.count))
-                }
-            }
-            var apps: [MoleInstalledApp] = []
-            apps.reserveCapacity(Int(count))
-            for i in 0..<Int(count) {
-                var rec = records[i]
-                let name = withUnsafePointer(to: &rec.name.0) { String(cString: $0) }
-                let bundleIdStr = withUnsafePointer(to: &rec.bundle_id.0) { String(cString: $0) }
-                let path = withUnsafePointer(to: &rec.path.0) { String(cString: $0) }
-                apps.append(MoleInstalledApp(
-                    name: name,
-                    bundleId: bundleIdStr.isEmpty ? nil : bundleIdStr,
-                    source: "Applications",
-                    uninstallName: name,
-                    path: path,
-                    size: Int64(rec.app_size_bytes)
-                ))
-            }
-            return apps
-        }.value
-        #else
-        let metadataApps = await scanInstalledApplicationsMetadata()
-        return await withTaskGroup(of: MoleInstalledApp.self) { group in
-            for app in metadataApps {
-                group.addTask {
-                    let size = calculatePathSize(atPath: app.path)
-                    return MoleInstalledApp(
-                        name: app.name,
-                        bundleId: app.bundleId,
-                        source: app.source,
-                        uninstallName: app.uninstallName,
-                        path: app.path,
-                        size: size
-                    )
-                }
-            }
+        await sizeInstalledApplications(scanInstalledApplicationsMetadata())
+    }
 
-            var results: [MoleInstalledApp] = []
-            results.reserveCapacity(metadataApps.count)
-            for await app in group {
-                results.append(app)
-            }
-            return results.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    static func sizeInstalledApplications(_ apps: [MoleInstalledApp]) async -> [MoleInstalledApp] {
+        let paths = apps.map(\.path)
+        let sizes = await calculatePathSizes(paths)
+        return zip(apps, sizes).map { app, size in
+            MoleInstalledApp(
+                name: app.name,
+                bundleId: app.bundleId,
+                source: app.source,
+                uninstallName: app.uninstallName,
+                path: app.path,
+                size: size
+            )
         }
-        #endif
+    }
+
+    private static func calculatePathSizes(_ paths: [String]) async -> [Int64] {
+        guard !paths.isEmpty else { return [] }
+        return await Task.detached(priority: .userInitiated) {
+            let allocated = paths.map { strdup($0) }
+            defer { for pointer in allocated { free(pointer) } }
+            if allocated.allSatisfy({ $0 != nil }) {
+                let input = allocated.map { $0.map { UnsafePointer($0) } }
+                var output = [UInt64](repeating: 0, count: input.count)
+                if upkeep_calculate_path_sizes(input, &output, input.count) {
+                    return output.map { Int64(clamping: $0) }
+                }
+            }
+            return paths.map { calculatePathSize(atPath: $0) }
+        }.value
     }
 
     /// Computes accurate physical disk usage for a single file or directory path.
     public static func calculatePathSize(atPath path: String) -> Int64 {
-        #if USE_RUST_UPKEEP_CORE
         return path.withCString { cstr in
             Int64(upkeep_calculate_path_size(cstr))
         }
-        #else
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: path, isDirectory: &isDir) else { return 0 }
-        let url = URL(fileURLWithPath: path)
-        if !isDir.boolValue {
-            let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .fileSizeKey])
-            return Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? values?.fileSize ?? 0)
-        }
-        let keys: [URLResourceKey] = [
-            .isRegularFileKey,
-            .isSymbolicLinkKey,
-            .totalFileAllocatedSizeKey,
-            .fileAllocatedSizeKey,
-            .fileSizeKey
-        ]
-        guard let enumerator = fm.enumerator(
-            at: url,
-            includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
-        ) else { return 0 }
-
-        var total: Int64 = 0
-        let keySet = Set(keys)
-        for case let fileURL as URL in enumerator {
-            guard let values = try? fileURL.resourceValues(forKeys: keySet),
-                  values.isSymbolicLink != true,
-                  values.isRegularFile == true else { continue }
-            let bytes = values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? values.fileSize ?? 0
-            total += Int64(bytes)
-        }
-        return total
-        #endif
     }
 
     /// Parallel Rust Uninstaller inspector (Mole-parity leftovers + APFS sizes + Caskroom match).
@@ -659,7 +468,6 @@ public enum UpkeepEngine {
         app: MoleInstalledApp,
         brewPrefix: String = "/opt/homebrew"
     ) async -> UninstallInspection? {
-        #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
             struct WireLeftover: Decodable {
                 let path: String
@@ -710,14 +518,10 @@ public enum UpkeepEngine {
                 officialUninstallerVendor: decoded.official_uninstaller_vendor
             )
         }.value
-        #else
-        return nil
-        #endif
     }
 
     /// Comprehensive native macOS Cleaner dry-run scanner (~50-150ms via Rust getattrlistbulk + Rayon).
     public static func scanCleanerNative() async -> CleanerScanResult {
-        #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
             struct WireCleanerItem: Decodable {
                 let id: String
@@ -778,42 +582,10 @@ public enum UpkeepEngine {
                 categories: categories
             )
         }.value
-        #else
-        return await Task.detached(priority: .userInitiated) {
-            let started = Date()
-            let fm = FileManager.default
-            let home = fm.homeDirectoryForCurrentUser.path
-            var items: [CleanerItem] = []
-            let cachesDir = (home as NSString).appendingPathComponent("Library/Caches")
-            if let entries = try? fm.contentsOfDirectory(atPath: cachesDir) {
-                for name in entries where !name.hasPrefix(".") && !name.hasPrefix("com.apple.") && name != "CloudKit" && name != "com.local.Upkeep" {
-                    let full = (cachesDir as NSString).appendingPathComponent(name)
-                    let size = calculatePathSize(atPath: full)
-                    guard size >= 4096 else { continue }
-                    items.append(CleanerItem(
-                        id: full,
-                        category: "User App Caches",
-                        name: name,
-                        path: full,
-                        displayPath: "~/Library/Caches/\(name)",
-                        sizeBytes: size,
-                        defaultSelected: true,
-                        holdbackReason: nil
-                    ))
-                }
-            }
-            items.sort { $0.sizeBytes > $1.sizeBytes }
-            let total = items.reduce(0) { $0 + $1.sizeBytes }
-            let cats = items.isEmpty ? [] : [CleanerCategory(id: "user_app_caches", title: "User App Caches", totalBytes: total, items: items)]
-            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-            return CleanerScanResult(totalBytes: total, selectedBytes: total, itemCount: items.count, scanDurationMs: elapsed, categories: cats)
-        }.value
-        #endif
     }
 
     /// Safe parallel native Rust Cleaner executor with strict allowlist & symlink guards.
     public static func cleanPathsNative(_ paths: [String], dryRun: Bool = false) async -> CleanExecutionResult {
-        #if USE_RUST_UPKEEP_CORE
         return await Task.detached(priority: .userInitiated) {
             struct WireFailedItem: Decodable {
                 let path: String
@@ -848,39 +620,5 @@ public enum UpkeepEngine {
                 dryRun: payload.dry_run
             )
         }.value
-        #else
-        return await Task.detached(priority: .userInitiated) {
-            let started = Date()
-            let fm = FileManager.default
-            let home = fm.homeDirectoryForCurrentUser.path
-            let tmp = NSTemporaryDirectory()
-            var reclaimed: Int64 = 0
-            var removed = 0
-            var failed: [CleanFailedItem] = []
-            for path in Set(paths) {
-                guard path.hasPrefix(home + "/") || path.hasPrefix(tmp),
-                      !path.contains("/.."),
-                      !path.hasSuffix("/com.local.Upkeep") else {
-                    failed.append(CleanFailedItem(path: path, error: "Path is protected"))
-                    continue
-                }
-                let size = calculatePathSize(atPath: path)
-                if dryRun {
-                    reclaimed += size
-                    removed += 1
-                    continue
-                }
-                do {
-                    try fm.removeItem(atPath: path)
-                    reclaimed += size
-                    removed += 1
-                } catch {
-                    failed.append(CleanFailedItem(path: path, error: error.localizedDescription))
-                }
-            }
-            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-            return CleanExecutionResult(reclaimedBytes: reclaimed, removedCount: removed, failedItems: failed, durationMs: elapsed, dryRun: dryRun)
-        }.value
-        #endif
     }
 }

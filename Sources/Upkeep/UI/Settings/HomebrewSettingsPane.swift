@@ -606,11 +606,11 @@ struct HomebrewSettingsPane: View {
         Task {
             do {
                 if pkg.isInstalled && pkg.isOutdated {
-                    _ = try await BrewService.shared.upgrade(name: pkg.commandName, isCask: pkg.isCask)
+                    _ = try await BrewService.shared.upgrade(name: pkg.commandName, isCask: pkg.isCask, retainOutput: false)
                 } else if pkg.isInstalled {
-                    _ = try await BrewService.shared.uninstall(name: pkg.commandName, isCask: pkg.isCask)
+                    _ = try await BrewService.shared.uninstall(name: pkg.commandName, isCask: pkg.isCask, retainOutput: false)
                 } else {
-                    _ = try await BrewService.shared.install(name: pkg.commandName, isCask: pkg.isCask)
+                    _ = try await BrewService.shared.install(name: pkg.commandName, isCask: pkg.isCask, retainOutput: false)
                 }
             } catch {
                 vm.brewErrorText = error.localizedDescription

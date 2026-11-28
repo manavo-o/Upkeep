@@ -53,22 +53,24 @@ public struct MenuBarHeaderView: View {
             // Active Caffeinate indicator pill badge (quiet by default, tinted only when active)
             if keepAwake.isActive {
                 let scopeTag = keepAwake.mode == .displayAndSystem ? "Display" : "System"
-                HStack(spacing: 4) {
-                    Image(systemName: "cup.and.saucer.fill")
-                        .font(.system(size: 9.5, weight: .semibold))
-                    Text("\(scopeTag) · \(keepAwake.formattedRemaining)")
-                        .font(MenuBarTheme.Typography.timerBadge)
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    HStack(spacing: 4) {
+                        Image(systemName: "cup.and.saucer.fill")
+                            .font(.system(size: 9.5, weight: .semibold))
+                        Text("\(scopeTag) · \(keepAwake.formattedRemaining)")
+                            .font(MenuBarTheme.Typography.timerBadge)
+                    }
+                    .foregroundStyle(MenuBarTheme.Colors.caffeinate)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(MenuBarTheme.Colors.caffeinate.opacity(0.16), in: Capsule())
+                    .overlay {
+                        Capsule()
+                            .strokeBorder(MenuBarTheme.Colors.caffeinate.opacity(0.32), lineWidth: 0.75)
+                    }
+                    .transition(.scale(scale: 0.85).combined(with: .opacity))
+                    .accessibilityLabel("Caffeinate active: \(scopeTag) mode, \(keepAwake.formattedRemaining) remaining")
                 }
-                .foregroundStyle(MenuBarTheme.Colors.caffeinate)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(MenuBarTheme.Colors.caffeinate.opacity(0.16), in: Capsule())
-                .overlay {
-                    Capsule()
-                        .strokeBorder(MenuBarTheme.Colors.caffeinate.opacity(0.32), lineWidth: 0.75)
-                }
-                .transition(.scale(scale: 0.85).combined(with: .opacity))
-                .accessibilityLabel("Caffeinate active: \(scopeTag) mode, \(keepAwake.formattedRemaining) remaining")
             }
 
             // Liquid Glass Updates / Settings Toggle Button
@@ -221,9 +223,11 @@ public struct MenuBarControlsTab: View {
                         .font(MenuBarTheme.Typography.cardTitle)
                         .foregroundStyle(.primary)
 
-                    Text(keepAwake.isActive ? "Keeping Mac awake · \(keepAwake.formattedRemaining)" : "Prevent display & system sleep")
-                        .font(MenuBarTheme.Typography.cardSubtitle)
-                        .foregroundStyle(keepAwake.isActive ? MenuBarTheme.Colors.caffeinate : .secondary)
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        Text(keepAwake.isActive ? "Keeping Mac awake · \(keepAwake.formattedRemaining)" : "Prevent display & system sleep")
+                            .font(MenuBarTheme.Typography.cardSubtitle)
+                            .foregroundStyle(keepAwake.isActive ? MenuBarTheme.Colors.caffeinate : .secondary)
+                    }
                 }
 
                 Spacer(minLength: 8)

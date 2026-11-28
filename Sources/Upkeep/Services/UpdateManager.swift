@@ -236,7 +236,7 @@ public final class UpdateManager {
         defer { isUpdatingHomebrew = false }
 
         do {
-            _ = try await BrewService.shared.updateBrew()
+            _ = try await BrewService.shared.updateBrew(retainOutput: false)
             homebrewUpdateMessage = "Homebrew package catalog refreshed."
         } catch {
             homebrewUpdateMessage = error.localizedDescription

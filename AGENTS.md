@@ -17,7 +17,7 @@ Instructions and operational gotchas for AI agents working on **Upkeep** (`com.l
 
 ## Architecture & UI Conventions
 
-- **Stack:** Swift 6 strict concurrency, SwiftUI + AppKit (`NavigationSplitView`, `NSPanel`, `NSGlassEffectView`), plus optional Rust C-ABI library in `rust/upkeep_core` (auto-built by `Scripts/build-app.sh` when `cargo` is installed).
+- **Stack:** Swift 6 strict concurrency, SwiftUI + AppKit (`NavigationSplitView`, `NSPanel`, `NSGlassEffectView`), plus the required Rust C ABI library in `rust/upkeep_core` (built by `Scripts/build-app.sh`).
 - **macOS 27 Native UI System:**
   - Shared primitives live in `Sources/Upkeep/UI/UpkeepSettingsComponents.swift` (`.upkeepPrimary` / `.upkeepSecondary` glass button styles, `UpkeepSettingsFormView`, `UpkeepSettingsSection`, `UpkeepSettingsIcon`, `UpkeepSettingsCallout`, `UpkeepStatusRow`, `UpkeepResetButton`, `UpkeepKeycapGroup`, `.upkeepAnnotation(...)`, `.upkeepSoftTopScrollEdge()`).
   - Sidebar search (`⌘F`) and scroll-to-highlight targets live in `Sources/Upkeep/UI/UpkeepSettingsSearch.swift` (`.upkeepSearchTarget(...)`).

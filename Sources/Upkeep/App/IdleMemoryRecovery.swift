@@ -12,10 +12,12 @@ public final class IdleMemoryRecovery: NSObject {
 
     private static let handoffKey = "UPKEEP_MEMORY_HANDOFF"
     private static let idleBudget: UInt64 = 24 * 1024 * 1024
+    nonisolated static let workDidBecomeIdle = Notification.Name("UpkeepWorkDidBecomeIdle")
 
     @ObservationIgnored private var enabled = false
     @ObservationIgnored private var trackingMenus = 0
     @ObservationIgnored private var recoveryTask: Task<Void, Never>?
+    @ObservationIgnored private var idleObservation: UUID?
     @ObservationIgnored private var replacement: Process?
     @ObservationIgnored private var handoffDirectory: URL?
     @ObservationIgnored private var restoredSession: Session?
@@ -110,6 +112,10 @@ public final class IdleMemoryRecovery: NSObject {
         center.addObserver(self, selector: #selector(menuBegan), name: NSMenu.didBeginTrackingNotification, object: nil)
         center.addObserver(self, selector: #selector(menuEnded), name: NSMenu.didEndTrackingNotification, object: nil)
         center.addObserver(self, selector: #selector(applicationWillTerminate), name: NSApplication.willTerminateNotification, object: nil)
+        center.addObserver(self, selector: #selector(windowDidClose), name: NSWindow.willCloseNotification, object: nil)
+        center.addObserver(forName: Self.workDidBecomeIdle, object: nil, queue: nil) { [weak self] _ in
+            Task { @MainActor in self?.idleEnvironmentChanged() }
+        }
     }
 
     /// Called by the app entry point, including in the replacement process.
@@ -166,28 +172,57 @@ public final class IdleMemoryRecovery: NSObject {
 
     public func schedule() {
         guard enabled else { return }
-        diagnostic("scheduled")
         cancel()
+        startGracePeriod()
+    }
+
+    private func startGracePeriod() {
         recoveryTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(8))
             guard !Task.isCancelled, let self else { return }
-            while true {
-                let catalogBusy = await BrewService.shared.hasPendingCatalogWork
-                guard !Task.isCancelled else { return }
-                #if DEBUG
-                self.diagnostic("eligible=\(self.canRecover) catalog=\(catalogBusy) open=\(HUDCoordinator.shared.hasOpenUserWindows) windows=\(NSApp.windows.filter { $0.isVisible && $0.canBecomeKey }.map { $0.className }) menus=\(self.trackingMenus) cli=\(CLIExecutor.hasRunningCommands) footprint=\(Self.footprint)")
-                #endif
-                if self.canRecover && !catalogBusy { break }
-                try? await Task.sleep(for: .seconds(2))
-                guard !Task.isCancelled else { return }
+            guard self.canRecover else {
+                self.recoveryTask = nil
+                self.retryWhenIdle(startWaiting: true)
+                return
             }
-            guard Self.footprint > Self.idleBudget else { return }
+            guard Self.footprint > Self.idleBudget else {
+                self.recoveryTask = nil
+                return
+            }
             HUDCoordinator.shared.trayViewModel.releaseTransientCaches()
-            await self.replaceProcess()
+            let interrupted = await self.replaceProcess()
+            guard !Task.isCancelled else { return }
+            self.recoveryTask = nil
+            if interrupted { self.retryWhenIdle(startWaiting: true) }
         }
     }
 
+    private func retryWhenIdle(startWaiting: Bool = false) {
+        guard startWaiting || idleObservation != nil else { return }
+        let observation = UUID()
+        idleObservation = observation
+        let ready = withObservationTracking {
+            canRecover
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self, self.idleObservation == observation else { return }
+                self.retryWhenIdle()
+            }
+        }
+        if ready {
+            idleObservation = nil
+            startGracePeriod()
+        }
+    }
+
+    private func idleEnvironmentChanged() {
+        guard idleObservation != nil, canRecover else { return }
+        idleObservation = nil
+        startGracePeriod()
+    }
+
     public func cancel() {
+        idleObservation = nil
         recoveryTask?.cancel()
         recoveryTask = nil
         if let replacement, replacement.isRunning { replacement.terminate() }
@@ -199,25 +234,26 @@ public final class IdleMemoryRecovery: NSObject {
     private var canRecover: Bool {
         let vm = HUDCoordinator.shared.trayViewModel
         let updater = UpdateManager.shared
-        let hasWindow = NSApp.windows.contains { $0.isVisible && $0.canBecomeKey }
-        return !hasWindow && !HUDCoordinator.shared.hasOpenUserWindows
-            && trackingMenus == 0 && NSApp.modalWindow == nil
-            && !CleaningModeManager.shared.isLocked
+        return !CleaningModeManager.shared.isLocked
             && !KeepAwakeManager.shared.closedLid.isEngaged
-            && !CLIExecutor.hasRunningCommands && vm.pendingUninstallApp == nil
+            && vm.pendingUninstallApp == nil
             && !BrewLogStore.shared.isRunning && !HUDCoordinator.shared.homebrewModel.isOperating
             && !vm.isRefreshingBrew && !vm.isHomebrewBusy
             && !vm.isScanningClean && !vm.isCleaning && !vm.isLoadingApps && !vm.isUpdatingAppSizes
             && !vm.isInspectingUninstall && !vm.isUninstallingApp
             && !updater.isChecking && !updater.isInstalling && !updater.isUpdatingHomebrew
+            && !CLIExecutor.hasRunningCommands && !BrewService.shared.hasPendingCatalogWork
+            && trackingMenus == 0 && NSApp.modalWindow == nil && !HUDCoordinator.shared.hasOpenUserWindows
+            && !NSApp.windows.contains { $0.isVisible && $0.canBecomeKey }
     }
 
-    private func replaceProcess() async {
-        guard let executable = Bundle.main.executableURL else { return }
+    private func replaceProcess() async -> Bool {
+        guard let executable = Bundle.main.executableURL else { return false }
         let token = UUID()
         let directory = Self.directory(for: token)
         let process = Process()
         var committed = false
+        var interrupted = false
         defer {
             if replacement === process { replacement = nil }
             if handoffDirectory == directory { handoffDirectory = nil }
@@ -237,7 +273,11 @@ public final class IdleMemoryRecovery: NSObject {
             let ready = directory.appendingPathComponent("ready")
             for _ in 0..<50 {
                 try await Task.sleep(for: .milliseconds(100))
-                guard process.isRunning, canRecover, session.powerStateStillMatches else { break }
+                guard process.isRunning else { break }
+                guard canRecover, session.powerStateStillMatches else {
+                    interrupted = true
+                    break
+                }
                 if FileManager.default.fileExists(atPath: ready.path) {
                     // The replacement has restored the session and acquired its power assertion.
                     try Data().write(to: directory.appendingPathComponent("commit"), options: .atomic)
@@ -245,7 +285,7 @@ public final class IdleMemoryRecovery: NSObject {
                     replacement = nil
                     handoffDirectory = nil
                     NSApp.terminate(nil)
-                    return
+                    return false
                 }
             }
         } catch {
@@ -253,6 +293,7 @@ public final class IdleMemoryRecovery: NSObject {
             // Keep the original process and its services if startup or handoff fails.
         }
         if process.isRunning { process.terminate() }
+        return interrupted
     }
 
     private static func directory(for token: UUID) -> URL {
@@ -288,4 +329,7 @@ public final class IdleMemoryRecovery: NSObject {
         if trackingMenus == 0 && !HUDCoordinator.shared.hasOpenUserWindows { schedule() }
     }
     @objc private func applicationWillTerminate() { cancel() }
+    @objc private func windowDidClose() {
+        Task { @MainActor in idleEnvironmentChanged() }
+    }
 }

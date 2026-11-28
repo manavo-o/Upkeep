@@ -177,13 +177,13 @@ public final class HomebrewHUDModel {
         guard !isOperating else { return }
         if item.isInstalled && item.isOutdated {
             runAsync(packageID: item.id, label: "Upgrading \(item.name)…", success: "Upgraded \(item.name)") {
-                _ = try await BrewService.shared.upgrade(name: item.commandName, isCask: item.isCask)
+                _ = try await BrewService.shared.upgrade(name: item.commandName, isCask: item.isCask, retainOutput: false)
             }
         } else if item.isInstalled {
             uninstall(item)
         } else {
             runAsync(packageID: item.id, label: "Installing \(item.name)…", success: "Installed \(item.name)") {
-                _ = try await BrewService.shared.install(name: item.commandName, isCask: item.isCask)
+                _ = try await BrewService.shared.install(name: item.commandName, isCask: item.isCask, retainOutput: false)
             }
         }
     }
@@ -191,7 +191,7 @@ public final class HomebrewHUDModel {
     public func uninstall(_ item: BrewPackageItem) {
         guard !isOperating else { return }
         runAsync(packageID: item.id, label: "Uninstalling \(item.name)…", success: "Uninstalled \(item.name)") {
-            _ = try await BrewService.shared.uninstall(name: item.commandName, isCask: item.isCask)
+            _ = try await BrewService.shared.uninstall(name: item.commandName, isCask: item.isCask, retainOutput: false)
         }
     }
 
@@ -200,11 +200,11 @@ public final class HomebrewHUDModel {
         guard !item.isCask else { return }
         if item.isPinned {
             runAsync(packageID: item.id, label: "Unpinning \(item.name)…", success: "Unpinned \(item.name)") {
-                _ = try await BrewService.shared.unpin(name: item.commandName)
+                _ = try await BrewService.shared.unpin(name: item.commandName, retainOutput: false)
             }
         } else {
             runAsync(packageID: item.id, label: "Pinning \(item.name)…", success: "Pinned \(item.name)") {
-                _ = try await BrewService.shared.pin(name: item.commandName)
+                _ = try await BrewService.shared.pin(name: item.commandName, retainOutput: false)
             }
         }
     }

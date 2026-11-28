@@ -4,28 +4,9 @@ import PackageDescription
 
 let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let rustLibDir = packageDir.appendingPathComponent("Frameworks/lib").path
-let rustLibPath = packageDir.appendingPathComponent("Frameworks/lib/libupkeep_core.a").path
-let hasRustCore = FileManager.default.fileExists(atPath: rustLibPath)
-
-var coreDependencies: [Target.Dependency] = []
-var coreSwiftSettings: [SwiftSetting] = []
-var coreLinkerSettings: [LinkerSetting] = [
-    .linkedFramework("IOKit"),
-    .linkedFramework("ApplicationServices"),
-    .linkedFramework("Carbon")
-]
-var extraTargets: [Target] = []
-
-if hasRustCore {
-    extraTargets.append(
-        .systemLibrary(
-            name: "CUpkeepCore",
-            path: "Frameworks/include"
-        )
-    )
-    coreDependencies.append("CUpkeepCore")
-    coreSwiftSettings.append(.define("USE_RUST_UPKEEP_CORE"))
-    coreLinkerSettings.append(.unsafeFlags(["-L\(rustLibDir)", "-lupkeep_core"]))
+if !FileManager.default.fileExists(atPath: "\(rustLibDir)/libupkeep_core.a") {
+    FileHandle.standardError.write(Data("Upkeep requires its Rust core. Run ./Scripts/build-rust-cabi.sh before building with SwiftPM.\n".utf8))
+    exit(EXIT_FAILURE)
 }
 
 let package = Package(
@@ -37,13 +18,18 @@ let package = Package(
         .executable(name: "Upkeep", targets: ["Upkeep"]),
         .executable(name: "UpkeepSelfTest", targets: ["UpkeepSelfTest"])
     ],
-    targets: extraTargets + [
+    targets: [
+        .systemLibrary(name: "CUpkeepCore", path: "Frameworks/include"),
         .target(
             name: "UpkeepCore",
-            dependencies: coreDependencies,
+            dependencies: ["CUpkeepCore"],
             path: "Sources/Upkeep",
-            swiftSettings: coreSwiftSettings,
-            linkerSettings: coreLinkerSettings
+            linkerSettings: [
+                .linkedFramework("IOKit"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("Carbon"),
+                .unsafeFlags(["-L\(rustLibDir)", "-lupkeep_core"])
+            ]
         ),
         .executableTarget(
             name: "Upkeep",

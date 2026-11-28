@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Observation
+import Synchronization
 
 public struct BrewOperationLog: Codable, Sendable, Equatable {
     public let command: String
@@ -50,14 +51,10 @@ public final class BrewLogStore {
     }
 
     private var liveOutputBuffer: String = ""
-    private var pendingLiveLines: [String] = []
-    private var liveFlushTask: Task<Void, Never>?
+    nonisolated static let maxOutputBytes = 64 * 1024
 
     func beginLive(command: String, operationID: UUID) {
         liveOperationID = operationID
-        liveFlushTask?.cancel()
-        liveFlushTask = nil
-        pendingLiveLines.removeAll(keepingCapacity: true)
         liveOutputBuffer = ""
         self.isRunning = true
         self.activeCommand = command
@@ -71,46 +68,12 @@ public final class BrewLogStore {
         )
     }
 
-    func appendLiveLine(_ line: String, operationID: UUID) {
-        guard liveOperationID == operationID else { return }
-        let cleanedLine = CLIExecutor.stripANSI(line).trimmingCharacters(in: .whitespacesAndNewlines)
-        pendingLiveLines.append(cleanedLine.isEmpty ? line : cleanedLine)
-        if liveFlushTask == nil {
-            liveFlushTask = Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(40))
-                guard !Task.isCancelled, let self else { return }
-                self.flushPendingLiveLines()
-            }
-        }
-    }
-
-    private static let maxLiveBufferUTF8Bytes = 64 * 1024
-
-    private func flushPendingLiveLines() {
-        liveFlushTask = nil
-        guard !pendingLiveLines.isEmpty, let current = lastLog else { return }
-        if let latest = pendingLiveLines.last(where: { !$0.isEmpty }) {
-            self.liveStatusLine = latest
-        }
-        let batch = pendingLiveLines.joined(separator: "\n")
-        pendingLiveLines.removeAll(keepingCapacity: true)
-        if liveOutputBuffer.isEmpty {
-            liveOutputBuffer = batch
-        } else {
-            liveOutputBuffer.append("\n")
-            liveOutputBuffer.append(batch)
-        }
-        // Cap live buffer to the latest 64 KB so long upgrades never bloat RAM or SwiftUI diffs.
-        if liveOutputBuffer.utf8.count > Self.maxLiveBufferUTF8Bytes {
-            let dropCount = liveOutputBuffer.utf8.count - Self.maxLiveBufferUTF8Bytes
-            let cutIdx = liveOutputBuffer.utf8.index(liveOutputBuffer.utf8.startIndex, offsetBy: dropCount)
-            let trimmed = String(liveOutputBuffer[cutIdx...])
-            if let firstNL = trimmed.firstIndex(of: "\n") {
-                liveOutputBuffer = "… (earlier output truncated)\n" + String(trimmed[trimmed.index(after: firstNL)...])
-            } else {
-                liveOutputBuffer = trimmed
-            }
-        }
+    func appendLiveOutput(_ output: String, latestLine: String, operationID: UUID) {
+        guard liveOperationID == operationID, let current = lastLog else { return }
+        liveStatusLine = latestLine
+        if !liveOutputBuffer.isEmpty { liveOutputBuffer.append("\n") }
+        liveOutputBuffer.append(output)
+        liveOutputBuffer = CLIExecutor.boundedTail(liveOutputBuffer, maxBytes: Self.maxOutputBytes)
         self.lastLog = BrewOperationLog(
             command: current.command,
             output: liveOutputBuffer,
@@ -121,9 +84,6 @@ public final class BrewLogStore {
     }
 
     public func record(command: String, stdout: String, stderr: String, exitCode: Int32) {
-        liveFlushTask?.cancel()
-        liveFlushTask = nil
-        pendingLiveLines.removeAll()
         liveOutputBuffer = ""
         self.isRunning = false
         liveOperationID = nil
@@ -141,14 +101,7 @@ public final class BrewLogStore {
         } else {
             combined = cleanOut + "\n\n" + cleanErr
         }
-        let boundedOutput: String
-        if combined.utf8.count > Self.maxLiveBufferUTF8Bytes {
-            let dropCount = combined.utf8.count - Self.maxLiveBufferUTF8Bytes
-            let cutIdx = combined.utf8.index(combined.utf8.startIndex, offsetBy: dropCount)
-            boundedOutput = "… (earlier output truncated)\n" + String(combined[cutIdx...])
-        } else {
-            boundedOutput = combined
-        }
+        let boundedOutput = CLIExecutor.boundedTail(combined, maxBytes: Self.maxOutputBytes)
         let entry = BrewOperationLog(
             command: command,
             output: boundedOutput,
@@ -227,7 +180,7 @@ public struct BrewPackageItem: Identifiable, Sendable, Hashable {
     }
 }
 
-/// Fast fuzzy matcher delegating to UpkeepEngine (Rust nucleo when linked, zero-alloc Swift otherwise).
+/// Fuzzy matcher that delegates to Rust through UpkeepEngine.
 public enum SwiftFuzzyMatcher {
     public static func score(query: String, candidate: String) -> Int? {
         UpkeepEngine.scoreFuzzy(query: query, candidate: candidate)
@@ -240,19 +193,24 @@ public actor BrewService {
     private var catalogLookup: [String: BrewPackageItem] = [:]
     private var lastLoadedAt: Date?
     private var isRunningCommand = false
-    private var inFlightLoadTask: Task<[BrewPackageItem], Error>?
+    private var inFlightLoadTask: Task<[BrewPackageItem], Error>? {
+        didSet { updateCatalogActivity() }
+    }
     private var installedCatalogRevision = 0
 
     // Cached full Homebrew API catalog (~15k formulae + casks) for sub-ms remote search without spawning Ruby `brew search`
-    private var remoteCatalog: [BrewPackageItem] = []
     private var lastRemoteCatalogFetch: Date?
-    private var inFlightRemoteCatalogTask: Task<[BrewPackageItem], Never>?
+    private var inFlightRemoteCatalogTask: Task<Bool, Never>? {
+        didSet { updateCatalogActivity() }
+    }
+    private var catalogSearchCount = 0 {
+        didSet { updateCatalogActivity() }
+    }
+    private let catalogActivity = Mutex(false)
     private var remoteCatalogRevision = 0
     private var idleEvictionTask: Task<Void, Never>?
 
-    #if USE_RUST_UPKEEP_CORE
     private let rustRemoteIndex = UpkeepEngine.RustBrewIndex()
-    #endif
 
     private static let brewEnv: [String: String] = [
         "HOMEBREW_NO_AUTO_UPDATE": "1",
@@ -279,11 +237,9 @@ public actor BrewService {
 
     /// Fast direct filesystem scan of `/opt/homebrew/Cellar`, `Caskroom`, and `var/homebrew/pinned`.
     public static func scanInstalledDirectories(prefix: String = "/opt/homebrew") -> [BrewPackageItem] {
-        #if USE_RUST_UPKEEP_CORE
         if let rustItems = UpkeepEngine.scanBrewDirs(prefix: prefix) {
             return rustItems
         }
-        #endif
         let fm = FileManager.default
         let resolvedPrefix = fm.fileExists(atPath: prefix) ? prefix : "/usr/local"
         let pinnedDir = (resolvedPrefix as NSString).appendingPathComponent("var/homebrew/pinned")
@@ -487,21 +443,6 @@ public actor BrewService {
 
     // MARK: - Fast Disk-Cached Homebrew Public JSON API Index
 
-    private struct APIFormula: Decodable {
-        struct Versions: Decodable { let stable: String? }
-        let name: String
-        let desc: String?
-        let homepage: String?
-        let versions: Versions?
-    }
-
-    private struct APICask: Decodable {
-        let token: String
-        let desc: String?
-        let version: String?
-        let homepage: String?
-    }
-
     private static var catalogBinURL: URL {
         cacheDirURL.appendingPathComponent("catalog.bin")
     }
@@ -569,8 +510,20 @@ public actor BrewService {
     }
 
     /// Pre-warms the 15k-package Rust Homebrew index on demand.
-    var hasPendingCatalogWork: Bool {
-        inFlightLoadTask != nil || inFlightRemoteCatalogTask != nil
+    nonisolated var hasPendingCatalogWork: Bool {
+        catalogActivity.withLock { $0 }
+    }
+
+    private func updateCatalogActivity() {
+        let busy = inFlightLoadTask != nil || inFlightRemoteCatalogTask != nil || catalogSearchCount != 0
+        let becameIdle = catalogActivity.withLock {
+            let wasBusy = $0
+            $0 = busy
+            return wasBusy && !busy
+        }
+        if becameIdle {
+            NotificationCenter.default.post(name: IdleMemoryRecovery.workDidBecomeIdle, object: nil)
+        }
     }
 
     public func prewarmIfNeeded() async {
@@ -600,14 +553,11 @@ public actor BrewService {
     public func evictRemoteCatalogIfIdle() {
         idleEvictionTask?.cancel()
         idleEvictionTask = nil
-        guard inFlightRemoteCatalogTask == nil && inFlightLoadTask == nil else {
+        guard !hasPendingCatalogWork else {
             scheduleIdleEviction(afterSeconds: 5)
             return
         }
-        #if USE_RUST_UPKEEP_CORE
         rustRemoteIndex.clear()
-        #endif
-        remoteCatalog.removeAll()
         lastRemoteCatalogFetch = nil
         URLCache.shared.removeAllCachedResponses()
         malloc_zone_pressure_relief(nil, 0)
@@ -615,46 +565,27 @@ public actor BrewService {
 
     /// Returns true when the remote Homebrew catalog is already warm in memory (zero debounce needed).
     public func hasWarmRemoteIndex() -> Bool {
-        #if USE_RUST_UPKEEP_CORE
-        if rustRemoteIndex.count > 0 { return true }
-        #endif
-        return !remoteCatalog.isEmpty
+        rustRemoteIndex.count > 0
     }
 
     private func ensureRemoteCatalogLoaded() async -> Bool {
         guard !Task.isCancelled else { return false }
         cancelIdleEviction()
-        #if USE_RUST_UPKEEP_CORE
         if rustRemoteIndex.count > 0,
            let last = lastRemoteCatalogFetch,
            Date().timeIntervalSince(last) < 6 * 3600 {
             return true
         }
-        #else
-        if !remoteCatalog.isEmpty,
-           let last = lastRemoteCatalogFetch,
-           Date().timeIntervalSince(last) < 6 * 3600 {
-            return true
-        }
-        #endif
 
         let revision = remoteCatalogRevision
         if let inFlight = inFlightRemoteCatalogTask {
-            let items = await inFlight.value
-            guard revision == remoteCatalogRevision else { return false }
-            #if USE_RUST_UPKEEP_CORE
-            return rustRemoteIndex.count > 0 || !items.isEmpty
-            #else
-            return !items.isEmpty
-            #endif
+            let didLoad = await inFlight.value
+            return revision == remoteCatalogRevision && didLoad
         }
 
-        #if USE_RUST_UPKEEP_CORE
         let rustIndex = self.rustRemoteIndex
-        #endif
 
-        let task = Task<[BrewPackageItem], Never> {
-            #if USE_RUST_UPKEEP_CORE
+        let task = Task<Bool, Never> {
             let fm = FileManager.default
             let binURL = Self.catalogBinURL
             let hasBinCache = fm.fileExists(atPath: binURL.path)
@@ -664,10 +595,9 @@ public actor BrewService {
                let modDate = attrs[.modificationDate] as? Date,
                Date().timeIntervalSince(modDate) < 6 * 3600 {
                 if rustIndex.loadBinaryCache(path: binURL.path) > 0 {
-                    return []
+                    return true
                 }
             }
-            #endif
 
             async let formulaeFetch = Self.ensureCachedJSONFile(
                 urlString: "https://formulae.brew.sh/api/formula.json",
@@ -680,54 +610,21 @@ public actor BrewService {
 
             let (fRes, cRes) = await (formulaeFetch, casksFetch)
 
-            #if USE_RUST_UPKEEP_CORE
             // If both ETags returned 304 Not Modified and catalog.bin exists, load binary cache directly.
             if fRes.notModified && cRes.notModified && hasBinCache {
                 try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: binURL.path)
                 if rustIndex.loadBinaryCache(path: binURL.path) > 0 {
-                    return []
+                    return true
                 }
             }
             // Stream directly from disk into Rust's contiguous byte slab (avoids 30 MB Swift Data spike).
             let loadedCount = rustIndex.loadAPIFiles(formulaePath: fRes.url?.path, casksPath: cRes.url?.path)
             if loadedCount > 0 {
                 rustIndex.saveBinaryCache(path: binURL.path)
-                return []
-            }
-            #endif
-
-            let fData = fRes.url.flatMap { try? Data(contentsOf: $0) }
-            let cData = cRes.url.flatMap { try? Data(contentsOf: $0) }
-
-            var merged: [BrewPackageItem] = []
-            merged.reserveCapacity(16_000)
-            let decoder = JSONDecoder()
-
-            if let fData, let formulae = try? decoder.decode([APIFormula].self, from: fData) {
-                for f in formulae {
-                    merged.append(BrewPackageItem(
-                        name: f.name,
-                        description: f.desc ?? "",
-                        version: f.versions?.stable ?? "",
-                        isCask: false,
-                        homepage: f.homepage ?? ""
-                    ))
-                }
+                return true
             }
 
-            if let cData, let casks = try? decoder.decode([APICask].self, from: cData) {
-                for c in casks {
-                    merged.append(BrewPackageItem(
-                        name: c.token,
-                        description: c.desc ?? "",
-                        version: c.version ?? "",
-                        isCask: true,
-                        homepage: c.homepage ?? ""
-                    ))
-                }
-            }
-
-            return merged
+            return false
         }
 
         inFlightRemoteCatalogTask = task
@@ -735,48 +632,47 @@ public actor BrewService {
         guard revision == remoteCatalogRevision else { return false }
         inFlightRemoteCatalogTask = nil
 
-        #if USE_RUST_UPKEEP_CORE
-        if rustRemoteIndex.count > 0 {
-            lastRemoteCatalogFetch = Date()
-            return true
-        }
-        #endif
-
-        if !loaded.isEmpty {
-            remoteCatalog = loaded
-            lastRemoteCatalogFetch = Date()
-            return true
-        }
-        return false
+        if loaded { lastRemoteCatalogFetch = Date() }
+        return loaded
     }
 
     public func searchRemote(query: String, filterCasks: Bool? = nil) async throws -> [BrewPackageItem] {
         try Task.checkCancellation()
+        catalogSearchCount += 1
         defer {
-            if !Task.isCancelled { scheduleIdleEviction() }
+            catalogSearchCount -= 1
+            scheduleIdleEviction()
         }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return fuzzySearchLocal(query: "", filterCasks: filterCasks) }
 
-        async let remoteReady = ensureRemoteCatalogLoaded()
-        _ = try await loadInstalledAndOutdated()
-        let hasRemote = await remoteReady
-        try Task.checkCancellation()
-        if hasRemote {
-            #if USE_RUST_UPKEEP_CORE
-            let hits = rustRemoteIndex.searchJSON(query: trimmed, filterCasks: filterCasks, limit: 40)
-            #else
-            let hits = scorePool(remoteCatalog, query: trimmed, filterCasks: filterCasks, limit: 40)
-            #endif
-            if !hits.isEmpty { return hits.map(withInstalledState) }
+        while true {
+            let revision = remoteCatalogRevision
+            async let remoteReady = ensureRemoteCatalogLoaded()
+            _ = try await loadInstalledAndOutdated()
+            let hasRemote = await remoteReady
+            try Task.checkCancellation()
+            guard revision == remoteCatalogRevision else { continue }
+            if hasRemote {
+                let hits = try await rustRemoteIndex.searchCancellable(query: trimmed, filterCasks: filterCasks, limit: 40)
+                try Task.checkCancellation()
+                guard revision == remoteCatalogRevision else { continue }
+                if !hits.isEmpty { return hits.map(withInstalledState) }
+            }
+            let results = try await searchConfiguredTaps(query: trimmed, filterCasks: filterCasks)
+            try Task.checkCancellation()
+            if revision == remoteCatalogRevision { return results }
         }
+    }
 
+    private func searchConfiguredTaps(query trimmed: String, filterCasks: Bool?) async throws -> [BrewPackageItem] {
         // The description search also covers packages in locally configured taps.
         let result = try await CLIExecutor.run(
             binary: "brew",
             arguments: ["search", "--desc", "--", trimmed],
             environment: Self.brewEnv
         )
+        try Task.checkCancellation()
         if !result.succeeded {
             return fuzzySearchLocal(query: trimmed, filterCasks: filterCasks)
         }
@@ -825,14 +721,11 @@ public actor BrewService {
     }
 
     private func invalidateRemoteCatalog() async {
-        remoteCatalogRevision += 1
         _ = await inFlightRemoteCatalogTask?.value
+        remoteCatalogRevision += 1
         inFlightRemoteCatalogTask = nil
-        remoteCatalog.removeAll()
         lastRemoteCatalogFetch = nil
-        #if USE_RUST_UPKEEP_CORE
         rustRemoteIndex.clear()
-        #endif
         for file in ["formula.json", "cask.json", "catalog.bin"] {
             try? FileManager.default.setAttributes(
                 [.modificationDate: Date.distantPast],
@@ -893,7 +786,47 @@ public actor BrewService {
         var errorDescription: String? { "Wait for the current Homebrew command to finish." }
     }
 
-    private func runBrewStreaming(arguments: [String]) async throws -> CLIResult {
+    private final class LiveBrewOutput: Sendable {
+        private struct Pending {
+            var output = ""
+            var latestLine: String?
+        }
+
+        private let pending = Mutex(Pending())
+        private let operationID: UUID
+
+        init(operationID: UUID) {
+            self.operationID = operationID
+        }
+
+        func append(_ lines: [String]) {
+            guard let latestLine = lines.last else { return }
+            let batch = lines.joined(separator: "\n")
+            let shouldFlush = pending.withLock { state in
+                let needsFlush = state.latestLine == nil
+                if !state.output.isEmpty { state.output.append("\n") }
+                state.output.append(batch)
+                state.output = CLIExecutor.boundedTail(state.output, maxBytes: BrewLogStore.maxOutputBytes)
+                state.latestLine = latestLine
+                return needsFlush
+            }
+            if shouldFlush {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(40))
+                    let batch = pending.withLock { state in
+                        let batch = state
+                        state = Pending()
+                        return batch
+                    }
+                    if let latestLine = batch.latestLine {
+                        BrewLogStore.shared.appendLiveOutput(batch.output, latestLine: latestLine, operationID: operationID)
+                    }
+                }
+            }
+        }
+    }
+
+    private func runBrewStreaming(arguments: [String], retainOutput: Bool = true) async throws -> CLIResult {
         guard !isRunningCommand else { throw CommandInProgress() }
         isRunningCommand = true
         defer { isRunningCommand = false }
@@ -903,15 +836,15 @@ public actor BrewService {
         await BrewLogStore.shared.beginLive(command: command, operationID: operationID)
         let result: CLIResult
         do {
-            result = try await CLIExecutor.runStreaming(
+            let liveOutput = LiveBrewOutput(operationID: operationID)
+            result = try await CLIExecutor.runStreamingBatches(
                 binary: "brew",
                 arguments: arguments,
-                environment: Self.brewEnv
-            ) { line in
-                Task { @MainActor in
-                    BrewLogStore.shared.appendLiveLine(line, operationID: operationID)
-                }
-            }
+                environment: Self.brewEnv,
+                capture: retainOutput ? .full : .tail(maxBytes: BrewLogStore.maxOutputBytes),
+                liveLineLimit: BrewLogStore.maxOutputBytes,
+                onLines: liveOutput.append
+            )
         } catch {
             await BrewLogStore.shared.record(
                 command: command, stdout: "", stderr: error.localizedDescription, exitCode: 1
@@ -928,46 +861,46 @@ public actor BrewService {
         return result
     }
 
-    private func runPackageCommand(_ arguments: [String]) async throws -> String {
-        let result = try await runBrewStreaming(arguments: arguments)
+    private func runPackageCommand(_ arguments: [String], retainOutput: Bool) async throws -> String {
+        let result = try await runBrewStreaming(arguments: arguments, retainOutput: retainOutput)
         guard result.succeeded else {
             let command = "brew " + arguments.joined(separator: " ")
             let detail = result.stderr.isEmpty ? result.stdout : result.stderr
             throw CLIError.executionFailed(command: command, exitCode: result.exitCode, stderr: CLIExecutor.stripANSI(detail))
         }
-        return CLIExecutor.stripANSI(result.stdout)
+        return retainOutput ? CLIExecutor.stripANSI(result.stdout) : ""
     }
 
-    public func install(name: String, isCask: Bool) async throws -> String {
-        try await runPackageCommand(["install", isCask ? "--cask" : "--formula", name])
+    public func install(name: String, isCask: Bool, retainOutput: Bool = true) async throws -> String {
+        try await runPackageCommand(["install", isCask ? "--cask" : "--formula", name], retainOutput: retainOutput)
     }
 
-    public func uninstall(name: String, isCask: Bool, zap: Bool = false) async throws -> String {
+    public func uninstall(name: String, isCask: Bool, zap: Bool = false, retainOutput: Bool = true) async throws -> String {
         var args = ["uninstall", isCask ? "--cask" : "--formula"]
         if isCask && zap { args.append("--zap") }
         args.append(name)
-        return try await runPackageCommand(args)
+        return try await runPackageCommand(args, retainOutput: retainOutput)
     }
 
-    public func upgrade(name: String? = nil, isCask: Bool? = nil) async throws -> String {
+    public func upgrade(name: String? = nil, isCask: Bool? = nil, retainOutput: Bool = true) async throws -> String {
         var args = ["upgrade"]
         if let name {
             if let isCask { args.append(isCask ? "--cask" : "--formula") }
             args.append(name)
         }
-        return try await runPackageCommand(args)
+        return try await runPackageCommand(args, retainOutput: retainOutput)
     }
 
-    public func pin(name: String) async throws -> String {
-        try await runPackageCommand(["pin", name])
+    public func pin(name: String, retainOutput: Bool = true) async throws -> String {
+        try await runPackageCommand(["pin", name], retainOutput: retainOutput)
     }
 
-    public func unpin(name: String) async throws -> String {
-        try await runPackageCommand(["unpin", name])
+    public func unpin(name: String, retainOutput: Bool = true) async throws -> String {
+        try await runPackageCommand(["unpin", name], retainOutput: retainOutput)
     }
 
-    public func updateBrew() async throws -> String {
-        try await runPackageCommand(["update"])
+    public func updateBrew(retainOutput: Bool = true) async throws -> String {
+        try await runPackageCommand(["update"], retainOutput: retainOutput)
     }
 
     public func runDoctor() async throws -> String {

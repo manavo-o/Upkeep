@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EXECUTABLE_NAME="Upkeep"
 APP_NAME="Upkeep"
 BUNDLE_ID="com.local.Upkeep"
-APP_VERSION="${UPKEEP_VERSION:-1.6.1}"
+APP_VERSION="${UPKEEP_VERSION:-1.6.2}"
 BUILD_DIR="$ROOT_DIR/.build/release"
 APP_BUNDLE="$ROOT_DIR/dist/$APP_NAME.app"
 DEV_CERT_NAME="Upkeep Local Signing"
@@ -13,25 +13,14 @@ DEV_CERT_NAME="Upkeep Local Signing"
 echo "Building $APP_NAME (Swift 6 release)..."
 cd "$ROOT_DIR"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-REQUIRE_RUST=0
-if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" || "${UPKEEP_REQUIRE_RUST:-0}" == "1" ]]; then
-    REQUIRE_RUST=1
-fi
-
-if [[ "$REQUIRE_RUST" == "1" ]] && ! command -v cargo >/dev/null 2>&1; then
-    echo "ERROR: Rust (cargo) is required for CI/release builds." >&2
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "ERROR: Rust (cargo) is required to build Upkeep." >&2
     exit 1
 fi
 
-if command -v cargo >/dev/null 2>&1 && [[ -x "$ROOT_DIR/Scripts/build-rust-cabi.sh" ]]; then
-    echo "Building Rust upkeep_core static library..."
-    "$ROOT_DIR/Scripts/build-rust-cabi.sh"
-fi
+echo "Building Rust upkeep_core static library..."
+"$ROOT_DIR/Scripts/build-rust-cabi.sh"
 
-if [[ "$REQUIRE_RUST" == "1" && ! -f "$ROOT_DIR/Frameworks/lib/libupkeep_core.a" ]]; then
-    echo "ERROR: Expected Rust static library at $ROOT_DIR/Frameworks/lib/libupkeep_core.a" >&2
-    exit 1
-fi
 if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" && ! -f "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib" ]]; then
     export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
 fi
@@ -92,7 +81,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>CFBundleShortVersionString</key>
     <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>16</string>
+    <string>17</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSUIElement</key>

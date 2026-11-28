@@ -35,12 +35,7 @@ struct UpkeepSelfTest {
             return
         }
         print("=== Upkeep Self-Test Suite ===")
-        print("  Engine: \(UpkeepEngine.isUsingRustCore ? "Rust upkeep_core C-ABI" : "Swift fallback")")
-        let env = ProcessInfo.processInfo.environment
-        let requireRust = env["UPKEEP_REQUIRE_RUST"] == "1" || env["CI"] != nil || env["GITHUB_ACTIONS"] != nil
-        if requireRust {
-            check("Rust upkeep_core C-ABI is linked", UpkeepEngine.isUsingRustCore, UpkeepEngine.isUsingRustCore ? "enabled" : "Swift fallback active")
-        }
+        print("  Engine: Rust upkeep_core C ABI")
 
         // 1. CLIExecutor & ANSI tests
         check("Resolve `brew` binary", CLIExecutor.resolveBinary("brew") != nil, CLIExecutor.resolveBinary("brew") ?? "nil")
@@ -48,6 +43,7 @@ struct UpkeepSelfTest {
         check("Missing binary returns nil", CLIExecutor.resolveBinary("nonexistent_bin_xyz_999") == nil)
         let stripped = CLIExecutor.stripANSI("\u{001B}[32m✓ User app cache · 18 items, 2.4GB\u{001B}[0m")
         check("ANSI escape stripping", stripped == "✓ User app cache · 18 items, 2.4GB", stripped)
+        await testBoundedCLIOutput()
 
         // 2. Native Rust Cleaner dry-run scan & safety/deletion tests
         let scanStart = Date()
@@ -111,7 +107,7 @@ struct UpkeepSelfTest {
 
         // 3. Fast Parallel Application Scanner & Uninstaller Inspection benchmark
         let appScanStart = Date()
-        let apps = await UpkeepEngine.scanInstalledApplications()
+        let apps = await testSharedAppScan(startedAt: appScanStart)
         let appScanMs = Date().timeIntervalSince(appScanStart) * 1000.0
         check("Parallel application scan discovers installed apps", !apps.isEmpty, String(format: "%d apps in %.1fms", apps.count, appScanMs))
         let appsWithSizes = apps.filter { ($0.size ?? 0) > 0 }
@@ -166,6 +162,20 @@ struct UpkeepSelfTest {
             let hits = try await BrewService.shared.searchRemote(query: "git")
             let searchMs = Date().timeIntervalSince(searchStart) * 1000.0
             check("15k Brew catalog search ('git') benchmark", !hits.isEmpty && hits.first?.name == "git", String(format: "%d hits in %.1fms (top=%@)", hits.count, searchMs, hits.first?.name ?? "nil"))
+            let warmStart = Date()
+            let warm = try await BrewService.shared.searchRemote(query: "git")
+            check("Warm Brew search returns the same ranking", hits == warm,
+                  String(format: "%.1fms", Date().timeIntervalSince(warmStart) * 1000))
+            let cancelled = Task {
+                try? await Task.sleep(for: .seconds(1))
+                return try await BrewService.shared.searchRemote(query: "upkeep-cancelled-query")
+            }
+            cancelled.cancel()
+            if case .failure(let error) = await cancelled.result {
+                check("Cancelled Brew query throws cancellation", error is CancellationError)
+            } else {
+                check("Cancelled Brew query throws cancellation", false)
+            }
             if let git = loaded.first(where: { !$0.isCask && $0.name == "git" }) {
                 check("Homebrew search preserves installed package status", hits.first == git)
             }
@@ -203,6 +213,9 @@ struct UpkeepSelfTest {
             check("KeepAwakeManager starts Display+System assertion", mgr.isActive && mgr.mode == .displayAndSystem)
             mgr.extend(byMinutes: 30)
             check("KeepAwakeManager extends duration (+30m)", (mgr.remainingSeconds ?? 0) > 3500, mgr.formattedRemaining)
+            let expiry = mgr.expiresAt
+            NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: NSWorkspace.shared)
+            check("Caffeinate preserves its deadline on wake", mgr.isActive && mgr.expiresAt == expiry)
             mgr.start(durationMinutes: nil, mode: .systemOnly)
             check("KeepAwakeManager switches to System Only indefinite", mgr.isActive && mgr.mode == .systemOnly && mgr.formattedRemaining == "Indefinite")
             mgr.stop()
@@ -258,6 +271,58 @@ struct UpkeepSelfTest {
         print("=== Results: \(passed) passed, \(failed) failed ===")
         if failed > 0 {
             Foundation.exit(1)
+        }
+    }
+
+    private static func testBoundedCLIOutput() async {
+        let script = #"""
+            printf 'output-start\n'
+            /usr/bin/yes 'é🙂' | /usr/bin/head -c 2097151
+            printf '\n\360\237'
+            /bin/sleep 0.03
+            printf '\231\202 stdout-end'
+            printf 'stderr-end' >&2
+            exit 7
+            """#
+        do {
+            let cap = 64 * 1024
+            let bounded = try await CLIExecutor.runStreaming(
+                binary: "/bin/sh", arguments: ["-c", script], capture: .tail(maxBytes: cap), onLine: nil
+            )
+            check("Bounded CLI output preserves UTF-8 tail, stderr and exit status",
+                  bounded.stdout.utf8.count <= cap && bounded.stdout.hasPrefix("… (earlier output truncated)")
+                    && bounded.stdout.hasSuffix("🙂 stdout-end")
+                    && bounded.stderr == "stderr-end" && bounded.exitCode == 7)
+            let full = try await CLIExecutor.run(
+                binary: "/bin/sh", arguments: ["-c", script]
+            )
+            check("Full CLI capture preserves the complete output",
+                  full.stdout.hasPrefix("output-start\n") && full.stdout.utf8.count > 2_097_152
+                    && full.stdout.hasSuffix("🙂 stdout-end") && full.stderr == bounded.stderr)
+        } catch {
+            check("CLI output capture", false, error.localizedDescription)
+        }
+    }
+
+    @MainActor
+    private static func testSharedAppScan(startedAt: Date) async -> [MoleInstalledApp] {
+        var discovered: [MoleInstalledApp] = []
+        do {
+            async let other = MoleService.shared.listInstalledApps()
+            let sized = try await MoleService.shared.listInstalledApps(forceRefresh: true) { metadata in
+                discovered = metadata
+                check("Uninstaller publishes metadata before sizes",
+                      !metadata.isEmpty && metadata.allSatisfy { $0.size == nil },
+                      String(format: "%.1fms", Date().timeIntervalSince(startedAt) * 1000))
+            }
+            let shared = try await other
+            let cached = try await MoleService.shared.listInstalledApps()
+            check("Overlapping and cached app loads return the same sized snapshot",
+                  sized == shared && sized == cached && sized.map(\.path) == discovered.map(\.path))
+            return sized
+        } catch {
+            check("Shared Uninstaller scan", false, error.localizedDescription)
+            return []
         }
     }
 

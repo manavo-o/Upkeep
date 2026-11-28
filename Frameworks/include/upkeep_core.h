@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 typedef struct BrewSearchIndex BrewSearchIndex;
+typedef struct BrewSearchCancellation BrewSearchCancellation;
 
 typedef struct {
     uint32_t index;
@@ -122,6 +123,19 @@ char *upkeep_brew_index_search_scoped_json(
     bool installed_only
 );
 
+// The caller must keep the token alive until the search and any cancel call return.
+BrewSearchCancellation *upkeep_brew_search_cancellation_new(void);
+void upkeep_brew_search_cancel(const BrewSearchCancellation *token);
+void upkeep_brew_search_cancellation_free(BrewSearchCancellation *token);
+char *upkeep_brew_index_search_cancellable_json(
+    const BrewSearchIndex *ptr,
+    const char *query_utf8,
+    uint32_t limit,
+    int32_t filter_mode,
+    bool installed_only,
+    const BrewSearchCancellation *token
+);
+
 /// Zero-allocation parallel search: writes top matches into caller-allocated UpkeepMatch array.
 /// Returns number of matches written.
 uint32_t upkeep_brew_index_search_fast(
@@ -141,6 +155,9 @@ uint32_t upkeep_scan_applications_metadata(
     uint32_t capacity
 );
 
+/// App metadata as JSON, including full paths and bundle identifiers.
+char *upkeep_scan_applications_metadata_json(void);
+
 /// Full parallel scan of /Applications and ~/Applications using Rayon + macOS getattrlistbulk.
 uint32_t upkeep_scan_applications(
     UpkeepAppRecord *out_apps,
@@ -149,6 +166,9 @@ uint32_t upkeep_scan_applications(
 
 /// Computes APFS-accurate physical disk usage for a single file or directory path.
 uint64_t upkeep_calculate_path_size(const char *path_utf8);
+
+/// Computes sizes in path order using the same APFS walker as the single-path function.
+bool upkeep_calculate_path_sizes(const char *const *paths, uint64_t *sizes, size_t count);
 
 /// Parallel Uninstaller inspector: discovers ~/Library leftovers with APFS sizes
 /// and matches Homebrew Caskroom tokens. Returns newly allocated JSON string.

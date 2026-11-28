@@ -303,6 +303,13 @@ public actor MoleService {
     public static let shared = MoleService()
     private var cachedApps: [MoleInstalledApp] = []
     private var lastAppFetch: Date?
+    private var appScanRevision = 0
+    private var appScan: AppScan?
+
+    private struct AppScan {
+        let metadata: Task<[MoleInstalledApp], Never>
+        let sized: Task<[MoleInstalledApp], Never>
+    }
 
     public static func parseCleanOutput(_ raw: String, isDryRun: Bool) -> MoleCleanSummary {
         UpkeepEngine.parseMoleCleanOutput(raw, isDryRun: isDryRun)
@@ -468,14 +475,57 @@ public actor MoleService {
     }
 
     public func listInstalledApps(forceRefresh: Bool = false) async throws -> [MoleInstalledApp] {
-        if !forceRefresh, let last = lastAppFetch, Date().timeIntervalSince(last) < 60, !cachedApps.isEmpty {
-            return cachedApps
-        }
+        try await listInstalledApps(forceRefresh: forceRefresh, onMetadata: nil)
+    }
 
-        let apps = await UpkeepEngine.scanInstalledApplications()
-        cachedApps = apps
-        lastAppFetch = Date()
-        return apps
+    package func listInstalledApps(
+        forceRefresh: Bool,
+        onMetadata: (@MainActor @Sendable ([MoleInstalledApp]) -> Void)?
+    ) async throws -> [MoleInstalledApp] {
+        var force = forceRefresh
+        while true {
+            try Task.checkCancellation()
+            if appScan == nil {
+                if !force, let last = lastAppFetch, Date().timeIntervalSince(last) < 60 {
+                    return cachedApps
+                }
+                let metadata = Task { await UpkeepEngine.scanInstalledApplicationsMetadata() }
+                let sized = Task {
+                    let apps = await metadata.value
+                    guard !Task.isCancelled else { return [MoleInstalledApp]() }
+                    return await UpkeepEngine.sizeInstalledApplications(apps)
+                }
+                appScanRevision += 1
+                appScan = AppScan(metadata: metadata, sized: sized)
+            }
+            guard let scan = appScan else { continue }
+            let revision = appScanRevision
+            force = false
+            if let onMetadata {
+                let apps = await scan.metadata.value
+                try Task.checkCancellation()
+                guard revision == appScanRevision else { continue }
+                await onMetadata(apps)
+            }
+            let apps = await scan.sized.value
+            guard revision == appScanRevision else { continue }
+            if appScan != nil {
+                cachedApps = apps
+                lastAppFetch = Date()
+                appScan = nil
+            }
+            try Task.checkCancellation()
+            return apps
+        }
+    }
+
+    private func invalidateAppScan() {
+        appScanRevision += 1
+        appScan?.metadata.cancel()
+        appScan?.sized.cancel()
+        appScan = nil
+        cachedApps.removeAll()
+        lastAppFetch = nil
     }
 
     /// Moves an application (and optionally its discovered leftovers) to Trash natively without external CLIs.
@@ -528,7 +578,7 @@ public actor MoleService {
             }
         }
 
-        cachedApps.removeAll { $0.path == app.path || $0.name.caseInsensitiveCompare(app.name) == .orderedSame }
+        invalidateAppScan()
         let extraCount = max(0, trashedCount - 1)
         if extraCount > 0 {
             return "Moved \(app.name) and \(extraCount) support \(extraCount == 1 ? "item" : "items") to Trash"
@@ -537,7 +587,7 @@ public actor MoleService {
     }
 
     /// Inspects an installed app before removal: discovers exact `~/Library` leftover files with sizes
-    /// and cross-checks Homebrew's Caskroom in parallel (Rust `getattrlistbulk` + Rayon when linked).
+    /// and cross-checks Homebrew's Caskroom in parallel using Rust, `getattrlistbulk`, and Rayon.
     public func inspectAppForUninstall(_ app: MoleInstalledApp) async -> UninstallInspection {
         if let rustInspection = await UpkeepEngine.inspectAppForUninstallRust(app: app) {
             return rustInspection
@@ -651,7 +701,7 @@ public actor MoleService {
 
         var usedHomebrew = false
         if let token = homebrewCaskToken, !token.isEmpty, BrewService.isInstalled() {
-            _ = try await BrewService.shared.uninstall(name: token, isCask: true, zap: !hasSiblingApp)
+            _ = try await BrewService.shared.uninstall(name: token, isCask: true, zap: !hasSiblingApp, retainOutput: false)
             usedHomebrew = true
         } else {
             let appURL = URL(fileURLWithPath: app.path)
@@ -715,7 +765,7 @@ public actor MoleService {
             }
         }
 
-        cachedApps.removeAll { $0.path == app.path || $0.name.caseInsensitiveCompare(app.name) == .orderedSame }
+        invalidateAppScan()
 
         let skippedSuffix = skippedSystemCount > 0
             ? " (\(skippedSystemCount) system \(skippedSystemCount == 1 ? "item" : "items") skipped)"

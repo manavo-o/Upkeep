@@ -14,6 +14,7 @@ use std::io::{BufReader, Read};
 use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{OnceLock, RwLock};
 
 mod cleaner;
@@ -294,6 +295,8 @@ pub struct UpkeepAppRecord {
 pub struct BrewSearchIndex {
     slab: RwLock<BrewCatalogSlab>,
 }
+
+pub struct BrewSearchCancellation(AtomicBool);
 
 #[derive(Deserialize)]
 struct ApiFormulaVersions {
@@ -1978,7 +1981,12 @@ fn parallel_score_indices(
     filter_mode: i32,
     limit: usize,
     installed_only: bool,
+    cancellation: Option<&BrewSearchCancellation>,
 ) -> Vec<(u32, u32)> {
+    let cancelled = || cancellation.is_some_and(|token| token.0.load(AtomicOrdering::Relaxed));
+    if cancelled() {
+        return Vec::new();
+    }
     let entries = &slab.entries;
     let matches_filter = |e: &SlabPackage| {
         (!installed_only || e.is_installed())
@@ -2011,6 +2019,9 @@ fn parallel_score_indices(
         let mut high_tier_count = 0usize;
         let mut local = Vec::new();
         for (idx, entry) in entries.iter().enumerate() {
+            if idx % 32 == 0 && cancelled() {
+                return Vec::new();
+            }
             if !matches_filter(entry) {
                 continue;
             }
@@ -2046,6 +2057,9 @@ fn parallel_score_indices(
                         let mut high_tier_count = 0usize;
                         let mut local = Vec::new();
                         for (offset, entry) in chunk.iter().enumerate() {
+                            if offset % 32 == 0 && cancelled() {
+                                return Vec::new();
+                            }
                             if !matches_filter(entry) {
                                 continue;
                             }
@@ -2075,6 +2089,9 @@ fn parallel_score_indices(
                 )
                 .collect()
         });
+        if cancelled() {
+            return Vec::new();
+        }
         let total_len: usize = chunk_results.iter().map(Vec::len).sum();
         let mut merged = Vec::with_capacity(total_len);
         for chunk in chunk_results {
@@ -2106,6 +2123,39 @@ pub extern "C" fn upkeep_brew_index_search_scoped_json(
     filter_mode: i32,
     installed_only: bool,
 ) -> *mut c_char {
+    upkeep_brew_index_search_cancellable_json(
+        ptr, query_utf8, limit, filter_mode, installed_only, std::ptr::null(),
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn upkeep_brew_search_cancellation_new() -> *mut BrewSearchCancellation {
+    Box::into_raw(Box::new(BrewSearchCancellation(AtomicBool::new(false))))
+}
+
+#[no_mangle]
+pub extern "C" fn upkeep_brew_search_cancel(token: *const BrewSearchCancellation) {
+    if let Some(token) = unsafe { token.as_ref() } {
+        token.0.store(true, AtomicOrdering::Relaxed);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn upkeep_brew_search_cancellation_free(token: *mut BrewSearchCancellation) {
+    if !token.is_null() {
+        drop(unsafe { Box::from_raw(token) });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn upkeep_brew_index_search_cancellable_json(
+    ptr: *const BrewSearchIndex,
+    query_utf8: *const c_char,
+    limit: u32,
+    filter_mode: i32,
+    installed_only: bool,
+    token: *const BrewSearchCancellation,
+) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         if ptr.is_null() {
             return string_to_cstr("[]".to_string());
@@ -2116,8 +2166,13 @@ pub extern "C" fn upkeep_brew_index_search_scoped_json(
             return string_to_cstr("[]".to_string());
         };
 
-        let top_indices =
-            parallel_score_indices(&guard, query, filter_mode, limit as usize, installed_only);
+        let cancellation = unsafe { token.as_ref() };
+        let top_indices = parallel_score_indices(
+            &guard, query, filter_mode, limit as usize, installed_only, cancellation,
+        );
+        if cancellation.is_some_and(|token| token.0.load(AtomicOrdering::Relaxed)) {
+            return string_to_cstr("[]".to_string());
+        }
         let top: Vec<BrewPackageRef<'_>> = top_indices
             .into_iter()
             .map(|(_, idx)| guard.as_wire_ref(idx as usize))
@@ -2156,7 +2211,7 @@ pub extern "C" fn upkeep_brew_index_search_fast(
             return 0;
         };
 
-        let scored = parallel_score_indices(&guard, query, filter_mode, capacity as usize, false);
+        let scored = parallel_score_indices(&guard, query, filter_mode, capacity as usize, false, None);
         let count = (scored.len() as u32).min(capacity);
         for (i, (score, idx)) in scored.into_iter().take(count as usize).enumerate() {
             unsafe {
@@ -2376,6 +2431,37 @@ fn write_app_records(
     count
 }
 
+#[derive(Serialize)]
+struct AppMetadata {
+    name: String,
+    bundle_id: String,
+    path: String,
+}
+
+fn scan_app_metadata() -> Vec<AppMetadata> {
+    let paths = collect_app_paths();
+    let mut apps: Vec<_> = worker_pool().install(|| {
+        paths
+            .par_iter()
+            .map(|path| AppMetadata {
+                name: path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+                bundle_id: read_bundle_id(path),
+                path: path.to_string_lossy().into_owned(),
+            })
+            .collect()
+    });
+    apps.sort_unstable_by(|a, b| cmp_ignore_ascii_case(&a.name, &b.name));
+    apps
+}
+
+#[no_mangle]
+pub extern "C" fn upkeep_scan_applications_metadata_json() -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        string_to_cstr(serde_json::to_string(&scan_app_metadata()).unwrap_or_else(|_| "[]".into()))
+    });
+    result.unwrap_or_else(|_| string_to_cstr("[]".into()))
+}
+
 /// Phase 1 instant app scanner: discovers /Applications and ~/Applications with Info.plist
 /// bundle IDs in parallel without walking bundle contents (`app_size_bytes = 0`).
 #[no_mangle]
@@ -2387,24 +2473,11 @@ pub extern "C" fn upkeep_scan_applications_metadata(
         if out_apps.is_null() || capacity == 0 {
             return 0;
         }
-        let app_paths = collect_app_paths();
-        let mut records: Vec<(String, String, String, u64)> = worker_pool().install(|| {
-            app_paths
-                .par_iter()
-                .map(|path| {
-                    let name = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned();
-                    let bundle_id = read_bundle_id(path);
-                    let path_str = path.to_string_lossy().into_owned();
-                    (name, bundle_id, path_str, 0u64)
-                })
-                .collect()
-        });
-
-        records.sort_unstable_by(|a, b| cmp_ignore_ascii_case(&a.0, &b.0));
+        let records = scan_app_metadata()
+            .into_iter()
+            .take(capacity as usize)
+            .map(|app| (app.name, app.bundle_id, app.path, 0))
+            .collect();
         write_app_records(records, out_apps, capacity)
     });
     result.unwrap_or(0)
@@ -2443,6 +2516,35 @@ pub extern "C" fn upkeep_scan_applications(
         write_app_records(records, out_apps, capacity)
     });
     result.unwrap_or(0)
+}
+
+/// Computes APFS-accurate disk usage for multiple paths, in input order.
+#[no_mangle]
+pub extern "C" fn upkeep_calculate_path_sizes(
+    paths: *const *const c_char,
+    sizes: *mut u64,
+    count: usize,
+) -> bool {
+    if count == 0 {
+        return true;
+    }
+    if paths.is_null() || sizes.is_null() {
+        return false;
+    }
+    std::panic::catch_unwind(|| {
+        let input = unsafe { std::slice::from_raw_parts(paths, count) };
+        let output = unsafe { std::slice::from_raw_parts_mut(sizes, count) };
+        let path_strings: Vec<_> = input.iter().map(|&path| cstr_to_str(path)).collect();
+        worker_pool().install(|| {
+            output.par_iter_mut().zip(path_strings.par_iter()).for_each_init(
+                BulkScratch::new,
+                |scratch, (size, path)| {
+                    *size = calculate_path_size_accurate_with_scratch(Path::new(path), scratch);
+                },
+            );
+        });
+    })
+    .is_ok()
 }
 
 /// Computes APFS-accurate physical disk usage for a single file or directory path.
@@ -3830,17 +3932,50 @@ mod tests {
         assert_eq!(loaded, 3);
 
         let guard = idx.slab.read().unwrap();
-        let hits = parallel_score_indices(&guard, "rg", -1, 10, false);
+        let hits = parallel_score_indices(&guard, "rg", -1, 10, false, None);
         assert!(!hits.is_empty());
         assert_eq!(guard.str_of(guard.entries[hits[0].1 as usize].name), "ripgrep");
         assert_eq!(guard.version_of(hits[0].1 as usize), "14.1.0_1");
         drop(guard);
 
-        // Clear releases slab memory back to 0
         let raw = Box::into_raw(Box::new(idx));
+        let query = CString::new("rg").unwrap();
+        let token = upkeep_brew_search_cancellation_new();
+        let hits_with_token = upkeep_brew_index_search_cancellable_json(raw, query.as_ptr(), 10, -1, false, token);
+        let hits_without_token = upkeep_brew_index_search_scoped_json(raw, query.as_ptr(), 10, -1, false);
+        assert_eq!(cstr_to_str(hits_with_token), cstr_to_str(hits_without_token));
+        upkeep_string_free(hits_with_token);
+        upkeep_string_free(hits_without_token);
+
+        upkeep_brew_search_cancel(token);
+        let cancelled = upkeep_brew_index_search_cancellable_json(raw, query.as_ptr(), 10, -1, false, token);
+        assert_eq!(cstr_to_str(cancelled), "[]");
+        upkeep_string_free(cancelled);
+        upkeep_brew_search_cancellation_free(token);
+
+        // Clear releases slab memory back to 0
         upkeep_brew_index_clear(raw);
         assert_eq!(upkeep_brew_index_count(raw), 0);
         upkeep_brew_index_free(raw);
+    }
+
+    #[test]
+    fn batch_sizes_match_single_path_order() {
+        let root = std::env::temp_dir().join(format!("upkeep-batch-sizes-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, vec![0xAB; 65_536]).unwrap();
+        let paths = [root.join("missing"), root.clone(), file];
+        let c_paths = paths.map(|path| CString::new(path.to_str().unwrap()).unwrap());
+        let pointers = c_paths.each_ref().map(|path| path.as_ptr());
+        let mut sizes = [u64::MAX; 3];
+        assert!(upkeep_calculate_path_sizes(pointers.as_ptr(), sizes.as_mut_ptr(), sizes.len()));
+        let expected = pointers.map(|path| upkeep_calculate_path_size(path));
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(sizes, expected);
+        assert_eq!(sizes[0], 0);
+        assert!(sizes[1] >= sizes[2]);
+        assert!(sizes[2] > 0);
     }
 
     #[test]
