@@ -1,244 +1,183 @@
 <div align="center">
+  <img src="Resources/Icons/AppIcon.png" width="112" height="112" alt="Upkeep app icon" />
 
-<img src="Resources/Icons/AppIcon.png" width="120" height="120" alt="Upkeep App Icon" />
+  <h1 id="upkeep">Upkeep</h1>
 
-# Upkeep
+  <p>A native macOS menu bar app for keeping your Mac awake, locking input during cleaning, managing Homebrew, and reclaiming disk space.</p>
 
-**A fast, native macOS menu-bar toolkit for power control, Homebrew management, disk cleanup, and app removal.**
+  <a href="https://github.com/manavo-o/Upkeep/releases/latest"><strong>Download Upkeep</strong></a> ·
+  <a href="RELEASE_NOTES.md">Release notes</a> ·
+  <a href="#build-from-source">Build from source</a>
 
-<p>
-  <a href="https://github.com/manavo-o/Upkeep/releases/latest">
-    <img src="https://img.shields.io/github/v/release/manavo-o/Upkeep?display_name=tag&style=flat&color=007AFF" alt="Latest Release" />
-  </a>
-  <img src="https://img.shields.io/badge/macOS-26%2B%20Liquid%20Glass-1D1D1F?style=flat&logo=apple&logoColor=white" alt="macOS 26+ Liquid Glass" />
-  <img src="https://img.shields.io/badge/Apple%20silicon-arm64-1D1D1F?style=flat&logo=apple&logoColor=white" alt="Apple silicon" />
-  <img src="https://img.shields.io/badge/Swift-6-F05138?style=flat&logo=swift&logoColor=white" alt="Swift 6" />
-  <img src="https://img.shields.io/badge/Rust-upkeep__core-DEA584?style=flat&logo=rust&logoColor=black" alt="Rust upkeep_core" />
-  <a href="https://github.com/manavo-o/Upkeep/actions/workflows/release.yml">
-    <img src="https://github.com/manavo-o/Upkeep/actions/workflows/release.yml/badge.svg" alt="Build & Release" />
-  </a>
-</p>
-
-<p>
-  <a href="#features-at-a-glance">Features</a> •
-  <a href="#inside-upkeep">Deep Dive</a> •
-  <a href="#safety--protection-model">Safety</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#installation">Install</a> •
-  <a href="#keyboard-shortcuts">Shortcuts</a> •
-  <a href="#privacy--network-activity">Privacy</a> •
-  <a href="#faq">FAQ</a>
-</p>
-
+  <p>
+    <a href="https://github.com/manavo-o/Upkeep/releases/latest"><img src="https://img.shields.io/github/v/release/manavo-o/Upkeep?display_name=tag" alt="Latest GitHub release" /></a>
+    <img src="https://img.shields.io/badge/macOS-26%2B-1D1D1F?logo=apple" alt="macOS 26 or later" />
+    <img src="https://img.shields.io/badge/Apple%20silicon-arm64-1D1D1F" alt="Apple silicon" />
+  </p>
 </div>
 
-Upkeep opens from the menu bar into a native **Liquid Glass** workspace with grouped settings, Back and Forward navigation, and keyboard search. Its SwiftUI and AppKit interface uses a bundled Rust engine (`libupkeep_core.a`) for disk sizing, Homebrew catalog search, cache cleanup, and app leftover discovery.
+## Install
 
-> [!IMPORTANT]
-> **Review what will be removed.** Cleaner shows detected files, estimated sizes, and the selected total before deletion. Uninstaller lets you review the app and select related files. Both show holdback reasons and identify items that require administrator access. In Cleaner, a blue **Running** badge marks app caches held back by the scan.
+1. On an Apple silicon Mac running **macOS 26 or later**, download the `Upkeep-v*.zip` asset from the [latest GitHub release](https://github.com/manavo-o/Upkeep/releases/latest).
+2. Extract the ZIP and move **Upkeep.app** into **Applications**.
+3. Launch Upkeep and click the cup icon in the menu bar. Choose **Open Upkeep…** to open Settings.
 
----
+Upkeep starts in the menu bar without opening a window or adding a Dock icon. The cup fills in while Caffeinate is active. macOS 27 adds a Caffeinate duration slider to the menu and native tabs to the Homebrew package browser. On macOS 26 the menu offers a one-hour start command and an off command, with duration controls available in Settings.
 
-## Features at a Glance
+Homebrew is optional and enables package browsing, package commands, and Homebrew cask removal. Cleaner and Uninstaller’s native removal workflow work with the bundled engine, without installing Mole or Rust separately.
 
-| Module | What It Does | Under the Hood |
+## What you can do
+
+| Feature | Where to start | What it does |
 | --- | --- | --- |
-| **Caffeinate & Clean Keys** | Keep your Mac awake (**Caffeinate**) and lock keyboard/trackpad input while wiping your MacBook (**Clean Keys**). | Native IOKit power assertions, CoreGraphics event tap, live monospaced menu countdown. |
-| **Homebrew** | Search, install, and upgrade formulae and casks from Settings or the floating **Search HUD**. Follow command output in Homebrew Activity. | On-disk `catalog.bin` cache, HTTP revalidation, and ranked local search. |
-| **Cleaner** | Review up to **12 categories** covering developer tools, browsers, app caches, build artifacts, installers, and opt-in system files. | Lock-free `getattrlistbulk` + `DfsArena` APFS sizing, `libproc` + `SingletonLock` live-app guards, Rayon parallelism. |
-| **Uninstaller** | Review installed apps and related files, with optional administrator cleanup, Homebrew cask removal, and shared-data protection. | Two-phase app discovery and sizing, container metadata matching, and targeted service cleanup. |
-| **General & About** | Interface preferences, keyboard shortcuts, version, app updates, and Accessibility status. | Toolbar search jumps to matching settings. App updates check the configured GitHub repository. |
+| [Caffeinate](#caffeinate) | Menu bar or **Settings → Caffeinate** | Prevent idle sleep for a set duration or until you stop the session. |
+| [Clean Keys](#clean-keys) | Menu bar or **Settings → Clean Keys** | Temporarily pause keyboard input and optionally block pointer and trackpad input while cleaning. |
+| [Homebrew](#homebrew) | **Search Homebrew…** or **Settings → Homebrew** | Find packages, review upgrades, run package commands, and inspect command output. |
+| [Cleaner](#cleaner) | **Cleaner… → Scan** | Find caches and other reclaimable files, review estimates, and delete selected items. |
+| [Uninstaller](#uninstaller) | **Uninstaller… → Review…** | Inspect an installed app and its related files, then choose what to remove. |
+| [Updates](#updates-and-network-activity) | **Check for Updates…** or **Settings → About & Updates** | Check the installed version, review release notes, and install updates. |
 
-## Inside Upkeep
+In Settings, use <kbd>⌘</kbd> <kbd>F</kbd> to find a setting and jump to it.
 
-### Caffeinate & Clean Keys
-- **Caffeinate (Keep Mac Awake)**: Uses macOS power assertions to prevent idle sleep. Choose **Mac & Display** or **Mac Only**, start a timed session or choose **Until Stopped**, and add 30 minutes when needed. The countdown updates while the menu is open and when the Mac wakes.
-- **Clean Keys (Keyboard & Pointer Lock)**: Uses a CoreGraphics event tap (`CGEvent.tapCreate`) to absorb accidental keystrokes and optional trackpad/pointer input while cleaning your MacBook. Includes presets (`30s`, `60s`, `2m`), **Dim Screen**, and two ways to unlock early: **hold <kbd>⌘</kbd> + <kbd>Esc</kbd> for 1 second** or **press <kbd>⌘</kbd> six times**.
+### Caffeinate
 
-### Homebrew Search HUD & Package Manager
-- **Local package catalog** stores Homebrew formulae and casks in `catalog.bin`, refreshes the index using HTTP revalidation, and reads installed and pinned state from disk.
-- **5-Tier Name-First Search**: Ranks results in **Exact → Prefix → Substring → Fuzzy Name → Description** order using `nucleo-matcher` and `memchr` NEON/SIMD scanning, shared between the floating Liquid Glass Search HUD and the Settings **Homebrew** pane.
-- **Package management** includes install, upgrade, and uninstall actions, plus pinning and homepage links from the HUD’s <kbd>⌘</kbd><kbd>K</kbd> menu. In Settings, **Homebrew → Activity** shows command output and diagnostics. **Refresh Catalog** runs `brew update`. macOS 27 uses native tabs for the Settings package scopes.
+Choose **Mac & Display** to prevent idle display sleep as well as idle system sleep, or **Mac Only** to let the display sleep. Drag **Session Duration** to start a timed session or reset the current timer. The slider ranges from 15 minutes to 2 hours in five-minute steps, with **Off** at the left. Settings also offers **Until Stopped**, **Stop Session**, and **Add 30 min** for an active timed session.
 
-### Native Rust Cleaner (12 Categories)
-The bundled `upkeep_core` engine scans in parallel using `getattrlistbulk` and uses `O_NOFOLLOW` when opening paths. The scan shows categories with results and leaves held-back items unselected by default.
+**Keep Awake With Lid Closed** is a separate setting in **Caffeinate**. Enabling it asks for administrator approval once to install a per-user launch daemon. The preference applies automatically to future sessions and takes effect for an active session when enabled. While engaged, the helper uses `pmset` to disable system sleep. It restores the previous sleep behavior when the session ends or Upkeep disconnects. A boot-time recovery job can restore sleep if the machine loses power during a session. Turn the setting off to stop using closed-lid mode.
 
-<details>
-<summary><strong>Explore the 12 supported cleanup categories</strong></summary>
+### Clean Keys
 
-1. **Developer Tools (64+ targets + shut-down Simulators)** — Xcode (`DerivedData`, Caches, `XCTest`, Products, iOS Device Logs, SwiftUI Previews; held-back Archives & iOS/watchOS/tvOS DeviceSupport), CoreSimulator (`Caches`, user `dyld`, and shut-down per-device `data/{tmp,Library/Caches,Library/Logs}` when Simulator isn't running), Homebrew, SwiftPM, CocoaPods, JetBrains, Android Studio, Docker Buildx, npm (`_cacache`, `_logs`), pnpm, Yarn Classic, Bun, `node-gyp`, Electron, Deno, TypeScript, Turborepo, esbuild, Biome, Prisma, pip, uv, Poetry, Pipenv, Conda, Ruff, Mypy, `pre-commit`, Cargo (`cache` & `src`), Rustup downloads, Bazel, Zig, `sccache`, `ccache`, Gradle, Android cache/build-cache, Ivy2, Coursier, Maven (held back), Go build cache, Playwright & Puppeteer browsers (held back), Composer, RubyGems, `pyenv`, `nvm`, Hugging Face Hub (held back), NuGet (held back), and Dart/Flutter Pub Cache (held back).
-2. **Browser Caches** — Chrome, Brave, Edge, Arc, Firefox, Zen, Vivaldi, Opera, plus Chromium `.code_sign_clone` update leftovers (Chrome, Brave, Edge, Helium) in `~/Library/Caches` and `$TMPDIR`. **Caches only** — never touches profiles, bookmarks, history, cookies, passwords, or sessions.
-3. **App Internal Caches** — Exact disposable Electron/Chromium cache leaves (`Cache`, `Code Cache`, `GPUCache`, `DawnCache`, `DawnGraphiteCache`, `DawnWebGPUCache`, `CachedData`, `Service Worker/CacheStorage`, `Crashpad/completed`) in `~/Library/Application Support/<App>/`, plus Vesktop `sessionData`, T3 Code preview partitions, and Adobe Media Cache.
-4. **User App & Sandboxed Container Caches** — `~/Library/Caches/*` and third-party `~/Library/Containers/<bundle_id>/Data/Library/Caches` (preserving parent directories).
-5. **macOS & Apple Caches** — QuickLook thumbnails & cache, Icon Services, Safari Webpage Previews, WebKit Network cache, App Store caches, Media/Photo Analysis, Siri/Calendar/Address Book/Help Viewer caches, Apple Maps `GeoServices`, Messages sticker/preview caches (never `Attachments`), 30d+ Mail Downloads attachment copies (held back), Autosave Information (held back), and local iOS Device Backups (held back).
-6. **Project Build Artifacts** — Bounded, sibling-marker-verified discovery of rebuildable `node_modules`, `target`, `.build`, `Pods`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.gradle`, `.dart_tool`, `dist`, and `build` folders across standard developer roots (`~/Projects`, `~/Developer`, `~/Code`, `~/GitHub`, `~/dev`, `~/.t3/worktrees`, etc.) with nested `.git` protection and recent-activity reasons (held back by default).
-7. **Orphaned App Leftovers** — 30d+ deep-stale caches, logs, `HTTPStorages`, `WebKit`, and saved states whose reverse-DNS bundle ID is no longer installed across `/Applications`, `/System/Applications`, `~/Applications`, Setapp, or Homebrew Caskroom, plus orphaned non-Apple `/Library/LaunchDaemons` & `/Library/LaunchAgents` whose target binaries no longer exist (`Admin`).
-8. **Logs & Diagnostics** — `~/Library/Logs`, `DiagnosticReports`, and 30d+ `CrashReporter` entries.
-9. **Saved State & Temp** — `Saved Application State` (held back), user-owned `$TMPDIR` files >24h old, and stale `.crdownload` / `.download` / `.part` files >24h old (held back).
-10. **Old Installers** — `.dmg`, `.pkg`, `.mpkg`, `.iso`, and `.xip` files older than 24h in `~/Downloads` and `~/Desktop` (held back).
-11. **System Caches & Logs (Admin)** — Opt-in allowlisted system cleanup (`/Library/Developer/CoreSimulator/Caches/dyld`, `/Library/Logs/DiagnosticReports`, `/private/var/db/diagnostics/{Special,Persist}`, `/private/var/db/DiagnosticPipeline`, `/private/var/db/reportmemoryexception`, stale `/private/var/log`, `/Library/Caches`, `/private/tmp`, `/private/var/tmp`, and `/private/var/db/powerlog` excluding live `Current*` PerfPowerTelemetry databases). Removing selected system items requires administrator authorization.
-12. **Trash** — `~/.Trash` (held back by default).
+Choose a lock duration of **30 seconds**, **1 minute**, or **2 minutes**. **Dim Screen** makes smudges easier to see, and **Lock Pointer & Trackpad** extends the lock to pointer input. Start the timer with **Lock Keyboard**.
 
-</details>
+Clean Keys needs **Accessibility** permission for its temporary input lock. Use **Grant Accessibility…** in Settings to open the relevant macOS settings, then enable **Upkeep** under **Privacy & Security → Accessibility**.
 
-### Deep App Uninstaller
-- **Two-phase discovery** lists apps in `/Applications`, `~/Applications`, and their immediate subfolders before filling in bundle sizes.
-- **Opt-In Admin System Leftovers**: System remnants (`/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/Library/PrivilegedHelperTools`, `/Library/Application Support`, `/Library/Caches`, `/Library/Logs`, `/Library/Preferences`, `/Users/Shared`, `/private/var/db/receipts`) are labeled as requiring administrator access and validated against an allowlist. Upkeep attempts to unload selected launch services and unregisters the removed bundle.
-- **Homebrew Caskroom Integration**: Detects Caskroom-managed apps and offers removal through Homebrew. When enabled, Homebrew can remove cask-managed files beyond the checked items. Upkeep skips `--zap` when it finds a sibling app.
+To unlock early, hold <kbd>⌘</kbd> + <kbd>Esc</kbd> for one second or press <kbd>⌘</kbd> six times. **Unlock Keyboard** is also available from Upkeep when you can reach its controls.
+
+### Homebrew
+
+Open **Search Homebrew…** from the menu bar to use the floating search window, or browse in **Settings → Homebrew**. Filter by **Installed**, **Formulae**, **Casks**, or **Upgrades**. Use **Floating Search** in Settings to open the current query in the floating window.
+
+- **Search.** Upkeep caches formula and cask metadata and the Rust search index under `~/Library/Caches/com.local.Upkeep/BrewAPI`. The index ranks exact names, prefixes, substrings, fuzzy name matches, and description matches in that order. Upkeep reads installed versions, pins, and available upgrades from `brew info --json=v2 --installed` and `brew outdated --json=v2`.
+- **Manage packages.** Install, upgrade, or uninstall a package. The floating window’s <kbd>⌘</kbd> <kbd>K</kbd> actions menu also exposes formula pinning and unpinning, install-command copying, and homepage links where available. The Homebrew pane offers a bulk upgrade action when updates are available.
+- **Inspect activity.** Follow running commands and review their output under **Homebrew → Activity**. **Refresh Catalog** runs `brew update`. **Run Diagnostics** in Settings and **Run Brew Doctor** in the floating window both run `brew doctor`.
+- **Set up Homebrew.** If Upkeep cannot find `brew`, the Homebrew pane offers **Copy Install Command**. With Homebrew installed, Upkeep uses your existing Homebrew setup for package operations.
+
+### Cleaner
+
+1. Select **Scan** to preview candidates and their estimated sizes.
+2. Review the paths and selection total. **Recommended** restores the default selection, and you can change individual items or whole categories. Entries labeled **Running** are caches that the scan associated with running apps and left unchecked.
+3. Confirm **Delete Files** to permanently delete the selected items. Entries marked **Administrator access required** start unchecked. Upkeep processes user items before requesting administrator authorization, so canceling that prompt leaves completed user deletions in place.
+
+The full Rust scanner can report the following categories. A scan only shows categories with results.
 
 <details>
-<summary><strong>Explore all Uninstaller leftover discovery surfaces</strong></summary>
+<summary>Cleaner categories and examples</summary>
 
-- **Standard macOS User Locations**: `Application Support`, `Caches`, `Preferences`, `ByHost`, `SyncedPreferences`, `Logs`, `Containers`, UUID sandbox containers (`MCMMetadataIdentifier` with 36-char UUID pre-filtering), `Group Containers` (`<TeamID>.` boundary matching), `HTTPStorages`, `WebKit`, `Cookies`, `Saved Application State`, `Autosave Information`, `FileProvider`, `ApplicationRecentDocuments` (`.sfl2`–`.sfl4`), and `SplashBoard/Snapshots`.
-- **Helpers, Agents & Crash Telemetry**: Embedded `.appex`, `.xpc`, `LoginItems`, `Contents/Preferences`, `SharedSupport`, `QuickLook`, and `Spotlight` bundle IDs; `LaunchAgents` (`Program`/`ProgramArguments[0]` ownership matching + `launchctl bootout`); `ShipIt`/updaters; `KSCrash`, `SentryCrash`, `CrashReporter`, `DiagnosticReports`; `NativeMessagingHosts`; plug-ins; XDG directories; vendor-nested folders; and tailored rules for VS Code, Xcode, JetBrains, Android Studio, Claude Desktop, Docker, Anki, and Godot.
-
-</details>
-
-## Safety & Protection Model
-
-Cleaner checks candidate paths during scanning and validates targets again before deletion. Uninstaller applies its own path and shared-data checks during review and removal.
-
-| Risk | How Upkeep Protects You |
+| Category | What the scanner looks for |
 | --- | --- |
-| **Corrupting open app databases** | Enumerates live `.app` bundles via macOS `libproc` (`proc_listallpids` + `proc_pidpath`) and inspects Chromium/Electron `SingletonLock` PIDs to leave detected running-app and browser caches unselected by default. |
-| **Symlink escapes & path traversal** | Canonicalizes targets against user-home/temp allowlists (and a separate strict allowlist for Admin paths), rejects `..`, control characters, leaf symlinks, and symlinked ancestors, deduplicates by `(dev, ino)`, and preserves parent cache folders. |
-| **Deleting credentials or irreplaceable data** | Permanently blocks Keychains, `.ssh`/`.gnupg`/`.aws`/`.kube`, independent CLI directories (Claude Code, Codex, Gemini, OpenCode), `llama.cpp`, `Buzz`, Yarn Berry stores, Jupyter runtime, macOS aerial wallpapers, OrbStack/Docker/UTM/Parallels/Tailscale state, Mail stores, Messages attachments, Apple Notes, Steam, Epic, Unity, and live `Current*` powerlogs. |
-| **Breaking sibling apps or personal profiles** | Holds back browser profiles, `Group Containers`, VM/game libraries, Raycast clipboard cache, Mullvad Browser cache, and Spotify offline data unchecked by default; skips shared data and `--zap` when sibling channels exist (e.g., *VS Code* + *VS Code Insiders*). |
-| **Removing managed security / MDM tools** | Flags enterprise MDM, endpoint security, and VPN suites (CrowdStrike, Jamf, SentinelOne, ESET, GlobalProtect, Cisco Secure Client, Malwarebytes, TeamViewer) and recommends their official vendor uninstallers. |
+| **Developer Tools** | Xcode DerivedData, simulator caches and selected data from shut-down devices, plus caches from Homebrew, SwiftPM, CocoaPods, JetBrains, Android Studio, Node package managers, Python tools, Rust, Gradle, and other build tools. Some larger or harder-to-replace items, including Xcode Archives and Maven’s local repository, start unchecked. |
+| **Browser Caches** | Cache locations for browsers such as Chrome, Brave, Edge, Arc, Firefox, Zen, Vivaldi, and Opera, plus known Chromium update leftovers. The scan targets cache data and avoids browser profiles. |
+| **App Internal Caches** | Specific cache folders inside Application Support, including Electron and Chromium code or GPU caches, plus app-specific targets such as Adobe Media Cache. |
+| **User App Caches** | User caches under `~/Library/Caches` and cache directories inside third-party app containers. The cleaner preserves designated parent directories. |
+| **macOS & Apple Caches** | Quick Look thumbnails, icon services, Safari previews, WebKit network caches, and selected Apple app data. Stale Mail attachment copies, autosave data, and local iOS device backups start unchecked. |
+| **Project Build Artifacts** | Directories such as `node_modules`, `target`, `.build`, `Pods`, and `.venv` in common project roots. A neighboring project marker such as `package.json`, `Cargo.toml`, or `Package.swift` must match the artifact rule. Results start unchecked. |
+| **Orphaned App Leftovers** | Stale app caches, logs, saved state, and related files for bundle IDs no longer found on disk. Also looks for some non-Apple system launch agents and daemons whose programs are missing. |
+| **Logs & Diagnostics** | User application logs, diagnostic reports, and older crash reports. |
+| **Saved State & Temp** | Saved application state, older temporary files, and stale partial downloads. Saved state and partial downloads start unchecked. |
+| **Old Installers** | `.dmg`, `.pkg`, `.mpkg`, `.iso`, and `.xip` files older than 24 hours in Downloads or Desktop. Results start unchecked. |
+| **System Caches & Logs (Admin)** | Allowlisted system caches, logs, diagnostics, and temporary files. The scanner excludes live power-log databases. |
+| **Trash** | Contents of the user’s Trash. This starts unchecked. |
 
-## Architecture
+</details>
 
-```mermaid
-flowchart LR
-    subgraph UI["Swift 6 · SwiftUI · AppKit"]
-        MB["AppKit NSStatusItem + NSMenu<br/>Live Caffeinate & Clean Keys"]
-        WIN["SwiftUI navigation + AppKit toolbar<br/>Liquid Glass Settings"]
-        HUD["Floating NSPanel<br/>Homebrew Search HUD"]
-    end
+The Rust cleaner checks candidates and revalidates selected paths before deleting. It rejects protected paths, traversal, and symlinked targets or ancestors in the user removal path. Explicit protections cover locations such as Keychains, SSH and GnuPG data, Mail stores, and Messages attachments. A holdback reason indicates a candidate that needs review and starts unchecked. Use the selected size as an estimate of space you may reclaim.
 
-    subgraph SYS["Native macOS Frameworks"]
-        IOK["IOKit<br/>Power Assertions"]
-        CG["CoreGraphics<br/>Keyboard/Pointer Tap"]
-        ADM["Allowlisted Admin Helper<br/>Single Native Prompt"]
-    end
+### Uninstaller
 
-    subgraph RUST["Rust C-ABI Static Library (libupkeep_core.a)"]
-        APFS["Lock-Free getattrlistbulk<br/>+ DfsArena APFS Sizing"]
-        BREW["catalog.bin Cache<br/>nucleo-matcher + memchr SIMD"]
-        CLN["Parallel Cleaner & Uninstaller<br/>libproc + Rayon + Path Guards"]
-    end
+Upkeep lists apps from **Applications**, **~/Applications**, and their immediate subfolders, then fills in bundle sizes. Choose **Review…** to inspect a bundle and its related files. The review groups leftovers such as preferences, caches, logs, support files, containers, and launch agents. Use **Recommended**, **All User Files**, or **Deselect All** as a starting point, then review individual paths.
 
-    UI --> SYS
-    UI -- "C-ABI (CUpkeepCore)<br/>auto Swift fallback" --> RUST
-```
+- **Native removal** attempts to quit the app, moves its bundle and selected user leftovers to Trash, and attempts to unregister the removed bundle from Launch Services.
+- **System leftovers** require administrator authorization and are permanently deleted if selected. Upkeep limits these targets to known locations such as system launch agents, privileged helpers, and app support directories. Declining authorization can leave system leftovers in place after the app and user files have been moved to Trash.
+- **Uninstall with Homebrew** appears for detected casks when Homebrew is available. Homebrew can remove files declared by the cask beyond the checked paths. Upkeep skips `--zap` when it detects a sibling app or release channel and preserves identified shared files.
+- **Official Uninstaller Recommended** appears for certain device-management, security, and VPN products. The vendor’s uninstaller can handle components such as system extensions and background services.
 
-### Project Layout
-
-```text
-Upkeep/
-├── Sources/
-│   ├── Upkeep/
-│   │   ├── App/           # Entry coordinator & floating HUD lifecycle
-│   │   ├── Services/      # KeepAwake, CleaningMode, Brew, Mole/Cleaner, Updater, Engine
-│   │   └── UI/            # Liquid Glass Settings, Homebrew HUD, Search
-│   ├── UpkeepAppEntry/    # Executable entrypoint
-│   └── UpkeepSelfTest/    # Swift integration & regression self-test runner
-├── rust/upkeep_core/      # Rust C-ABI engine (lib.rs, cleaner.rs, Cargo.toml)
-├── Scripts/               # build-app.sh (Swift + Rust + vtool + signing), build-rust-cabi.sh
-├── Resources/Icons/       # AppIcon.icns, AppIcon.png, Apple Icon Composer Upkeep.icon
-└── .github/workflows/     # Automated macOS release builds & GitHub Releases publishing
-```
-
-## Installation
-
-### Download a Release
-1. On an Apple silicon Mac running macOS 26 or later, download the latest `Upkeep-v*.zip` from [**GitHub Releases**](https://github.com/manavo-o/Upkeep/releases/latest).
-2. Unzip and move `Upkeep.app` into `/Applications`.
-3. Launch **Upkeep**, then choose **Open Upkeep…** from its menu bar icon. Find the installed version in **About & Updates** or at the top of the menu.
-
-### Build from Source
-
-**Prerequisites**
-- **Xcode 27** with the macOS 27 SDK for building the current interface
-- **Rust (`cargo`)** for the bundled Cleaner, Uninstaller, and Homebrew search engine. The build script compiles it into `Frameworks/lib/libupkeep_core.a`.
-- **Homebrew** *(optional)* — enables the Homebrew Search HUD and Caskroom integration
-
-**Test, Build, Sign & Launch**
-
-```zsh
-git clone https://github.com/manavo-o/Upkeep.git
-cd Upkeep
-(cd rust/upkeep_core && cargo test) &&
-  UPKEEP_REQUIRE_RUST=1 ./Scripts/build-app.sh &&
-  open dist/Upkeep.app
-```
-
-**Run the Swift Self-Test Suite**
-
-```zsh
-./.build/release/UpkeepSelfTest
-./.build/release/UpkeepSelfTest --status-menu
-```
-
-> [!TIP]
-> Run `./Scripts/build-app.sh` in Terminal so it can sign `dist/Upkeep.app` with your `Apple Development` identity (or create a persistent local `Upkeep Local Signing` certificate). Persistent signing preserves your macOS Accessibility permission across rebuilds.
-
-### Permissions
-- **Accessibility** *(Clean Keys only)*: Open **Upkeep → Clean Keys** or **About & Updates** and use the Accessibility action to enable Upkeep in **System Settings → Privacy & Security → Accessibility**.
-- **Administrator Password** *(optional)*: Upkeep asks for authorization when you confirm removal of selected system items.
-
-## Keyboard Shortcuts
+## Keyboard shortcuts
 
 | Context | Shortcut | Action |
 | --- | --- | --- |
-| **Main Window** | <kbd>⌘</kbd> <kbd>F</kbd> | Focus toolbar settings search |
-| **Settings** | <kbd>⌘</kbd> <kbd>[</kbd> / <kbd>⌘</kbd> <kbd>]</kbd> | Go Back or Forward between panes |
-| **Upkeep menu** | <kbd>⌘</kbd> <kbd>,</kbd> | Open the Settings window |
-| **Upkeep menu** | <kbd>⌘</kbd> <kbd>Q</kbd> | Quit Upkeep |
-| **Homebrew HUD** | <kbd>⌘</kbd> <kbd>1</kbd> – <kbd>⌘</kbd> <kbd>4</kbd> | Switch scopes (Installed, Formulae, Casks, Upgrades) |
-| **Homebrew HUD** | <kbd>⌘</kbd> <kbd>K</kbd> | Open package actions menu |
-| **Homebrew HUD** | <kbd>Esc</kbd> | Dismiss Search HUD |
-| **Clean Keys** | Hold <kbd>⌘</kbd> + <kbd>Esc</kbd> (1s) | Emergency unlock keyboard |
-| **Clean Keys** | Press <kbd>⌘</kbd> × 6 | Alternate emergency unlock |
+| Upkeep menu or active app | <kbd>⌘</kbd> <kbd>,</kbd> | Open Settings. From floating Homebrew search, open Homebrew Settings. |
+| Upkeep menu or active app | <kbd>⌘</kbd> <kbd>Q</kbd> | Quit Upkeep. |
+| Settings | <kbd>⌘</kbd> <kbd>F</kbd> | Focus settings search. |
+| Settings | <kbd>⌘</kbd> <kbd>[</kbd> / <kbd>⌘</kbd> <kbd>]</kbd> | Go back or forward. |
+| Floating Homebrew search | <kbd>⌘</kbd> <kbd>1</kbd>–<kbd>4</kbd> | Select Installed, Formulae, Casks, or Upgrades. |
+| Floating Homebrew search | <kbd>↑</kbd> / <kbd>↓</kbd> | Move through the results. |
+| Floating Homebrew search | <kbd>Return</kbd> | From the search field or results list, install a missing package, upgrade an outdated package, or uninstall an installed package with no upgrade available. |
+| Floating Homebrew search | <kbd>⌘</kbd> <kbd>K</kbd> | Open the actions menu. |
+| Floating Homebrew search | <kbd>Esc</kbd> | Clear the query and scope, or close the window when both are clear. |
+| Clean Keys | Hold <kbd>⌘</kbd> + <kbd>Esc</kbd> for one second or press <kbd>⌘</kbd> six times | Unlock input early. |
 
-## Privacy & Network Activity
+## Updates and network activity
 
-Upkeep scans files and searches its cached catalog on your Mac. It does not send telemetry or analytics.
+**About & Updates** shows the installed version and lets you choose whether to check automatically. Automatic checks are enabled by default. Upkeep checks GitHub Releases on launch or when Settings opens if six hours have elapsed since the previous check. **Check for Updates…** runs a manual check. The default repository is `manavo-o/Upkeep`.
 
-- **Homebrew catalog** fetches formula and cask metadata from `formulae.brew.sh`. Homebrew commands that you run through Upkeep can also contact taps, package sources, and download hosts.
-- **App updates** check the configured GitHub repository (by default `manavo-o/Upkeep`) at launch or when opening Settings if automatic checks are due, or when you check manually. If you choose **Install & Relaunch**, Upkeep downloads the release archive from GitHub.
+**Install & Relaunch** downloads the release ZIP, verifies the extracted app’s code signature with `codesign`, and attempts to replace the current bundle and reopen it. Changing the repository in Settings changes the source of downloadable updates, so use a repository you trust.
 
-## Idle Memory Recovery
+File scans, package search, and preferences stay on the Mac. Upkeep has no analytics or telemetry. The app contacts GitHub for updates and `formulae.brew.sh` for package metadata. Homebrew commands can also contact taps, package registries, and download hosts.
 
-Upkeep releases the Homebrew search index after a short close/reopen grace period and can trim idle catalog data while Settings remains open. Searches reload the on-disk index as needed.
+## Build from source
 
-Once all windows are closed and background work has finished, Upkeep can quietly restart its idle process to release macOS UI framework caches. It transfers active Caffeinate assertions before the original process exits and restores the session's preferences and recent results. Open or minimized windows, menus, Clean Keys, and maintenance operations defer recovery.
+Use an Apple silicon Mac, **Xcode 27** with the macOS 27 SDK to build the current interface, and a Rust toolchain with `cargo` and the `aarch64-apple-darwin` target. Use a Terminal session with access to your login keychain for a build you intend to launch.
 
-## FAQ
+```sh
+git clone https://github.com/manavo-o/Upkeep.git
+cd Upkeep
+UPKEEP_REQUIRE_RUST=1 ./Scripts/build-app.sh
+codesign --verify --deep --strict dist/Upkeep.app
+codesign -dv --verbose=4 dist/Upkeep.app
+```
 
-<details>
-<summary><strong>Why does Upkeep require macOS 26+?</strong></summary>
+The script builds the Rust static library into `Frameworks/lib/`, compiles the Swift release executables, and packages `dist/Upkeep.app`. It also stamps the SDK version into the executable to enable native Liquid Glass controls. Wait for a successful build before running the verification commands.
 
-Upkeep is built around macOS 26/27 Liquid Glass materials, `NSGlassEffectView`, and native System Settings controls. `Scripts/build-app.sh` also stamps the real macOS SDK version into `LC_BUILD_VERSION` via `vtool` so SwiftPM builds render native Liquid Glass controls properly.
-</details>
+For repeatable local builds, look for `Authority=Apple Development: …` or `Authority=Upkeep Local Signing` in the signature details, then run `open dist/Upkeep.app`. The script can create a persistent local signing identity when a development identity is unavailable. If it falls back to ad-hoc signing, rebuild with keychain access before replacing your running copy. After switching from an ad-hoc build to a persistent signature, toggle Upkeep off and on once in **System Settings → Privacy & Security → Accessibility** if Clean Keys still asks for access.
 
-<details>
-<summary><strong>Do I need Mole (<code>mo</code>) or Homebrew installed to use Upkeep?</strong></summary>
+A local development build can use the Swift fallback when `Frameworks/lib/libupkeep_core.a` is absent and Rust is unavailable. The fallback has narrower Cleaner coverage and uses Swift implementations of other engine operations. CI and release builds require the Rust core.
 
-Mole is unnecessary. The bundled engine provides Cleaner scanning and app leftover discovery. Homebrew is optional for everyday use and required for package operations or Homebrew cask removal. The Homebrew pane can copy the Homebrew install command.
-</details>
+### Run the checks
 
-<details>
-<summary><strong>Can I build Upkeep without Rust installed?</strong></summary>
+Run these from the repository root after building. The main Swift self-test expects Homebrew on the machine and uses disposable temporary files to test Cleaner deletion.
 
-Yes, for local development. SwiftPM links the Rust library when it exists and otherwise uses Swift fallbacks with more limited cleanup coverage. GitHub releases require Rust.
-</details>
+```sh
+cargo test --manifest-path rust/upkeep_core/Cargo.toml
+UPKEEP_REQUIRE_RUST=1 ./.build/release/UpkeepSelfTest
+./.build/release/UpkeepSelfTest --status-menu
+```
 
----
+The status menu mode exercises the AppKit menu. To test idle process handoff in a logged-in macOS desktop session, run the opt-in memory recovery test.
 
-<div align="center">
-  <a href="RELEASE_NOTES.md">Release Notes</a> •
-  <a href="https://github.com/manavo-o/Upkeep/releases">Releases</a> •
-  <a href="https://github.com/manavo-o/Upkeep/issues">Report an Issue</a> •
-  <a href="#upkeep">Back to Top ↑</a>
-</div>
+```sh
+recovery_results="$(mktemp -d)"
+UPKEEP_MEMORY_TEST_DIRECTORY="$recovery_results" ./.build/release/UpkeepSelfTest --memory-recovery
+```
+
+The replacement process writes `result.json` shortly after the original command exits. Check `"$recovery_results/result.json"` for `"passed": true`.
+
+The [release workflow](.github/workflows/release.yml) tests the Rust core, builds Upkeep with Rust enabled, runs the main Swift self-test, and packages `Upkeep-v*.zip`. Builds from `v*` tags publish the archive to GitHub Releases. CI uses ad-hoc signing.
+
+## Architecture
+
+Swift 6, SwiftUI, and AppKit implement the status menu, the settings window, and the floating Homebrew and Clean Keys panels. Caffeinate uses IOKit power assertions. Clean Keys uses a CoreGraphics event tap. Swift calls the Rust core through `CUpkeepCore` for parallel filesystem scanning and sizing, app and leftover discovery, and package indexing.
+
+| Path | Responsibility |
+| --- | --- |
+| [App entry point](Sources/UpkeepAppEntry/UpkeepApp.swift) | Launches the menu bar app. |
+| [App coordination](Sources/Upkeep/App) | Status menu, window lifecycle, and idle process recovery. |
+| [Services](Sources/Upkeep/Services) | Power and input control, Homebrew execution, cleanup and removal, and updates. |
+| [UI](Sources/Upkeep/UI) | Settings navigation and search, shared controls, and floating panels. |
+| [Rust core](rust/upkeep_core) | Cleaner rules, macOS bulk directory sizing, app discovery, and ranked package search. |
+| [Build scripts](Scripts) and [self-tests](Sources/UpkeepSelfTest) | App packaging, Rust integration, and regression checks. |
+
+Upkeep can evict the in-memory Homebrew index during idle periods and reload it from `catalog.bin` when needed. If memory use stays above its idle budget, Upkeep can replace its idle process to release framework caches. It hands off ordinary Caffeinate assertions before the old process exits. Open or minimized windows, tracked menus, Clean Keys, an engaged closed-lid helper, and maintenance operations defer process recovery.
+
+## Report an issue
+
+Include the Upkeep version from **About & Updates**, your macOS version, the pane or menu action involved, and the steps to reproduce the behavior. For a Homebrew problem, include the relevant **Activity** output with any private paths or credentials removed. [Open a GitHub issue](https://github.com/manavo-o/Upkeep/issues).
