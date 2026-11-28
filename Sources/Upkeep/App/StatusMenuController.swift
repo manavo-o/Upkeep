@@ -38,9 +38,9 @@ public final class StatusMenuController: NSObject, NSMenuDelegate {
         guard let statusItem else { return }
         withObservationTracking {
             statusItem.isVisible = recovery.isStatusItemInserted
-            let symbol = keepAwake.isActive ? "cup.and.saucer.fill" : "arrow.up.circle"
-            statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-            statusItem.button?.setAccessibilityLabel(keepAwake.isActive ? "Upkeep, Caffeinate active" : "Upkeep")
+            let isActive = keepAwake.isActive
+            statusItem.button?.image = isActive ? UpkeepStatusIcon.active : UpkeepStatusIcon.idle
+            statusItem.button?.setAccessibilityLabel(isActive ? "Upkeep, Caffeinate active" : "Upkeep")
         } onChange: { [weak self] in
             Task { @MainActor in self?.observeStatusItem() }
         }

@@ -12,18 +12,22 @@ final class CaffeinateDurationControl: NSView {
     private let valueLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private let currentMinutes: () -> Int
-    private let onCommit: (Int) -> Void
+    var onCommit: (Int) -> Void
+    private let showsDisclosure: Bool
     private var committedMinutes: Int
     private var lastPreview: Int
-    private var isExpanded = false
+    private var isExpanded: Bool
 
-    init(currentMinutes: @escaping () -> Int, onCommit: @escaping (Int) -> Void) {
+    init(showsDisclosure: Bool = true, currentMinutes: @escaping () -> Int, onCommit: @escaping (Int) -> Void) {
         let initialMinutes = Self.sliderMinutes(currentMinutes())
         committedMinutes = initialMinutes
         lastPreview = initialMinutes
         self.currentMinutes = currentMinutes
         self.onCommit = onCommit
-        super.init(frame: NSRect(x: 0, y: 0, width: 248, height: Self.headerHeight))
+        self.showsDisclosure = showsDisclosure
+        isExpanded = !showsDisclosure
+        let height = showsDisclosure ? Self.headerHeight : Self.controlsHeight
+        super.init(frame: NSRect(x: 0, y: 0, width: 248, height: height))
 
         disclosure.isBordered = false
         disclosure.alignment = .left
@@ -32,9 +36,9 @@ final class CaffeinateDurationControl: NSView {
         disclosure.action = #selector(toggleDisclosure)
         disclosure.frame = NSRect(x: 13, y: 4, width: 112, height: 26)
         disclosure.autoresizingMask = [.minYMargin]
-        addSubview(disclosure)
+        if showsDisclosure { addSubview(disclosure) }
 
-        sliderContent.isHidden = true
+        sliderContent.isHidden = showsDisclosure
         addSubview(sliderContent)
         updateDisclosureAppearance()
 
@@ -49,7 +53,7 @@ final class CaffeinateDurationControl: NSView {
         statusLabel.alignment = .right
         statusLabel.frame = NSRect(x: 125, y: 9, width: 109, height: 16)
         statusLabel.autoresizingMask = [.minYMargin]
-        addSubview(statusLabel)
+        if showsDisclosure { addSubview(statusLabel) }
 
         slider.cell = trackingCell
         slider.minValue = 0
@@ -87,7 +91,17 @@ final class CaffeinateDurationControl: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil, isExpanded { setExpanded(false) }
+        if showsDisclosure, window == nil, isExpanded { setExpanded(false) }
+    }
+
+    func setSettingsMinutes(_ minutes: Int) {
+        guard !trackingCell.isTrackingPointer else { return }
+        committedMinutes = minutes < 0 ? 60 : Self.sliderMinutes(minutes)
+        renderValue(committedMinutes)
+        if minutes < 0 {
+            valueLabel.stringValue = "Until stopped"
+            slider.setAccessibilityValueDescription("Until stopped")
+        }
     }
 
     @objc private func toggleDisclosure() {

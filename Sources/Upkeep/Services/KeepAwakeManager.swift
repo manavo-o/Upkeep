@@ -38,6 +38,8 @@ public final class KeepAwakeManager {
     /// Observable formatted countdown string updated only when its text changes, so menu bar items
     /// refresh live while views using `Text(expiresAt, style: .timer)` avoid 1 Hz invalidation.
     public private(set) var formattedRemaining: String = "Off"
+    private static let closedLidPreferenceKey = "caffeinateWithLidClosed"
+    private(set) var keepsAwakeWithLidClosed = UserDefaults.standard.bool(forKey: closedLidPreferenceKey)
     let closedLid = ClosedLidSession()
 
     /// Computed on demand so views observing `expiresAt` don't suffer 1 Hz `@Observable` invalidation storms.
@@ -121,6 +123,7 @@ public final class KeepAwakeManager {
         self.mode = mode
         self.isActive = true
         setExpiration(durationMinutes.flatMap { $0 > 0 ? Date().addingTimeInterval(TimeInterval($0) * 60) : nil })
+        applyClosedLidPreference()
     }
 
     func applyDuration(minutes: Int?, mode: KeepAwakeMode) {
@@ -167,15 +170,22 @@ public final class KeepAwakeManager {
         clearIdleSleepSession()
     }
 
-    func toggleClosedLid(mode: KeepAwakeMode) {
-        if closedLid.isEngaged {
-            closedLid.stop()
-        } else {
-            closedLid.start { [weak self] in
-                guard let self, !self.isActive else { return }
-                self.start(durationMinutes: 60, mode: mode)
-            }
-        }
+    func enableKeepsAwakeWithLidClosed() async {
+        if await closedLid.prepare() { setKeepsAwakeWithLidClosed(true) }
+    }
+
+    func setKeepsAwakeWithLidClosed(_ enabled: Bool) {
+        guard keepsAwakeWithLidClosed != enabled else { return }
+        keepsAwakeWithLidClosed = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.closedLidPreferenceKey)
+        if enabled { applyClosedLidPreference() } else { closedLid.stop() }
+    }
+
+    private func applyClosedLidPreference() {
+        guard isActive, keepsAwakeWithLidClosed else { return }
+        closedLid.start(onRestored: { [weak self] in
+            self?.applyClosedLidPreference()
+        })
     }
 
     private func clearIdleSleepSession() {

@@ -53,6 +53,7 @@ struct GeneralSettingsPane: View {
             Button("Cancel", role: .cancel) {}
             Button("Restore Defaults", role: .destructive) {
                 vm.selectedAwakeMode = .displayAndSystem
+                KeepAwakeManager.shared.setKeepsAwakeWithLidClosed(false)
                 vm.cleaningDuration = 60
                 vm.cleaningDimScreen = true
                 vm.cleaningLockPointer = false

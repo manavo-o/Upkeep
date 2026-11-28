@@ -24,21 +24,45 @@ struct CaffeinateSettingsPane: View {
                 .upkeepSearchTarget("power.assertionMode")
 
                 Toggle(isOn: Binding(
-                    get: { keepAwake.closedLid.state == .active },
-                    set: { _ in keepAwake.toggleClosedLid(mode: vm.selectedAwakeMode) }
+                    get: { keepAwake.keepsAwakeWithLidClosed },
+                    set: { enabled in
+                        if enabled {
+                            Task { await keepAwake.enableKeepsAwakeWithLidClosed() }
+                        } else {
+                            keepAwake.setKeepsAwakeWithLidClosed(false)
+                        }
+                    }
                 )) {
                     UpkeepSettingLabel("Keep Awake With Lid Closed", subtitle: closedLidSubtitle)
                 }
                 .tint(UpkeepSettingsPalette.accent)
-                .disabled(keepAwake.closedLid.state == .authorizing || keepAwake.closedLid.state == .stopping)
+                .disabled(keepAwake.closedLid.state == .authorizing)
+                .accessibilityLabel("Keep Awake With Lid Closed")
+                .accessibilityHint(closedLidSubtitle)
                 .upkeepSearchTarget("power.closedLid")
 
-                LabeledContent("Start a Session") {
-                    HStack(spacing: 6) {
-                        durationButton("30 min", minutes: 30)
-                        durationButton("1 hr", minutes: 60)
-                        durationButton("2 hr", minutes: 120)
-                        durationButton("Until Stopped", minutes: nil)
+                HStack {
+                    Text("Session Duration")
+                    Spacer()
+                    HStack(spacing: 10) {
+                        CaffeinateDurationSlider(minutes: sliderMinutes) { minutes in
+                            updateSession {
+                                if minutes == 0 {
+                                    keepAwake.stop()
+                                } else {
+                                    keepAwake.applyDuration(minutes: minutes, mode: vm.selectedAwakeMode)
+                                }
+                            }
+                        }
+                        .frame(width: 248, height: 61)
+
+                        Button("Until Stopped") {
+                            updateSession { keepAwake.applyDuration(minutes: nil, mode: vm.selectedAwakeMode) }
+                        }
+                        .buttonStyle(.upkeepSecondary)
+                        .controlSize(.small)
+                        .fixedSize()
+                        .disabled(keepAwake.isActive && keepAwake.expiresAt == nil)
                     }
                 }
                 .upkeepSearchTarget("power.quickDuration")
@@ -46,11 +70,20 @@ struct CaffeinateSettingsPane: View {
         }
     }
 
+    private var sliderMinutes: Int {
+        guard keepAwake.isActive else { return 0 }
+        return keepAwake.remainingSeconds.map { max(15, ($0 + 59) / 60) } ?? -1
+    }
+
     private var closedLidSubtitle: String {
         switch keepAwake.closedLid.state {
-        case .off: "Requires administrator approval. Starts a 1-hour session if Caffeinate is off."
-        case .authorizing: "Waiting for administrator approval…"
-        case .active: "System sleep is disabled until you turn this off or the session ends."
+        case .off:
+            keepAwake.keepsAwakeWithLidClosed
+                ? "Applies automatically to future Caffeinate sessions."
+                : "One-time administrator approval lets future sessions stay awake with the lid closed."
+        case .authorizing: "Waiting for one-time administrator approval…"
+        case .starting: "Enabling closed-lid mode…"
+        case .active: "This Mac stays awake with the lid closed until the session ends."
         case .stopping: "Restoring the previous sleep setting…"
         case .failed(let message): message
         }
@@ -102,13 +135,6 @@ struct CaffeinateSettingsPane: View {
                 }
             }
         )
-    }
-
-    private func durationButton(_ title: String, minutes: Int?) -> some View {
-        Button(title) { start(minutes: minutes) }
-            .buttonStyle(.upkeepSecondary)
-            .controlSize(.small)
-            .fixedSize()
     }
 
     private func start(minutes: Int?) {

@@ -1,6 +1,49 @@
 import AppKit
 import SwiftUI
 
+@MainActor
+enum UpkeepStatusIcon {
+    static let idle = makeImage(isActive: false)
+    static let active = makeImage(isActive: true)
+
+    private static func makeImage(isActive: Bool) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let arrow = NSBezierPath()
+            arrow.move(to: NSPoint(x: 9, y: 14.25))
+            arrow.line(to: NSPoint(x: 13.25, y: 8))
+            arrow.line(to: NSPoint(x: 10.5, y: 8))
+            arrow.line(to: NSPoint(x: 10.5, y: 4.5))
+            arrow.line(to: NSPoint(x: 7.5, y: 4.5))
+            arrow.line(to: NSPoint(x: 7.5, y: 8))
+            arrow.line(to: NSPoint(x: 4.75, y: 8))
+            arrow.close()
+
+            NSColor.black.setFill()
+            if isActive {
+                let disk = NSBezierPath(ovalIn: NSRect(x: 1, y: 1, width: 16, height: 16))
+                disk.append(arrow)
+                disk.windingRule = .evenOdd
+                disk.fill()
+            } else {
+                let ring = NSBezierPath()
+                ring.appendArc(
+                    withCenter: NSPoint(x: 9, y: 9), radius: 7.25,
+                    startAngle: 90, endAngle: 153, clockwise: true
+                )
+                ring.lineWidth = 1.5
+                ring.lineCapStyle = .round
+                NSColor.black.setStroke()
+                ring.stroke()
+                NSBezierPath(ovalIn: NSRect(x: 4.5, y: 14.4, width: 1.5, height: 1.5)).fill()
+                arrow.fill()
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+}
+
 // MARK: - Upkeep App Icon (Loaded from Apple Icon Composer export)
 
 /// Displays Upkeep's Liquid Glass app icon exported from Apple Icon Composer,
