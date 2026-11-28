@@ -8,6 +8,7 @@ Instructions and operational gotchas for AI agents working on **Upkeep** (`com.l
 - **Why this matters:** Ad-hoc signing changes the app's CDHash on every build, which invalidates macOS TCC **Accessibility** permissions and causes Clean Keys to prompt for Accessibility access even when Upkeep is already listed and enabled in System Settings.
 - **Codex:** Run the signed build and relaunch directly outside the sandbox so the build can use the login keychain. Verify that `dist/Upkeep.app` has a persistent `Upkeep Local Signing` or `Apple Development` signature before replacing the running instance. If access is blocked, report the specific blocker. For an explicitly requested release, carry out the authorized release steps directly.
 - For compilation checks, you may run `./Scripts/build-app.sh` in the sandbox and verify with `./.build/out/Products/Release/UpkeepSelfTest`.
+- After pushing a release to GitHub, report the pushed commit and tag. Wait for the GitHub Actions build only when the user asks you to monitor it.
 - If an ad-hoc build was previously launched, remind the user to toggle **Upkeep** off and back on once in **System Settings → Privacy & Security → Accessibility** so TCC binds to the persistent certificate.
 
 ## App Behavior & Launching
